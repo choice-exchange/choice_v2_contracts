@@ -5,7 +5,6 @@ import {Test} from "forge-std/Test.sol";
 import {Vault} from "infinity-core/src/Vault.sol";
 import {CLPoolManager} from "infinity-core/src/pool-cl/CLPoolManager.sol";
 import {BinPoolManager} from "infinity-core/src/pool-bin/BinPoolManager.sol";
-import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {ProtocolFeeLibrary} from "infinity-core/src/libraries/ProtocolFeeLibrary.sol";
 import {CLQuoter} from "infinity-periphery/src/pool-cl/lens/CLQuoter.sol";
 import {UniversalRouter} from "infinity-universal-router/src/UniversalRouter.sol";
