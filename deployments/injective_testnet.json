@@ -11,14 +11,25 @@
     "usdt": "0xaDC7bcB5d8fe053Ef19b4E0C861c262Af6e0db60",
     "usdc": "0x0C382e685bbeeFE5d3d9C29e29E341fEE8E84C5d",
     "bankPrecompile": "0x0000000000000000000000000000000000000064",
-    "exchangePrecompile": "0x0000000000000000000000000000000000000065"
+    "exchangePrecompile": "0x0000000000000000000000000000000000000065",
+    "safeProxyFactory": "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67",
+    "safeSingletonL2": "0x29fcB43b46531BcA003ddC8FCB67FFE91900C762",
+    "safeFallbackHandler": "0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99"
   },
   "governance": {
-    "safe": null,
-    "timelock": null,
+    "safe": "0x0ee0Db41E787FdFcD0a35680074935C6bdC00237",
+    "safeSigners": [
+      "0x8BDa07903B29d61eB6b019f5FFB905a8076575a0",
+      "0xF48390Bb427A38a6A13086f3F164e9c2055D873d",
+      "0xF7Ca1E12a79fA77cB1E8b7Be2B2FF6828426BF94"
+    ],
+    "safeThreshold": 2,
+    "safeSaltNonce": 0,
+    "timelock": "0xfE9811111Cffd823aA2c1c8F31A77009BFaeDE42",
+    "timelockMinDelay": 60,
     "create3Factory": "0x2Be6e98818A7CbBd1c7fD8e06A3B0449715790CD",
     "create3DeployerEOA": "0x15248340974929CeF4194a9Be763960d8A807fbc",
-    "deployerEOA": null
+    "deployerEOA": "0xAcA0d67c52B503ED15706df5fE29E19677338bc6"
   },
   "infinity": {
     "vault": null,

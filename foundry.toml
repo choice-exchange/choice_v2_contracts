@@ -21,7 +21,9 @@ ffi = true
 fs_permissions = [
     { access = "read-write", path = ".forge-snapshots/" },
     { access = "read", path = "./foundry-out" },
-    { access = "read", path = "./deployments" },
+    # deploy scripts write the address book back as they go, so the next script in the
+    # sequence reads what the last one deployed rather than a hand-copied address.
+    { access = "read-write", path = "./deployments" },
 ]
 gas_limit = "300000000"
 # Infinity's suites rely on this (see upstream foundry.toml).
