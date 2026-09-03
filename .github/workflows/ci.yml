@@ -74,8 +74,13 @@ jobs:
               echo "::error file=$f::not 20-byte addresses: $bad"; fail=1
             fi
 
-            # a single address must never appear under two different keys
-            dupes="$(jq -r '[paths(scalars) as $p | getpath($p)]
+            # A single address must never appear under two different keys - that is almost
+            # always a copy-paste that ships one contract's address as another's. The
+            # exception is a deliberate alias, which must be listed in meta.addressAliases
+            # with the reason, so an intentional overlap is a reviewed line in the diff
+            # rather than a silent hole in this check.
+            dupes="$(jq -r '(.meta.addressAliases // {} | keys) as $allowed
+                            | [paths(scalars) as $p | select(($p | join(".")) as $k | $allowed | index($k) | not) | getpath($p)]
                             | map(select(type == "string" and test("^0x[0-9a-fA-F]{40}$")))
                             | map(ascii_downcase) | group_by(.) | map(select(length > 1)) | map(.[0]) | .[]' "$f")"
             if [ -n "$dupes" ]; then

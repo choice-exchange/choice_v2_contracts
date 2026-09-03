@@ -32,11 +32,11 @@
     "deployerEOA": "0xAcA0d67c52B503ED15706df5fE29E19677338bc6"
   },
   "infinity": {
-    "vault": null,
-    "clPoolManager": null,
-    "binPoolManager": null,
-    "clPoolManagerOwner": null,
-    "binPoolManagerOwner": null,
+    "vault": "0x17BDb95424cA07c31C23ecA9925CBA10818CBF6e",
+    "clPoolManager": "0x0d93E2E86e308F54eFca3f225487382cECF57F37",
+    "binPoolManager": "0x88Af37259DB7775B4625449AeEa11Fc682452143",
+    "clPoolManagerOwner": "0xC46e1388834077F64600f039DbD942Db0ad550D7",
+    "binPoolManagerOwner": "0xB1d448ec21A2845980BfFCA92370ba25Da573995",
     "clPositionDescriptor": null,
     "clPositionManager": null,
     "binPositionManager": null,
@@ -48,12 +48,14 @@
     "unsupportedProtocol": null
   },
   "choice": {
-    "clFeeController": null,
-    "binFeeController": null,
+    "clFeeController": "0x36ab137ac1647c16646CA851c2715FBb60f4FD3C",
+    "binFeeController": "0x1aceba7d060Af651553fE850C17938e2F0580066",
     "infinitySettler": null,
     "positionLocker": null,
     "choiceRouter": null,
-    "treasury": null
+    "treasury": "0x0ee0Db41E787FdFcD0a35680074935C6bdC00237",
+    "directTransferBurnSink": "0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215",
+    "exchangeSubaccountBurnSink": "0xefe613636921D9d683CDe6d91FD0485D9DD2987f"
   },
   "pools": [],
   "meta": {
@@ -67,6 +69,9 @@
       "infinity-periphery": "8261f8d93a23c9ba8a73060823251ba8b5ac46de",
       "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
     },
-    "lastUpdated": "2026-09-04"
+    "lastUpdated": "2026-09-04",
+    "addressAliases": {
+      "choice.treasury": "the Safe: protocol revenue lands where the signers can move it without waiting out a timelock delay"
+    }
   }
 }
