@@ -47,8 +47,8 @@
   "pools": [],
   "meta": {
     "forkPins": {
-      "infinity-core": "538cc2aa19fd120d62058b309201e146fcb05fc6",
-      "infinity-periphery": "dcaa498492697ada6e70b495f6b83127d7de127c",
+      "infinity-core": "9aa98116aa026a966ea363ea33850a01034ecd28",
+      "infinity-periphery": "37f9314b8b8f891053e1a61899f6ec3247468a58",
       "infinity-universal-router": "96929b54da90319677715cb5e5381ef59260f726"
     },
     "upstreamPins": {
