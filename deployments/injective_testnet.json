@@ -70,6 +70,19 @@
       "currency1": "external.usdt",
       "seedSqrtPriceX96": "250541448375047923607155",
       "seededOn": "2026-09-04"
+    },
+    {
+      "pair": "wINJ/USDC",
+      "poolId": "0x9ef1129891ccbff459261d1fb1583d40fea5639666b4d436fe2e8ff0ee357605",
+      "tierTotalPips": 500,
+      "lpFeePips": 335,
+      "protocolFeePipsPerDirection": 164,
+      "tickSpacing": 10,
+      "parameters": "0x00000000000000000000000000000000000000000000000000000000000a0000",
+      "currency0": "external.wINJ",
+      "currency1": "external.usdc",
+      "seedSqrtPriceX96": "250541448375047923607155",
+      "seededOn": "2026-09-04"
     }
   ],
   "meta": {
@@ -86,6 +99,8 @@
     "lastUpdated": "2026-09-04",
     "addressAliases": {
       "choice.treasury": "the Safe: protocol revenue lands where the signers can move it without waiting out a timelock delay"
-    }
+    },
+    "vaultDeployBlock": 138923726,
+    "blockscoutApi": "https://testnet.blockscout-api.injective.network"
   }
 }
