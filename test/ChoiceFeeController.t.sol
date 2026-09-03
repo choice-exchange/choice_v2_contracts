@@ -100,6 +100,8 @@ contract ChoiceFeeControllerTest is Test {
     // ---------------------------------------------------------------- harvest
 
     function test_harvestSplitsFiftyFiftyAndIsPermissionless() public {
+        vm.prank(TIMELOCK);
+        controller.setTreasuryBps(5_000); // unpark: plan D10's 50/50
         Currency currency = _accrueProtocolFee(1_000_000);
 
         // Called by an arbitrary address: revenue must not depend on a privileged keeper.
@@ -117,6 +119,8 @@ contract ChoiceFeeControllerTest is Test {
     /// @dev An odd amount is where a second multiplication would strand a wei on every
     /// harvest; the remainder must go to the burn leg instead.
     function test_harvestLeavesNoDustBehind() public {
+        vm.prank(TIMELOCK);
+        controller.setTreasuryBps(5_000);
         Currency currency = _accrueProtocolFee(999_999);
 
         (uint256 toTreasury, uint256 toBurn) = controller.harvest(currency);
@@ -138,6 +142,34 @@ contract ChoiceFeeControllerTest is Test {
         assertEq(token.balanceOf(address(controller)), 0, "nothing stranded");
     }
 
+    /// @dev The shipping default. Everything reaches the treasury and no sink is touched, so
+    /// the controller is deployable and revenue is collectable before the burn path is settled.
+    function test_parkedByDefaultSendsEverythingToTreasuryWithoutASink() public {
+        assertEq(controller.treasuryBps(), 10_000, "must ship parked");
+
+        ChoiceFeeController parked = new ChoiceFeeController(address(poolManager), TREASURY, IBurnSink(address(0)));
+        poolManager.setProtocolFeeController(parked);
+
+        Currency currency = _accrueProtocolFee(1_000);
+        (uint256 toTreasury, uint256 toBurn) = parked.harvest(currency);
+
+        assertEq(toTreasury, 1_000);
+        assertEq(toBurn, 0, "nothing is burnt while parked");
+        assertEq(token.balanceOf(TREASURY), 1_000);
+    }
+
+    /// @dev Unparking without wiring a sink must fail loudly rather than leave the burn share
+    /// sitting in the controller looking like revenue nobody is watching.
+    function test_unparkingWithoutASinkReverts() public {
+        ChoiceFeeController parked = new ChoiceFeeController(address(poolManager), TREASURY, IBurnSink(address(0)));
+        poolManager.setProtocolFeeController(parked);
+        parked.setTreasuryBps(5_000);
+
+        Currency currency = _accrueProtocolFee(1_000);
+        vm.expectRevert(ChoiceFeeController.BurnSinkNotSet.selector);
+        parked.harvest(currency);
+    }
+
     function test_harvestRevertsWhenThereIsNothingToCollect() public {
         vm.expectRevert(ChoiceFeeController.NothingToHarvest.selector);
         controller.harvest(Currency.wrap(address(token)));
@@ -147,8 +179,10 @@ contract ChoiceFeeControllerTest is Test {
     /// the controller where it reads as revenue nobody is watching.
     function test_harvestRevertsIfTheBurnSinkReverts() public {
         RevertingBurnSink broken = new RevertingBurnSink();
-        vm.prank(TIMELOCK);
+        vm.startPrank(TIMELOCK);
         controller.setBurnSink(broken);
+        controller.setTreasuryBps(5_000);
+        vm.stopPrank();
 
         Currency currency = _accrueProtocolFee(1_000);
         vm.expectRevert();

@@ -41,9 +41,18 @@ contract ChoiceFeeController is ProtocolFeeController {
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     /// @notice Share of harvested revenue kept by the treasury; the remainder is burnt.
-    /// @dev Plan D10: 50/50, which puts the burn contribution on the 0.30% tier at v1's
-    /// 0.05% while the treasury earns the same again.
-    uint256 public treasuryBps = 5_000;
+    ///
+    /// @dev Ships PARKED at 100%: everything goes to the treasury and nothing is burnt, so
+    /// the contract is deployable and harvestable before the burn path is settled. This does
+    /// not change what users pay - the protocol share is still 33% of the total fee - only
+    /// where Choice's own share lands.
+    ///
+    /// Turning the burn on is two calls from the timelock, never a redeploy:
+    /// `setBurnSink(sink)` then `setTreasuryBps(5000)` for plan D10's 50/50, which puts the
+    /// burn contribution on the 0.30% tier at v1's 0.05% while the treasury earns the same
+    /// again. Do that only once the auction path is settled for the currencies in question -
+    /// the sweep is denom-gated by governance, see the note above.
+    uint256 public treasuryBps = 10_000;
 
     /// @notice Receives the treasury half of every harvest.
     address public treasury;
@@ -74,9 +83,7 @@ contract ChoiceFeeController is ProtocolFeeController {
     /// @return toBurn Amount sent to the burn sink.
     function harvest(Currency currency) external returns (uint256 toTreasury, uint256 toBurn) {
         address _treasury = treasury;
-        IBurnSink _burnSink = burnSink;
         if (_treasury == address(0)) revert TreasuryNotSet();
-        if (address(_burnSink) == address(0)) revert BurnSinkNotSet();
 
         // Measure what actually arrived rather than trusting the requested amount: a
         // fee-on-transfer currency delivers less than it is asked for, and splitting the
@@ -93,6 +100,12 @@ contract ChoiceFeeController is ProtocolFeeController {
 
         if (toTreasury > 0) currency.transfer(_treasury, toTreasury);
         if (toBurn > 0) {
+            // Only required when something is actually being burnt, so the parked
+            // configuration (treasuryBps = 100%) needs no sink at all. Checked here rather
+            // than up front so a missing sink cannot silently strand the burn share.
+            IBurnSink _burnSink = burnSink;
+            if (address(_burnSink) == address(0)) revert BurnSinkNotSet();
+
             // Deliver first, then notify: the sink works from its own balance and never
             // pulls, so it needs no allowance and cannot reach back into the controller.
             currency.transfer(address(_burnSink), toBurn);
