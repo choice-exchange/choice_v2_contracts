@@ -47,6 +47,11 @@
   "pools": [],
   "meta": {
     "forkPins": {
+      "infinity-core": "538cc2aa19fd120d62058b309201e146fcb05fc6",
+      "infinity-periphery": "dcaa498492697ada6e70b495f6b83127d7de127c",
+      "infinity-universal-router": "96929b54da90319677715cb5e5381ef59260f726"
+    },
+    "upstreamPins": {
       "infinity-core": "61cd1311737fab6b1f31e7a5a136dabdcd5f4921",
       "infinity-periphery": "8261f8d93a23c9ba8a73060823251ba8b5ac46de",
       "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
