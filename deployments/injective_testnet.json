@@ -16,8 +16,8 @@
   "governance": {
     "safe": null,
     "timelock": null,
-    "create3Factory": null,
-    "create3DeployerEOA": null,
+    "create3Factory": "0x2Be6e98818A7CbBd1c7fD8e06A3B0449715790CD",
+    "create3DeployerEOA": "0x15248340974929CeF4194a9Be763960d8A807fbc",
     "deployerEOA": null
   },
   "infinity": {
@@ -56,6 +56,6 @@
       "infinity-periphery": "8261f8d93a23c9ba8a73060823251ba8b5ac46de",
       "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
     },
-    "lastUpdated": null
+    "lastUpdated": "2026-09-04"
   }
 }
