@@ -37,15 +37,15 @@
     "binPoolManager": "0x88Af37259DB7775B4625449AeEa11Fc682452143",
     "clPoolManagerOwner": "0xC46e1388834077F64600f039DbD942Db0ad550D7",
     "binPoolManagerOwner": "0xB1d448ec21A2845980BfFCA92370ba25Da573995",
-    "clPositionDescriptor": null,
-    "clPositionManager": null,
-    "binPositionManager": null,
-    "clQuoter": null,
-    "binQuoter": null,
-    "mixedQuoter": null,
-    "clTickLens": null,
-    "universalRouter": null,
-    "unsupportedProtocol": null
+    "clPositionDescriptor": "0xd5817F090C8F9939e086861d6EEAB95004072956",
+    "clPositionManager": "0x823F6dBB3e92f15FdA79A6b0e11e47dB1f3FEd54",
+    "binPositionManager": "0x6D255544204E318b99eE3E0CE39Fa111799548CC",
+    "clQuoter": "0xb7a4f84508c36255Bc29cc4dECaD6cBabd651a60",
+    "binQuoter": "0x0e41128C6Eb88E1DDc97683d78Cf58035eeabD46",
+    "mixedQuoter": "0x95B0B855108CA5A8D5c43D9bc3A5994A479043e0",
+    "clTickLens": "0x9D29c5BA79Ff9b173EADa6b8C0Fae10307cC9400",
+    "universalRouter": "0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7",
+    "unsupportedProtocol": "0xCB7340356Df545a6DCc10998078F3E0089640E2d"
   },
   "choice": {
     "clFeeController": "0x36ab137ac1647c16646CA851c2715FBb60f4FD3C",
@@ -57,7 +57,21 @@
     "directTransferBurnSink": "0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215",
     "exchangeSubaccountBurnSink": "0xefe613636921D9d683CDe6d91FD0485D9DD2987f"
   },
-  "pools": [],
+  "pools": [
+    {
+      "pair": "wINJ/USDT",
+      "poolId": "0xd44b01e87d2cb526cf36275bdc8a383950eb49f88a7f3bd9890fbd8c5486c067",
+      "tierTotalPips": 500,
+      "lpFeePips": 335,
+      "protocolFeePipsPerDirection": 164,
+      "tickSpacing": 10,
+      "parameters": "0x00000000000000000000000000000000000000000000000000000000000a0000",
+      "currency0": "external.wINJ",
+      "currency1": "external.usdt",
+      "seedSqrtPriceX96": "250541448375047923607155",
+      "seededOn": "2026-09-04"
+    }
+  ],
   "meta": {
     "forkPins": {
       "infinity-core": "9aa98116aa026a966ea363ea33850a01034ecd28",

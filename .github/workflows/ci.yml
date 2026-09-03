@@ -65,13 +65,15 @@ jobs:
             echo "checking $f"
             jq -e . "$f" > /dev/null || { echo "::error file=$f::not valid JSON"; fail=1; continue; }
 
-            # every non-null address must be a checksummed-length 0x hex address
+            # Every 0x value must be exactly 20 bytes (an address) or 32 bytes (a poolId,
+            # a salt, a PoolKey.parameters). Anything else - a truncated address, a value
+            # pasted one nibble short - is caught here rather than by a consumer at runtime.
             bad="$(jq -r '[paths(scalars) as $p | {p: ($p | join(".")), v: getpath($p)}]
                           | map(select(.v != null and (.v | type) == "string" and (.v | startswith("0x"))))
-                          | map(select(.v | test("^0x[0-9a-fA-F]{40}$") | not))
+                          | map(select(.v | test("^0x([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$") | not))
                           | map(.p) | .[]' "$f")"
             if [ -n "$bad" ]; then
-              echo "::error file=$f::not 20-byte addresses: $bad"; fail=1
+              echo "::error file=$f::not a 20- or 32-byte 0x value: $bad"; fail=1
             fi
 
             # A single address must never appear under two different keys - that is almost
