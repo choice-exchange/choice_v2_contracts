@@ -23,8 +23,17 @@ contract ExchangeSubaccountBurnSink is IBurnSink, Ownable2Step {
 
     IExchangeModule public constant EXCHANGE = IExchangeModule(0x0000000000000000000000000000000000000065);
 
-    /// @notice Auction subaccount id: `0x1111…1111` at nonce 0.
-    string public constant AUCTION_SUBACCOUNT = "0x1111111111111111111111111111111111111111000000000000000000000000";
+    /// @notice The burn-auction subaccount: THIRTY-TWO bytes of 0x11, not an address padded
+    /// with a zero nonce.
+    /// @dev `exchange/types/common_utils.go` has
+    /// `AuctionSubaccountID = common.HexToHash("0x1111…1111")` with all 64 hex digits set,
+    /// and Injective's docs say to contribute by "sending funds to the pool's subaccount
+    /// 0x1111111111111111111111111111111111111111111111111111111111111111". Reading it as
+    /// `address ++ 24 zeros` instead names a DIFFERENT subaccount that nothing ever sweeps.
+    string public constant AUCTION_SUBACCOUNT = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// @notice Nonce of the subaccount funds hop through on the way out. Anything but 0.
+    uint96 internal constant SOURCE_SUBACCOUNT_NONCE = 1;
 
     /// @notice Bank denom for each currency, e.g. "inj" or "erc20:0x…".
     mapping(Currency currency => string denom) public denomOf;
@@ -56,15 +65,20 @@ contract ExchangeSubaccountBurnSink is IBurnSink, Ownable2Step {
         uint256 amount = currency.balanceOfSelf();
         if (amount == 0) return;
 
-        // Step 1: bank balance -> this contract's own default subaccount.
-        if (!EXCHANGE.deposit(address(this), SubaccountLib.defaultSubaccount(address(this)), denom, amount)) {
-            revert DepositFailed();
-        }
+        // NOT the default subaccount. `SetDepositOrSendToBank` sweeps the integer part of a
+        // DEFAULT subaccount's available balance straight back to bank the moment it is
+        // credited ("for default subaccounts, if the integer part of the available deposit
+        // funds are non-zero, send them to bank"), so a deposit at nonce 0 never sticks and
+        // the transfer that follows fails with ErrInsufficientDeposit. v1's
+        // `choice_send_to_auction` hops through nonce 1 for exactly this reason.
+        string memory source = SubaccountLib.subaccount(address(this), SOURCE_SUBACCOUNT_NONCE);
+
+        // Step 1: bank balance -> our own non-default subaccount.
+        if (!EXCHANGE.deposit(address(this), source, denom, amount)) revert DepositFailed();
+
         // Step 2: our subaccount -> the auction subaccount. `externalTransfer` (not
         // `subaccountTransfer`) because source and destination have different owners.
-        if (!EXCHANGE.externalTransfer(
-                address(this), SubaccountLib.defaultSubaccount(address(this)), AUCTION_SUBACCOUNT, denom, amount
-            )) {
+        if (!EXCHANGE.externalTransfer(address(this), source, AUCTION_SUBACCOUNT, denom, amount)) {
             revert ExternalTransferFailed();
         }
 

@@ -5,14 +5,15 @@ import {Currency} from "infinity-core/src/types/Currency.sol";
 
 /// @notice Destination for the burn half of Choice's protocol revenue.
 ///
-/// Choice v1 reaches Injective's burn auction from CosmWasm by depositing into its own
-/// exchange subaccount and then `ExternalTransfer`-ing to the auction subaccount
-/// `0x1111…1111`. Both calls exist on the `0x65` precompile, and under MTS a plain bank
-/// transfer to the 20-byte form of that subaccount may be a one-call shortcut. Which of the
-/// two the auction module actually credits is an on-chain question that only testnet can
-/// answer (plan D8), so the controller holds this behind an interface: the losing
-/// implementation is swapped out with one setter instead of a controller redeploy, and the
-/// controller is what the pool manager points at.
+/// Injective's exchange module sweeps two places into the auction basket at the end of each
+/// round (`SubaccountKeeper.WithdrawAllAuctionBalances`): the auction SUBACCOUNT's exchange
+/// deposit, and the plain BANK BALANCE of `ExchangeAuctionFeesAddress`. Choice v1 reaches the
+/// first from CosmWasm; the second is one ERC20 transfer from the EVM. Both work, so this
+/// interface exists to let the deployment pick without a controller redeploy - the controller
+/// is what the pool manager points at, and swapping a sink is one setter.
+///
+/// `DirectTransferBurnSink` is the default (one call, no denom map).
+/// `ExchangeSubaccountBurnSink` reproduces v1's route and is the fallback.
 ///
 /// @dev The controller transfers the funds to the sink FIRST and then calls `burn`, so an
 /// implementation works from its own balance and never pulls.

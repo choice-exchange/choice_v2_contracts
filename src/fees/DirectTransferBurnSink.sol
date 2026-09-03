@@ -4,18 +4,35 @@ pragma solidity 0.8.26;
 import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
 
-/// @notice Burn sink candidate A (plan D8): one plain transfer to the auction address.
+/// @notice Burn sink A: one plain transfer to the exchange auction-fees address.
 ///
-/// Under MTS an ERC20 balance IS the bank balance, so an ordinary transfer to
-/// `0x1111…1111` - the 20-byte form of the auction subaccount v1 pays into - moves bank
-/// funds to that account with no precompile call and no denom string. If the auction module
-/// credits funds held there, this is strictly the better implementation: one call, no
-/// per-currency configuration, nothing to keep in sync.
+/// Confirmed against `injective-core`, not assumed. `SubaccountKeeper.WithdrawAllAuctionBalances`
+/// sweeps into the auction module from TWO places at the end of each auction round: the
+/// exchange deposit held by the auction subaccount, and the plain BANK BALANCE of
+/// `ExchangeAuctionFeesAddress`. That address is
+/// `sdk.AccAddress(common.HexToAddress(AuctionSubaccountID.Hex()))`, i.e. the low 20 bytes of
+/// the all-ones subaccount - `0x1111…1111` as an EVM address, `inj1zyg3zyg…t5qxqh` in bech32.
+/// Upstream's own comment on it reads: "Kept for backward compatibility with external senders
+/// (e.g. smart contracts) that already send funds here." It carried live INJ, peggy USDT, an
+/// IBC denom and an `erc20:` denom when this was checked on 2026-09-04.
 ///
-/// Whether it does is the open half of D8 and is settled on testnet by harvesting a real fee
-/// through this sink and reading the auction balance. Until then
-/// `ExchangeSubaccountBurnSink` is the conservative default, being the mechanism v1 has run
-/// for years.
+/// Under MTS an ERC20 balance IS the bank balance, so an ordinary `transfer` here needs no
+/// precompile call, no subaccount and no denom string - which is why this is the default sink
+/// and `ExchangeSubaccountBurnSink` is the fallback rather than the other way round.
+///
+/// Two caveats that apply to BOTH sinks:
+///
+/// 1. Only denoms on the exchange's auction-transfer list are swept. That list is set by
+///    genesis or by an `UpdateAuctionExchangeTransferDenomDecimalsProposal` governance
+///    proposal - it is not permissionless. A fee currency that is not on it accumulates here
+///    untouched instead of reaching the basket. See `ChoiceFeeController`'s notes.
+/// 2. Contributions land in the NEXT auction round, never the current one.
+///
+/// Upstream marks this address legacy and points new integrations at
+/// `auctiontypes.AuctionFeesSubaccountAddress`. That one is a 32-byte module-derived address
+/// (`inj18kc70l7…3a8gx9`), so an EVM contract cannot address it at all: a 20-byte EVM address
+/// cannot name it. Until a precompile exposes it, the two paths here are the only ones the
+/// EVM has.
 contract DirectTransferBurnSink is IBurnSink {
     using CurrencyLibrary for Currency;
 

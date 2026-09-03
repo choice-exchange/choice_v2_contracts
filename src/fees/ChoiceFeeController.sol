@@ -24,6 +24,16 @@ import {IBurnSink} from "../interfaces/IBurnSink.sol";
 ///
 /// The owner is the timelock (plan D13). `collectProtocolFee` stays inherited as an escape
 /// hatch for a currency the sink cannot handle.
+///
+/// @dev One operational limit inherited from the chain, not from this contract: Injective
+/// only sweeps a denom into the auction basket if it is on the exchange's auction-transfer
+/// denom list, which is set by genesis or by governance proposal
+/// (`UpdateAuctionExchangeTransferDenomDecimalsProposal`). Choice earns fees in whatever a
+/// pool trades, so a long-tail launch token generally will NOT be on that list, and its burn
+/// share would accumulate at the auction address rather than being burnt. Options, none of
+/// which belong in this contract: route non-eligible currencies through a swap to INJ before
+/// burning, or set a per-pool `treasuryBps` of 100% for them. Decide per currency before
+/// pointing a pool's fees at the burn leg.
 contract ChoiceFeeController is ProtocolFeeController {
     using CurrencyLibrary for Currency;
 
