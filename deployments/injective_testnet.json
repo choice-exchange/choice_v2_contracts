@@ -87,9 +87,9 @@
   ],
   "meta": {
     "forkPins": {
-      "infinity-core": "9aa98116aa026a966ea363ea33850a01034ecd28",
-      "infinity-periphery": "37f9314b8b8f891053e1a61899f6ec3247468a58",
-      "infinity-universal-router": "96929b54da90319677715cb5e5381ef59260f726"
+      "infinity-core": "c53aef3adbaaccd7a68086a18cbf201bed3a6fe9",
+      "infinity-periphery": "9be2647d3ea6758b32306956a9438d21e8873655",
+      "infinity-universal-router": "4d9d81af0081292e591ad26bc6a116e4ee7aee91"
     },
     "upstreamPins": {
       "infinity-core": "61cd1311737fab6b1f31e7a5a136dabdcd5f4921",
