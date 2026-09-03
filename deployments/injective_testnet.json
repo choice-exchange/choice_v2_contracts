@@ -1,0 +1,56 @@
+{
+  "$schema": "./schema.json",
+  "network": "injective_testnet",
+  "chainId": 1439,
+  "rpc": "https://k8s.testnet.json-rpc.injective.network",
+  "explorer": "https://testnet.blockscout.injective.network",
+  "external": {
+    "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+    "wINJ": "0x0000000088827d2d103ee2d9A6b781773AE03FfB",
+    "arachnidCreate2": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+    "usdt": "0xaDC7bcB5d8fe053Ef19b4E0C861c262Af6e0db60",
+    "usdc": "0x0C382e685bbeeFE5d3d9C29e29E341fEE8E84C5d",
+    "bankPrecompile": "0x0000000000000000000000000000000000000064",
+    "exchangePrecompile": "0x0000000000000000000000000000000000000065"
+  },
+  "governance": {
+    "safe": null,
+    "timelock": null,
+    "create3Factory": null,
+    "create3DeployerEOA": null,
+    "deployerEOA": null
+  },
+  "infinity": {
+    "vault": null,
+    "clPoolManager": null,
+    "binPoolManager": null,
+    "clPoolManagerOwner": null,
+    "binPoolManagerOwner": null,
+    "clPositionDescriptor": null,
+    "clPositionManager": null,
+    "binPositionManager": null,
+    "clQuoter": null,
+    "binQuoter": null,
+    "mixedQuoter": null,
+    "clTickLens": null,
+    "universalRouter": null,
+    "unsupportedProtocol": null
+  },
+  "choice": {
+    "clFeeController": null,
+    "binFeeController": null,
+    "infinitySettler": null,
+    "positionLocker": null,
+    "choiceRouter": null,
+    "treasury": null
+  },
+  "pools": [],
+  "meta": {
+    "forkPins": {
+      "infinity-core": "61cd1311737fab6b1f31e7a5a136dabdcd5f4921",
+      "infinity-periphery": "8261f8d93a23c9ba8a73060823251ba8b5ac46de",
+      "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
+    },
+    "lastUpdated": null
+  }
+}

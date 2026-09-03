@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Foundry
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      # via_ir at 25,666 runs is slow; without this cache every PR pays it in full and the
+      # org has overrun its Actions minutes before.
+      - name: Cache forge build
+        uses: actions/cache@v4
+        with:
+          path: |
+            foundry-out
+            cache
+          key: forge-${{ runner.os }}-${{ hashFiles('foundry.toml', 'remappings.txt', '.gitmodules') }}-${{ hashFiles('src/**', 'test/**', 'script/**') }}
+          restore-keys: |
+            forge-${{ runner.os }}-${{ hashFiles('foundry.toml', 'remappings.txt', '.gitmodules') }}-
+
+      - name: Format
+        run: forge fmt --check
+
+      - name: Build
+        run: forge build --sizes
+
+      - name: Test
+        run: forge test --isolate -vvv
+        env:
+          FOUNDRY_PROFILE: ci
+
+  address-book:
+    name: Address book is well formed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # deployments/*.json is the single source of truth for every consumer - frontend,
+      # backend, launchpad, sdk. A malformed or duplicated entry here ships a wrong address
+      # everywhere at once, so it is checked before anything reads it.
+      - name: Validate
+        run: |
+          fail=0
+          for f in deployments/injective_*.json; do
+            echo "checking $f"
+            jq -e . "$f" > /dev/null || { echo "::error file=$f::not valid JSON"; fail=1; continue; }
+
+            # every non-null address must be a checksummed-length 0x hex address
+            bad="$(jq -r '[paths(scalars) as $p | {p: ($p | join(".")), v: getpath($p)}]
+                          | map(select(.v != null and (.v | type) == "string" and (.v | startswith("0x"))))
+                          | map(select(.v | test("^0x[0-9a-fA-F]{40}$") | not))
+                          | map(.p) | .[]' "$f")"
+            if [ -n "$bad" ]; then
+              echo "::error file=$f::not 20-byte addresses: $bad"; fail=1
+            fi
+
+            # a single address must never appear under two different keys
+            dupes="$(jq -r '[paths(scalars) as $p | getpath($p)]
+                            | map(select(type == "string" and test("^0x[0-9a-fA-F]{40}$")))
+                            | map(ascii_downcase) | group_by(.) | map(select(length > 1)) | map(.[0]) | .[]' "$f")"
+            if [ -n "$dupes" ]; then
+              echo "::error file=$f::address appears under more than one key: $dupes"; fail=1
+            fi
+
+            # the fork pins here must match what the submodules are actually checked out at
+            for r in infinity-core infinity-periphery infinity-universal-router; do
+              pinned="$(jq -r --arg r "$r" '.meta.forkPins[$r]' "$f")"
+              actual="$(git ls-tree HEAD "lib/$r" | awk '{print $3}')"
+              if [ "$pinned" != "$actual" ]; then
+                echo "::error file=$f::meta.forkPins.$r is $pinned but the submodule is at $actual"; fail=1
+              fi
+            done
+          done
+          exit $fail

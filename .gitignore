@@ -1,0 +1,11 @@
+foundry-out/
+cache/
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Broadcasts ARE committed: an Injective deploy that dies mid-run is replayed from
+# broadcast/<script>/<chainId>/run-latest.json with `cast send`, never with --resume.
+!broadcast/
+broadcast/**/dry-run/

@@ -1,0 +1,46 @@
+# Mirrors the Infinity forks' compiler settings exactly. Any divergence here changes the
+# bytecode our contracts are built with relative to the audited protocol they link against,
+# so treat solc_version / optimizer_runs / via_ir / evm_version as pinned, not as knobs.
+[profile.default]
+src = 'src'
+out = 'foundry-out'
+libs = ['lib']
+# remappings.txt resolves forge-std / solmate / openzeppelin THROUGH lib/infinity-core so we
+# compile against exactly the dependency versions the audited Infinity bytecode was built
+# with. Never add a second top-level copy of those. (remappings.txt takes no comments.)
+test = 'test'
+script = 'script'
+solc_version = '0.8.26'
+optimizer_runs = 25_666
+via_ir = true
+# Injective sets CancunTime = 0 on both nets; TSTORE/TLOAD and MCOPY are verified to
+# execute on 1439 and 1776. Infinity's flash accounting depends on transient storage.
+evm_version = 'cancun'
+bytecode_hash = 'none'
+ffi = true
+fs_permissions = [
+    { access = "read-write", path = ".forge-snapshots/" },
+    { access = "read", path = "./foundry-out" },
+    { access = "read", path = "./deployments" },
+]
+gas_limit = "300000000"
+# Infinity's suites rely on this (see upstream foundry.toml).
+allow_internal_expect_revert = true
+
+[profile.default.fuzz]
+runs = 256
+
+[profile.ci.fuzz]
+runs = 10_000
+
+[profile.ci.invariant]
+runs = 1_000
+fail_on_revert = false
+
+[rpc_endpoints]
+injective_testnet = "https://k8s.testnet.json-rpc.injective.network"
+injective_mainnet = "https://sentry.evm-rpc.injective.network"
+
+[etherscan]
+injective_testnet = { key = "unused", chain = 1439, url = "https://testnet.blockscout.injective.network/api" }
+injective_mainnet = { key = "unused", chain = 1776, url = "https://blockscout.injective.network/api" }

@@ -1,0 +1,10 @@
+infinity-core/=lib/infinity-core/
+infinity-periphery/=lib/infinity-periphery/
+infinity-universal-router/=lib/infinity-universal-router/
+ds-test/=lib/infinity-core/lib/forge-std/lib/ds-test/src/
+forge-std/=lib/infinity-core/lib/forge-std/src/
+solmate/=lib/infinity-core/lib/solmate/
+@openzeppelin/=lib/infinity-core/lib/openzeppelin-contracts/
+openzeppelin-contracts/=lib/infinity-core/lib/openzeppelin-contracts/
+pancake-create3-factory/=lib/infinity-core/lib/pancake-create3-factory/
+permit2/=lib/infinity-periphery/lib/permit2/
