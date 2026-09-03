@@ -33,8 +33,22 @@ case "$dir" in
 esac
 
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
-( cd "$root" && forge verify-contract "$addr" "$target" --show-standard-json-input ) > "$tmp/input.json" 2>/dev/null
-[ -s "$tmp/input.json" ] || { echo "could not build standard json for $target" >&2; exit 70; }
+
+# infinity-periphery declares an extra compilation profile (`clPosm`, 9000 runs, applied only
+# to CLPositionManager.sol) alongside `default`. forge then refuses --show-standard-json-input
+# with "Ambiguous compilation profiles found in cache" for contracts in that project, and the
+# error goes to stderr while the exit status stays 0 - so an unguarded redirect silently writes
+# an EMPTY input file and the verification looks like a Blockscout problem. Try plain first,
+# fall back to naming the profile.
+err="$( { cd "$root" && forge verify-contract "$addr" "$target" --show-standard-json-input ; } 2>"$tmp/err" >"$tmp/input.json"; cat "$tmp/err" )"
+if [ ! -s "$tmp/input.json" ]; then
+  ( cd "$root" && forge verify-contract "$addr" "$target" --show-standard-json-input \
+      --compilation-profile "${COMPILATION_PROFILE:-default}" ) > "$tmp/input.json" 2>"$tmp/err"
+fi
+if [ ! -s "$tmp/input.json" ]; then
+  printf "%-28s %s  STANDARD-JSON FAILED: %s\n" "${target##*:}" "$addr" "$(head -c 200 "$tmp/err")"
+  exit 70
+fi
 
 resp="$(curl -s -m 120 -X POST "$API/api" \
   --data-urlencode "module=contract" \
