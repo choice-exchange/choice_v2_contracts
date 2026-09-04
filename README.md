@@ -11,7 +11,7 @@ Plan and decision log: `choice_v2/CHOICE_V2_EVM_PLAN.md`.
 | --- | --- |
 | `src/fees/` | `ChoiceFeeController` - `IProtocolFeeController` with Choice's tier policy, a permissionless harvest and the treasury / burn-auction split |
 | `src/launchpad/` | `InfinitySettler` (`IGraduationSettler`: seeds a full-range CL pool and calls `onSettled`, all inside `triggerGraduation`), `PositionLocker` (holds the seed NFT forever; permissionless `collect` splits LP fees creator / launchpad) and `LaunchPoolGuardHook` (only a settler may create a graduation pool) |
-| `src/router/` | *(M5, not built)* `ChoiceRouter` - holds the intermediate token across a Choice -> Pumex handoff so one end-to-end `minimumReceive` can be enforced. Routes inside one deployment do NOT go through it: `UniversalRouter`'s `INFI_SWAP` already runs a whole split, multi-hop route in a single Vault lock. There is no orderbook leg - an EVM `0x65` fill cannot be atomic (plan M5, 2026-09-04) |
+| `src/router/` | `ChoiceRouter` - holds the intermediate token across a Choice -> Pumex handoff so one end-to-end `minimumReceive` can be enforced. Routes inside one deployment do NOT go through it and `execute` REFUSES them: `UniversalRouter`'s `INFI_SWAP` already runs a whole split, multi-hop route in a single Vault lock. It locks both Vaults itself rather than calling Pumex's UniversalRouter, which is pausable by a Safe outside Choice. There is no orderbook leg - an EVM `0x65` fill cannot be atomic (plan M5, 2026-09-05) |
 | `script/` | one ordered deploy run per network, wrapping the forks' numbered scripts |
 | `deployments/` | **the** address book. Nothing else is authoritative |
 | `lib/` | the three Infinity forks as submodules, pinned by commit |
