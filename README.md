@@ -23,9 +23,15 @@ deploy. Everything Choice-specific lives here. See each fork's `INJECTIVE_FORK.m
 
 ## Build
 
+**Foundry is pinned to `v1.5.1`** — `foundryup --install v1.5.1`. CI installs that exact
+version, because `forge fmt` output changes between releases and an unpinned toolchain makes
+the format gate disagree with your machine. Bumping it is a deliberate PR: move the pin in
+`.github/workflows/ci.yml` and commit the reformat with it.
+
 ```bash
 git submodule update --init --recursive
 forge build
+forge fmt --check
 forge test --isolate
 ```
 
@@ -122,4 +128,6 @@ last verified on 2026-09-05 against the live testnet core `0xb03f…a71d`, field
 
 ## Licence
 
-GPL-2.0-or-later, following Infinity.
+GPL-2.0-or-later, following Infinity. The full text is in [LICENSE](LICENSE); [NOTICE](NOTICE)
+records the upstream copyright, the two deliberately-MIT interfaces, and where the complete
+corresponding source for every deployed contract lives.
