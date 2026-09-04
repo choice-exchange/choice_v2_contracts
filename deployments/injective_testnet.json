@@ -57,6 +57,12 @@
     "directTransferBurnSink": "0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215",
     "exchangeSubaccountBurnSink": "0xefe613636921D9d683CDe6d91FD0485D9DD2987f"
   },
+  "launchpad": {
+    "core": "0xb03fb1c05f7853601ae05ba7e3700a59dc14a71d",
+    "views": "0x60e12ebaf2d3f8a6249a934d44f502708dcb156d",
+    "treasury": "0xBf08c09Fe227ada4A86d279e98E695344848d33D",
+    "phase3Settler": "0x230a3bc958458e087f3cf4fd2eeddaffc33794e4"
+  },
   "pools": [
     {
       "pair": "wINJ/USDT",
@@ -98,7 +104,12 @@
     },
     "lastUpdated": "2026-09-04",
     "addressAliases": {
-      "choice.treasury": "the Safe: protocol revenue lands where the signers can move it without waiting out a timelock delay"
+      "choice.treasury": "the Safe: protocol revenue lands where the signers can move it without waiting out a timelock delay",
+      "launchpad": {
+        "core": "shroom_launchpad LaunchpadCore on 1439, deployed 2026-08-24. Not ours; the pad admin owns it and only the pad admin can setSeederFactory.",
+        "treasury": "the launchpad's FeeTreasury: PositionLocker sends the non-creator share of graduated LP fees here",
+        "phase3Settler": "the CW graduation path this one replaces, kept for reference"
+      }
     },
     "vaultDeployBlock": 138923726,
     "blockscoutApi": "https://testnet.blockscout-api.injective.network",
