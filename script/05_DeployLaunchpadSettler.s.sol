@@ -9,23 +9,21 @@ import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManage
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 import {ILaunchpadCore} from "../src/interfaces/ILaunchpadCore.sol";
 import {InfinitySettler} from "../src/launchpad/InfinitySettler.sol";
+import {LaunchPoolGuardHook} from "../src/launchpad/LaunchPoolGuardHook.sol";
 import {PositionLocker} from "../src/launchpad/PositionLocker.sol";
 import {BaseScript} from "./BaseScript.sol";
 
 /**
  * M4 step 1: the launchpad graduation path onto Choice v2.
  *
- * Deploys `PositionLocker` and `InfinitySettler`, wires them, and hands both to the timelock.
- * Nothing here touches the launchpad - `setSeederFactory` is the PAD ADMIN's call and is
- * printed at the end for whoever holds that key.
+ * Deploys `PositionLocker`, `LaunchPoolGuardHook` and `InfinitySettler`. Nothing here touches
+ * the launchpad - `setSeederFactory` is the PAD ADMIN's call and is printed at the end for
+ * whoever holds that key.
  *
- * Ownership, deliberately asymmetric:
- *  - the settler is born owned by the timelock. Its config has working defaults, so there is
- *    no deployer step to do first and therefore no pending-owner window to get wrong.
- *  - the locker cannot be, because `setSettler` has to run after the settler exists and the
- *    settler needs the locker's address to be constructed. So it is deployed owned by the
- *    deployer, wired, and then handed on. `Ownable2Step` means the timelock MUST
- *    `acceptOwnership` - until it does, the deployer still owns the locker.
+ * All three are born owned by the TIMELOCK, with no post-deploy wiring and no pending-owner
+ * window. That works because the locker and the hook each need to know the settler while the
+ * settler needs to know both of them, and CREATE3 breaks the circle: its address depends only
+ * on the salt, so `computeAddress(SETTLER_SALT)` is exact before the settler exists.
  *
  * forge script script/05_DeployLaunchpadSettler.s.sol:DeployLaunchpadSettler -vv \
  *     --rpc-url $RPC_URL --broadcast
@@ -36,6 +34,7 @@ import {BaseScript} from "./BaseScript.sol";
 contract DeployLaunchpadSettler is BaseScript {
     bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.0.0");
     bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.0.0");
+    bytes32 internal constant GUARD_HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolGuardHook/1.0.0");
 
     Create3Factory internal factory;
 
@@ -56,48 +55,58 @@ contract DeployLaunchpadSettler is BaseScript {
         _preflightCoreLayout(padCore);
 
         uint256 pk = deployerKey();
-        address deployer = vm.addr(pk);
+
+        // CREATE3 addresses depend only on the salt, so the settler's address is known here,
+        // before it exists. That is what lets the locker and the hook be constructed already
+        // pointing at it - and therefore already owned by the timelock.
+        address settler = factory.computeAddress(SETTLER_SALT);
+        console.log("[predicted] settler:", settler);
 
         vm.startBroadcast(pk);
 
-        // The locker holds the seed NFTs. Deployer-owned for now; handed on below.
         address locker = _deploy(
             LOCKER_SALT,
-            abi.encodePacked(type(PositionLocker).creationCode, abi.encode(positionManager, padTreasury, deployer))
-        );
-
-        address settler = _deploy(
-            SETTLER_SALT,
             abi.encodePacked(
-                type(InfinitySettler).creationCode,
-                abi.encode(padCore, clPoolManager, positionManager, permit2, locker, timelock)
+                type(PositionLocker).creationCode, abi.encode(positionManager, padTreasury, timelock, settler)
             )
         );
 
-        if (PositionLocker(payable(locker)).settler() != settler) {
-            PositionLocker(payable(locker)).setSettler(settler);
-            console.log("  locker.setSettler ->", settler);
-        }
+        // Without this hook a launch's pool can be created by anyone, at any price, for the
+        // cost of gas - see LaunchPoolGuardHook for the attack and why refusing to seed is a
+        // wedge rather than a defence.
+        address guardHook = _deploy(
+            GUARD_HOOK_SALT, abi.encodePacked(type(LaunchPoolGuardHook).creationCode, abi.encode(timelock, settler))
+        );
 
-        // Sets pendingOwner only. The timelock has to accept, from the Safe:
-        //   ./script/tools/safe-exec.sh <timelock> schedule/execute -> locker.acceptOwnership()
-        if (PositionLocker(payable(locker)).owner() == deployer) {
-            Ownable(locker).transferOwnership(timelock);
-            console.log("  locker ownership offered to the timelock; it must acceptOwnership()");
-        }
+        address deployedSettler = _deploy(
+            SETTLER_SALT,
+            abi.encodePacked(
+                type(InfinitySettler).creationCode,
+                abi.encode(padCore, clPoolManager, positionManager, permit2, locker, guardHook, timelock)
+            )
+        );
+        require(deployedSettler == settler, "settler address prediction is wrong");
 
         vm.stopBroadcast();
 
+        // Every link is set at construction, so this is an assertion rather than a step.
+        require(PositionLocker(payable(locker)).settler() == settler, "locker is not wired to the settler");
+        require(LaunchPoolGuardHook(guardHook).isInitializer(settler), "the guard hook does not allow the settler");
+        require(address(InfinitySettler(settler).LOCKER()) == locker, "settler is not wired to the locker");
+        require(address(InfinitySettler(settler).hooks()) == guardHook, "settler is not wired to the guard hook");
+
         writeAddress("choice.positionLocker", locker);
+        writeAddress("choice.launchPoolGuardHook", guardHook);
         writeAddress("choice.infinitySettler", settler);
 
         console.log("");
-        console.log("Remaining, and neither is ours to send:");
-        console.log("  1. timelock (via the Safe): PositionLocker.acceptOwnership() at", locker);
-        console.log("  2. LAUNCHPAD ADMIN on", padCore);
+        console.log("One step remains, and the key is not ours:");
+        console.log("  LAUNCHPAD ADMIN on", padCore);
         console.log("     setSeederFactory(%s)", settler);
         console.log("     Only launches created AFTER that call graduate onto v2 - the pad");
         console.log("     snapshots the settler per launch, so in-flight ones keep the CW path.");
+        console.log("");
+        console.log("  Ownership needs nothing: all three are timelock-owned from construction.");
     }
 
     /// @dev The settler decodes `creator` and `creatorFeeShareBps` straight out of the core's

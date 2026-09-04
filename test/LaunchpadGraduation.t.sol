@@ -33,7 +33,9 @@ import {IWETH9} from "infinity-periphery/src/interfaces/external/IWETH9.sol";
 import {ChoiceFeeController} from "../src/fees/ChoiceFeeController.sol";
 import {IBurnSink} from "../src/interfaces/IBurnSink.sol";
 import {ILaunchpadCore} from "../src/interfaces/ILaunchpadCore.sol";
+import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {InfinitySettler} from "../src/launchpad/InfinitySettler.sol";
+import {LaunchPoolGuardHook} from "../src/launchpad/LaunchPoolGuardHook.sol";
 import {PositionLocker} from "../src/launchpad/PositionLocker.sol";
 import {MockLaunchpadCore} from "./mocks/MockLaunchpadCore.sol";
 
@@ -104,6 +106,7 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     MockLaunchpadCore internal core;
     PositionLocker internal locker;
     InfinitySettler internal settler;
+    LaunchPoolGuardHook internal guardHook;
 
     MockERC20 internal launchToken;
     MockERC20 internal pairToken;
@@ -142,10 +145,17 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         swapRouter = new CLPoolManagerRouter(vault, clPoolManager);
 
         core = new MockLaunchpadCore();
-        locker = new PositionLocker(posm, PAD_TREASURY, OWNER);
-        settler = new InfinitySettler(ILaunchpadCore(address(core)), clPoolManager, posm, permit2, locker, OWNER);
-        vm.prank(OWNER);
-        locker.setSettler(address(settler));
+
+        // The locker and the hook both have to know the settler, and the settler has to know
+        // both of them. On chain that circle is closed by CREATE3, whose address depends only
+        // on the salt; here by predicting the CREATE address. Either way all three contracts
+        // are born owned by the timelock, with no post-deploy wiring to forget.
+        address predictedSettler = vm.computeCreateAddress(address(this), vm.getNonce(address(this)) + 2);
+        locker = new PositionLocker(posm, PAD_TREASURY, OWNER, predictedSettler);
+        guardHook = new LaunchPoolGuardHook(OWNER, predictedSettler);
+        settler =
+            new InfinitySettler(ILaunchpadCore(address(core)), clPoolManager, posm, permit2, locker, guardHook, OWNER);
+        assertEq(address(settler), predictedSettler, "settler address prediction is wrong");
 
         (launchToken, pairToken) = _orderedPair({launchIsCurrency0: true, launchDecimals: 18, pairDecimals: 18});
     }
@@ -365,60 +375,129 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     // The camped-pool grief, and the way out of it
     // =====================================================================================
 
-    /// @dev Initialising an Infinity pool is free and permissionless, and a launch token's
-    /// address is public from bind time. Seeding into a pool someone opened at their own
-    /// price hands them the difference on the first arb, so this must not happen.
-    function test_preInitialisedPoolAtAWrongPriceBlocksGraduation() public {
+    /// @dev The grief this hook exists for: initialising an Infinity pool is free and
+    /// permissionless, and a launch token's address is public from bind time. Without the
+    /// guard, anyone could open the pool a graduation is going to use, at a price of their
+    /// choosing, and take the difference from the seed on the first arb.
+    function test_grieferCannotCreateTheGraduationPool() public {
         _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
-
-        // A griefer opens the pool 100x away from the curve's ratio.
         PoolKey memory key = _key();
+
         vm.prank(RANDOM);
-        posm.initializePool(key, _sqrtPriceX96(SEED_TOKEN, SEED_PAIR * 100));
-
         vm.expectRevert();
-        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        clPoolManager.initialize(key, _sqrtPriceX96(SEED_TOKEN, SEED_PAIR * 100));
 
-        // Nothing moved: the launch is still fillable and the core still holds both legs.
-        assertEq(
-            uint8(core.getLaunchState(LAUNCH_ID)),
-            uint8(ILaunchpadCore.LaunchState.CurveFilled),
-            "a blocked graduation must leave the launch retryable"
-        );
-        assertEq(launchToken.balanceOf(address(core)), SEED_TOKEN, "core lost the seed");
-        assertEq(pairToken.balanceOf(address(core)), SEED_PAIR, "core lost the raise");
-    }
-
-    /// @dev And the recovery: move to a tier the griefer has not camped, then retry.
-    function test_tierFlipRecoversFromACampedPool() public {
-        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        // 🔴 Through the position manager it does not even revert: `initializePool` wraps the
+        // pool manager in a try/catch and swallows every error, returning `type(int24).max`.
+        // So the griefer's attempt is a silent no-op - and this is exactly why the settler
+        // initialises through the pool manager directly, where a rejection is loud.
         vm.prank(RANDOM);
-        posm.initializePool(_key(), _sqrtPriceX96(SEED_TOKEN, SEED_PAIR * 100));
+        int24 swallowed = posm.initializePool(key, _sqrtPriceX96(SEED_TOKEN, SEED_PAIR * 100));
+        assertEq(swallowed, type(int24).max, "the position manager did not swallow the rejection");
 
-        vm.expectRevert();
+        (uint160 price,,,) = clPoolManager.getSlot0(key.toId());
+        assertEq(price, 0, "the pool exists, so somebody got in");
+
+        // And graduation still works, at the curve's own ratio.
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
-
-        vm.prank(OWNER);
-        settler.setTier(2011, 60); // the 0.30% tier
-
-        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
-        assertEq(uint8(core.getLaunchState(LAUNCH_ID)), uint8(ILaunchpadCore.LaunchState.Graduated));
         _assertPoolPriceMatchesRatio(_key(), SEED_TOKEN, SEED_PAIR);
     }
 
-    /// @dev A pool someone opened at approximately the right price is used as it is - the
-    /// band exists so an honest race does not wedge a graduation.
-    function test_preInitialisedPoolInsideTheBandIsUsed() public {
+    /// @dev The consolation prize a griefer still has: a HOOKLESS pool for the same pair. It
+    /// is a different `PoolKey`, so it is a different pool - empty, unrouted, and irrelevant.
+    function test_aGrieferHooklessPoolDoesNotTouchTheGraduation() public {
         _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        (Currency currency0, Currency currency1) = _currencies();
+        PoolKey memory junk = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            hooks: IHooks(address(0)),
+            poolManager: IPoolManager(address(clPoolManager)),
+            fee: settler.lpFee(),
+            parameters: bytes32(0).setTickSpacing(settler.tickSpacing())
+        });
 
-        // 10 bps off in sqrt terms, inside the 100 bps default.
-        uint160 target = _sqrtPriceX96(SEED_TOKEN, SEED_PAIR);
         vm.prank(RANDOM);
-        posm.initializePool(_key(), uint160(uint256(target) * 10_010 / 10_000));
+        posm.initializePool(junk, _sqrtPriceX96(SEED_TOKEN, SEED_PAIR * 100));
+        assertTrue(PoolId.unwrap(junk.toId()) != PoolId.unwrap(_key().toId()), "same pool, not a different key");
+
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        _assertPoolPriceMatchesRatio(_key(), SEED_TOKEN, SEED_PAIR);
+        assertGt(locker.positionLiquidity(LAUNCH_ID), 0);
+    }
+
+    /// @dev The guard is an allowlist, not a hard-coded address, so a settler can be replaced
+    /// without stranding the launches the old one graduated.
+    function test_ownerCanAllowAndRevokeAnInitializer() public {
+        assertTrue(guardHook.isInitializer(address(settler)));
+
+        vm.prank(OWNER);
+        guardHook.setInitializer(RANDOM, true);
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        // Resolve the key BEFORE pranking: `_key()` calls the settler, and the first external
+        // call would otherwise spend the prank.
+        PoolKey memory key = _key();
+        uint160 price = _sqrtPriceX96(SEED_TOKEN, SEED_PAIR);
+        vm.prank(RANDOM);
+        clPoolManager.initialize(key, price); // now allowed
+
+        vm.prank(OWNER);
+        guardHook.setInitializer(address(settler), false);
+        (launchToken, pairToken) = _orderedPair({launchIsCurrency0: true, launchDecimals: 18, pairDecimals: 18});
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        vm.expectRevert();
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+    }
+
+    function test_onlyTheOwnerCanChangeTheAllowlist() public {
+        vm.prank(RANDOM);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, RANDOM));
+        guardHook.setInitializer(RANDOM, true);
+    }
+
+    /// @dev The hook registers `beforeInitialize` and nothing else, which is what makes it
+    /// inert once a pool exists: no swap, liquidity or donate callback can reach it, so a
+    /// broken or abandoned hook can never freeze a graduated pool.
+    function test_theHookIsInertOnceThePoolExists() public {
+        assertEq(guardHook.getHooksRegistrationBitmap(), 1, "the hook registers more than beforeInitialize");
+
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        // Nothing below routes through the hook, and all of it still works.
+        _swap(_key(), true, 10e18);
+        _swap(_key(), false, 1e18);
+        _mintPositionTo(RANDOM);
+        locker.collect(LAUNCH_ID);
+    }
+
+    /// @dev The price band is defence in depth now rather than the defence: with the guard in
+    /// place only an allowlisted settler can create the pool at all. It still has to hold, for
+    /// the case of a second settler that got there first.
+    function test_theBandStillRejectsAMispricedPoolFromAnAllowedInitializer() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        vm.prank(OWNER);
+        guardHook.setInitializer(RANDOM, true);
+
+        PoolKey memory key = _key();
+        uint160 wrongPrice = _sqrtPriceX96(SEED_TOKEN, SEED_PAIR * 100);
+        vm.prank(RANDOM);
+        clPoolManager.initialize(key, wrongPrice);
+
+        vm.expectRevert();
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        assertEq(uint8(core.getLaunchState(LAUNCH_ID)), uint8(ILaunchpadCore.LaunchState.CurveFilled));
+
+        // ... and inside the band it is used as it is.
+        vm.prank(OWNER);
+        settler.setPoolConfig(2011, 60, guardHook);
+        PoolKey memory retryKey = _key();
+        uint160 nearTarget = uint160(uint256(_sqrtPriceX96(SEED_TOKEN, SEED_PAIR)) * 10_010 / 10_000);
+        vm.prank(RANDOM);
+        clPoolManager.initialize(retryKey, nearTarget);
 
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
         assertEq(uint8(core.getLaunchState(LAUNCH_ID)), uint8(ILaunchpadCore.LaunchState.Graduated));
-        assertGt(locker.positionLiquidity(LAUNCH_ID), 0);
     }
 
     // =====================================================================================
@@ -502,7 +581,7 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     function test_ownerOnlyConfiguration() public {
         vm.prank(RANDOM);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, RANDOM));
-        settler.setTier(2011, 60);
+        settler.setPoolConfig(2011, 60, guardHook);
 
         vm.prank(RANDOM);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, RANDOM));
@@ -510,7 +589,11 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
 
         vm.prank(OWNER);
         vm.expectRevert(abi.encodeWithSelector(InfinitySettler.InvalidTier.selector, uint24(3000), int24(0)));
-        settler.setTier(3000, 0);
+        settler.setPoolConfig(3000, 0, guardHook);
+
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(InfinitySettler.HookHasNoCode.selector, RANDOM));
+        settler.setPoolConfig(2011, 60, IHooks(RANDOM));
 
         vm.prank(OWNER);
         vm.expectRevert(abi.encodeWithSelector(InfinitySettler.InvalidToleranceBps.selector, uint16(10_001)));
@@ -546,10 +629,10 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         return PoolKey({
             currency0: currency0,
             currency1: currency1,
-            hooks: IHooks(address(0)),
+            hooks: settler.hooks(),
             poolManager: IPoolManager(address(clPoolManager)),
             fee: settler.lpFee(),
-            parameters: bytes32(0).setTickSpacing(settler.tickSpacing())
+            parameters: settler.poolParameters()
         });
     }
 

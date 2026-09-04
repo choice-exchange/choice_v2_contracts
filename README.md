@@ -10,7 +10,7 @@ Plan and decision log: `choice_v2/CHOICE_V2_EVM_PLAN.md`.
 | Path | |
 | --- | --- |
 | `src/fees/` | `ChoiceFeeController` - `IProtocolFeeController` with Choice's tier policy, a permissionless harvest and the treasury / burn-auction split |
-| `src/launchpad/` | `InfinitySettler` (`IGraduationSettler`: seeds a full-range CL pool and calls `onSettled`, all inside `triggerGraduation`) and `PositionLocker` (holds the seed NFT forever; permissionless `collect` splits LP fees creator / launchpad) |
+| `src/launchpad/` | `InfinitySettler` (`IGraduationSettler`: seeds a full-range CL pool and calls `onSettled`, all inside `triggerGraduation`), `PositionLocker` (holds the seed NFT forever; permissionless `collect` splits LP fees creator / launchpad) and `LaunchPoolGuardHook` (only a settler may create a graduation pool) |
 | `src/router/` | *(M5, not built)* `ChoiceRouter` - holds the intermediate token across a Choice -> Pumex handoff so one end-to-end `minimumReceive` can be enforced. Routes inside one deployment do NOT go through it: `UniversalRouter`'s `INFI_SWAP` already runs a whole split, multi-hop route in a single Vault lock. There is no orderbook leg - an EVM `0x65` fill cannot be atomic (plan M5, 2026-09-04) |
 | `script/` | one ordered deploy run per network, wrapping the forks' numbered scripts |
 | `deployments/` | **the** address book. Nothing else is authoritative |
@@ -73,13 +73,37 @@ Graduation costs about **900k gas** end to end (pool init + full-range mint + th
 `eth_estimateGas` under-reports, so whatever sends `triggerGraduation` needs an explicit,
 generous gas limit rather than an estimate.
 
-Deploy with `script/05_DeployLaunchpadSettler.s.sol`. Two things it deliberately does not do,
-because neither key is ours:
+### The pool is un-campable, and that needs a hook
 
-1. the timelock must `acceptOwnership()` on the locker (`safe-exec.sh`);
-2. the **launchpad admin** must call `setSeederFactory(<settler>)` on its core. Only launches
-   created after that call graduate onto v2 - the pad snapshots the settler per launch, so
-   everything in flight keeps the CosmWasm path.
+Initialising an Infinity pool is free, permissionless, and sets the price with no liquidity
+behind it - and a launch token's address is public from `bindLaunchToken` onward. Anyone could
+open the pool a graduation was going to use, at a price of their choosing, and take the
+difference from the seed on the first arb. Refusing to seed a mispriced pool is a wedge, not a
+defence: there are only four canonical tiers, so camping all of them costs four times the gas
+of camping one.
+
+`LaunchPoolGuardHook` closes it: `beforeInitialize` reverts unless the caller is an allowlisted
+settler, so nobody else can create the pool at any price, funded or not. It registers
+`beforeInitialize` and **nothing else**, which `Hooks.validateHookConfig` enforces at
+initialize - so the hook is called exactly once in a pool's life and can never tax a swap,
+block a withdrawal or freeze a pool afterwards, even if it broke. Infinity carries hook
+permissions in `PoolKey.parameters` rather than in the hook's address bits, so no address
+mining is involved. A griefer can still open a *hookless* pool for the same pair; that is a
+different `PoolKey`, it holds no liquidity, and the graduation ignores it.
+
+🔴 **The settler initialises through `CLPoolManager.initialize`, never
+`CLPositionManager.initializePool`.** Two reasons, both load-bearing: the hook is handed the
+`msg.sender` of the pool-manager call, so the position manager would mask the settler; and
+`initializePool` wraps the call in a try/catch that **swallows every error**, so a rejection
+would come back as `type(int24).max` instead of a revert.
+
+Deploy with `script/05_DeployLaunchpadSettler.s.sol`. All three contracts are born owned by the
+timelock — the locker and the hook are constructed already pointing at the settler, whose
+CREATE3 address is known before it exists — so there is no ownership handoff and no
+pending-owner window. One step remains, and the key is not ours: the **launchpad admin** must
+call `setSeederFactory(<settler>)` on its core. Only launches created after that call graduate
+onto v2; the pad snapshots the settler per launch, so everything in flight keeps the CosmWasm
+path.
 
 ### The one coupling to watch
 
