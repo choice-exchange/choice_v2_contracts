@@ -1,0 +1,33 @@
+Choice v2 contracts
+Copyright (C) 2026 Choice Exchange
+
+This program is free software; you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software Foundation;
+either version 2 of the License, or (at your option) any later version. See LICENSE
+for the full text.
+
+Third-party code
+----------------
+
+This work builds on PancakeSwap Infinity, Copyright (C) PancakeSwap, licensed
+GPL-2.0-or-later. Nothing under Infinity's `src/` is modified here or in Choice's forks
+of it; the forks add deploy configuration only, and each records its own diff against
+upstream in `INJECTIVE_FORK.md`.
+
+The complete corresponding source for every contract Choice deploys is:
+
+  choice-exchange/choice_v2_contracts          this repository
+  choice-exchange/infinity-core                fork of pancakeswap/infinity-core
+  choice-exchange/infinity-periphery           fork of pancakeswap/infinity-periphery
+  choice-exchange/infinity-universal-router    fork of pancakeswap/infinity-universal-router
+
+The three forks are pinned by commit in `.gitmodules` / `lib/`, and the same commits are
+recorded in `meta.forkPins` in the address book under `deployments/`, so the exact source
+behind any deployed address is recoverable from this repository alone.
+
+Two files carry a different identifier and it is deliberate:
+
+  src/interfaces/IGraduationSettler.sol   MIT, mirrored from shroom_launchpad
+  src/interfaces/ILaunchpadCore.sol       MIT, mirrored from shroom_launchpad
+
+MIT is GPL-compatible, so the combined work remains distributable under the GPL.

@@ -122,4 +122,6 @@ last verified on 2026-09-05 against the live testnet core `0xb03f…a71d`, field
 
 ## Licence
 
-GPL-2.0-or-later, following Infinity.
+GPL-2.0-or-later, following Infinity. The full text is in [LICENSE](LICENSE); [NOTICE](NOTICE)
+records the upstream copyright, the two deliberately-MIT interfaces, and where the complete
+corresponding source for every deployed contract lives.
