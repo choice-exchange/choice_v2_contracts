@@ -21,10 +21,16 @@ jobs:
         with:
           submodules: recursive
 
+      # PINNED, not `stable`. `forge fmt` output changes between Foundry releases, so an
+      # unpinned toolchain turns this gate red overnight with no code change - it did, on
+      # 1.8.1, the moment checkout started working (2026-09-05). The workspace calls local
+      # `forge fmt --check` + `forge test --isolate` the real gate; that is only true while
+      # CI runs the same version the dev box does. Bumping is a deliberate PR: change this
+      # pin and commit the reformat together.
       - name: Install Foundry
         uses: foundry-rs/foundry-toolchain@v1
         with:
-          version: stable
+          version: v1.5.1
 
       # via_ir at 25,666 runs is slow; without this cache every PR pays it in full and the
       # org has overrun its Actions minutes before.
