@@ -93,12 +93,22 @@ contract PositionLocker is Ownable2Step, ReentrancyGuardTransient, IERC721Receiv
     event LaunchpadTreasuryUpdated(address oldTreasury, address newTreasury);
     event TokenSwept(Currency indexed currency, address indexed to, uint256 amount);
 
-    constructor(ICLPositionManager _positionManager, address _launchpadTreasury, address _owner) Ownable(_owner) {
-        if (address(_positionManager) == address(0) || _launchpadTreasury == address(0) || _owner == address(0)) {
+    /// @param _settler The settler, whose CREATE3 address is known before it is deployed. Set
+    /// here rather than through a post-deploy `setSettler` so this contract can be born owned
+    /// by the timelock instead of by a deployer that still has wiring left to do.
+    constructor(ICLPositionManager _positionManager, address _launchpadTreasury, address _owner, address _settler)
+        Ownable(_owner)
+    {
+        if (
+            address(_positionManager) == address(0) || _launchpadTreasury == address(0) || _owner == address(0)
+                || _settler == address(0)
+        ) {
             revert ZeroAddress();
         }
         POSITION_MANAGER = _positionManager;
         launchpadTreasury = _launchpadTreasury;
+        settler = _settler;
+        emit SettlerUpdated(address(0), _settler);
     }
 
     // -------------------------------------------------------------------------------------

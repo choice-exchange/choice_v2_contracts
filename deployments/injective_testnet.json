@@ -52,6 +52,7 @@
     "binFeeController": "0x1aceba7d060Af651553fE850C17938e2F0580066",
     "infinitySettler": null,
     "positionLocker": null,
+    "launchPoolGuardHook": null,
     "choiceRouter": null,
     "treasury": "0x0ee0Db41E787FdFcD0a35680074935C6bdC00237",
     "directTransferBurnSink": "0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215",

@@ -25,6 +25,7 @@ import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLP
 
 import {IGraduationSettler} from "../interfaces/IGraduationSettler.sol";
 import {ILaunchpadCore} from "../interfaces/ILaunchpadCore.sol";
+import {LaunchPoolGuardHook} from "./LaunchPoolGuardHook.sol";
 import {PositionLocker} from "./PositionLocker.sol";
 
 /// @title InfinitySettler
@@ -99,6 +100,16 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
     /// @notice Tick spacing of that tier.
     int24 public tickSpacing = 200;
 
+    /// @notice The hook every graduation pool is keyed to.
+    ///
+    /// @dev `LaunchPoolGuardHook` permissions `beforeInitialize` to this settler, which is
+    /// what makes the pool un-campable - see that contract for the attack. It is configuration
+    /// rather than an immutable because `lpFee`, `tickSpacing` and `hooks` jointly ARE the
+    /// pool key, and a future `LaunchFeeHook` (plan D11) has to be reachable without
+    /// redeploying this. Changing it only affects launches that graduate afterwards; a pool
+    /// already created keeps the hook in its identity forever.
+    IHooks public hooks;
+
     /// @notice How far a pre-existing pool's sqrt price may sit from the curve's ratio before
     /// this contract refuses to seed it, in bps of the target sqrt price.
     ///
@@ -121,6 +132,7 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
     error PriceOutOfRange(uint256 sqrtPriceX96);
     error ZeroLiquidity();
     error InvalidTier(uint24 lpFee, int24 tickSpacing);
+    error HookHasNoCode(address hooks);
     error InvalidToleranceBps(uint16 bps);
     error LayoutMismatch(bytes32 word);
 
@@ -135,7 +147,9 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         uint256 residue0,
         uint256 residue1
     );
-    event TierUpdated(uint24 oldLpFee, int24 oldTickSpacing, uint24 newLpFee, int24 newTickSpacing);
+    event PoolConfigUpdated(
+        uint24 oldLpFee, int24 oldTickSpacing, IHooks oldHooks, uint24 newLpFee, int24 newTickSpacing, IHooks newHooks
+    );
     event PriceToleranceUpdated(uint16 oldBps, uint16 newBps);
     event TokenSwept(Currency indexed currency, address indexed to, uint256 amount);
 
@@ -145,12 +159,13 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         ICLPositionManager _positionManager,
         IAllowanceTransfer _permit2,
         PositionLocker _locker,
+        LaunchPoolGuardHook _hooks,
         address _owner
     ) Ownable(_owner) {
         if (
             address(_core) == address(0) || address(_clPoolManager) == address(0)
                 || address(_positionManager) == address(0) || address(_permit2) == address(0)
-                || address(_locker) == address(0) || _owner == address(0)
+                || address(_locker) == address(0) || address(_hooks) == address(0) || _owner == address(0)
         ) revert ZeroAddress();
 
         CORE = _core;
@@ -158,6 +173,7 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         POSITION_MANAGER = _positionManager;
         PERMIT2 = _permit2;
         LOCKER = _locker;
+        hooks = _hooks;
     }
 
     // -------------------------------------------------------------------------------------
@@ -189,10 +205,10 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         PoolKey memory key = PoolKey({
             currency0: currency0,
             currency1: currency1,
-            hooks: IHooks(address(0)),
+            hooks: hooks,
             poolManager: IPoolManager(address(CL_POOL_MANAGER)),
             fee: lpFee,
-            parameters: bytes32(0).setTickSpacing(spacing)
+            parameters: poolParameters()
         });
 
         uint160 sqrtPriceX96 = _initializePool(key, amount0, amount1);
@@ -238,7 +254,10 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         (uint160 existing,,,) = CL_POOL_MANAGER.getSlot0(key.toId());
 
         if (existing == 0) {
-            POSITION_MANAGER.initializePool(key, target);
+            // 🔴 Directly, NOT through `CLPositionManager.initializePool`. The guard hook is
+            // handed `msg.sender` of `CLPoolManager.initialize`, so routing through the
+            // position manager would present IT as the caller and the guard would reject us.
+            CL_POOL_MANAGER.initialize(key, target);
             return target;
         }
 
@@ -359,18 +378,39 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
     // Owner
     // -------------------------------------------------------------------------------------
 
-    /// @notice Point graduations at a different fee tier.
-    /// @dev Also the recovery lever for a camped pool - see `priceToleranceBps`. Takes the LP
-    /// leg in pips, not the tier: ask the fee controller for `getLPFeeFromTotalFee(tier)`.
-    function setTier(uint24 newLpFee, int24 newTickSpacing) external onlyOwner {
+    /// @notice The `parameters` word of the pool key: the hook's own registration bitmap in
+    /// the low 16 bits, the tick spacing above it.
+    /// @dev Read from the hook rather than stored, so the key can never claim a permission set
+    /// the hook does not actually implement - `Hooks.validateHookConfig` rejects that pool
+    /// anyway, and a mismatch would surface as an unexplained revert inside a graduation.
+    function poolParameters() public view returns (bytes32) {
+        IHooks _hooks = hooks;
+        uint16 bitmap = address(_hooks) == address(0) ? 0 : _hooks.getHooksRegistrationBitmap();
+        return bytes32(uint256(bitmap)).setTickSpacing(tickSpacing);
+    }
+
+    /// @notice Point graduations at a different pool: fee tier, spacing, hook.
+    ///
+    /// @dev These three fields ARE the pool key, so they move together. Takes the LP leg in
+    /// pips, not the tier - ask the fee controller for `getLPFeeFromTotalFee(tier)`. Passing
+    /// `address(0)` for the hook is allowed but removes the camping guard, so it is only for
+    /// a deployment that has some other protection; the normal move is a new hook.
+    function setPoolConfig(uint24 newLpFee, int24 newTickSpacing, IHooks newHooks) external onlyOwner {
         // Upstream's own bounds: an LP fee above 100% is unrepresentable and a non-positive
-        // spacing bricks the full-range alignment below.
+        // spacing bricks the full-range alignment.
         if (newLpFee > 1_000_000 || newTickSpacing <= 0 || newTickSpacing > TickMath.MAX_TICK_SPACING) {
             revert InvalidTier(newLpFee, newTickSpacing);
         }
-        emit TierUpdated(lpFee, tickSpacing, newLpFee, newTickSpacing);
+        // A hook with no code answers `getHooksRegistrationBitmap` with empty returndata,
+        // which decodes as 0 and would silently key every future pool to a bitmap the pool
+        // manager then rejects. Fail here instead, where the error says what is wrong.
+        if (address(newHooks) != address(0) && address(newHooks).code.length == 0) {
+            revert HookHasNoCode(address(newHooks));
+        }
+        emit PoolConfigUpdated(lpFee, tickSpacing, hooks, newLpFee, newTickSpacing, newHooks);
         lpFee = newLpFee;
         tickSpacing = newTickSpacing;
+        hooks = newHooks;
     }
 
     function setPriceToleranceBps(uint16 newBps) external onlyOwner {
