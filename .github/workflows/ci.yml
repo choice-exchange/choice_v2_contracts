@@ -48,7 +48,39 @@ jobs:
         run: forge fmt --check
 
       - name: Build
-        run: forge build --sizes
+        run: forge build
+
+      # EIP-170, checked on the contracts THIS repo deploys. Plain `forge build --sizes`
+      # cannot be used: it fails on upstream's CLPositionManager, which infinity-periphery
+      # compiles at 9,000 optimizer runs (a compilation_restrictions entry) precisely so it
+      # fits, while this repo has one flat profile at 25,666 runs. That oversized artifact is
+      # a byproduct nothing here deploys - periphery's own script 02 deploys it, under
+      # periphery's profile.
+      - name: Contract sizes
+        run: |
+          ours="$(find src -name '*.sol' \
+                  -exec sed -n 's/^ *\(abstract \)\?contract \([A-Za-z0-9_]*\).*/\2/p' {} + \
+                  | sort -u | jq -R . | jq -sc .)"
+          # forge exits 1 - and prints "some contracts exceed the runtime size limit" - when
+          # ANY artifact is over, upstream's included, so neither its exit code nor its stderr
+          # is the signal here; both are dropped so a passing step does not read as an error.
+          # The JSON is the signal, and the three guards below are what make dropping them
+          # safe: no report, a missing contract, or a negative margin each fail the step.
+          # `forge build` above is what catches a real compile error, before this ever runs.
+          forge build --sizes --json > "$RUNNER_TEMP/sizes.json" 2>/dev/null || true
+          jq -e 'type == "object" and length > 0' "$RUNNER_TEMP/sizes.json" > /dev/null \
+            || { echo "::error::forge produced no size report"; exit 1; }
+          # a renamed or deleted contract has to break this, not silently shrink the gate
+          missing="$(jq -r --argjson ours "$ours" '$ours - keys | join(", ")' "$RUNNER_TEMP/sizes.json")"
+          [ -z "$missing" ] || { echo "::error::not in the size report: $missing"; exit 1; }
+          over="$(jq -r --argjson ours "$ours" '
+            to_entries
+            | map(select((.key as $k | $ours | index($k)) and .value.runtime_margin < 0))
+            | map("\(.key) is \(-.value.runtime_margin) bytes over") | join("; ")' "$RUNNER_TEMP/sizes.json")"
+          [ -z "$over" ] || { echo "::error::EIP-170: $over"; exit 1; }
+          jq -r --argjson ours "$ours" 'to_entries | map(select(.key as $k | $ours | index($k)))
+            | .[] | "  \(.key): \(.value.runtime_size) bytes, \(.value.runtime_margin) to spare"' \
+            "$RUNNER_TEMP/sizes.json"
 
       - name: Test
         run: forge test --isolate -vvv
