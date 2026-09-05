@@ -11,7 +11,7 @@ Plan and decision log: `choice_v2/CHOICE_V2_EVM_PLAN.md`.
 | --- | --- |
 | `src/fees/` | `ChoiceFeeController` - `IProtocolFeeController` with Choice's tier policy, a permissionless harvest and the treasury / burn-auction split |
 | `src/launchpad/` | `InfinitySettler` (`IGraduationSettler`: seeds a full-range CL pool and calls `onSettled`, all inside `triggerGraduation`), `PositionLocker` (holds the seed NFT forever; permissionless `collect` splits LP fees creator / launchpad) and `LaunchPoolGuardHook` (only a settler may create a graduation pool) |
-| `src/router/` | `ChoiceRouter` - holds the intermediate token across a Choice -> Pumex handoff so one end-to-end `minimumReceive` can be enforced. Routes inside one deployment do NOT go through it and `execute` REFUSES them: `UniversalRouter`'s `INFI_SWAP` already runs a whole split, multi-hop route in a single Vault lock. It locks both Vaults itself rather than calling Pumex's UniversalRouter, which is pausable by a Safe outside Choice. There is no orderbook leg - an EVM `0x65` fill cannot be atomic (plan M5, 2026-09-05) |
+| `src/router/` | `ChoiceRouter` - holds the intermediate token across a Choice -> Pumex handoff so one end-to-end `minimumReceive` can be enforced. Routes inside one deployment do NOT go through it and `execute` REFUSES them: `UniversalRouter`'s `INFI_SWAP` already runs a whole split, multi-hop route in a single Vault lock. It locks both Vaults itself rather than calling Pumex's UniversalRouter, which is pausable by a Safe outside Choice. There is no orderbook leg - an EVM `0x65` fill cannot be atomic (plan M5, 2026-09-05). ⚠️ Deployed on testnet 1439 but INERT there: only Choice's vault exists on that chain, so every route is single-deployment and `execute` reverts `NotCrossVault` until a second vault is allowlisted with `setVault` |
 | `script/` | one ordered deploy run per network, wrapping the forks' numbered scripts |
 | `deployments/` | **the** address book. Nothing else is authoritative |
 | `lib/` | the three Infinity forks as submodules, pinned by commit |
@@ -47,11 +47,20 @@ While the forks live only on disk, submodules point at `../forks/*`. Run
 Injective RPCs can return `null` for a mined tx's receipt, and `forge --resume` has hung for
 ten minutes on a real deploy.
 
-- Broadcast with `--slow`, through the k8s testnet RPC or (mainnet) sentry / our own node.
-  Never through polkachu, which serves no receipts.
+- 🔴 **Broadcast WITHOUT `--slow`.** This file said the opposite until 2026-09-05 and it was
+  wrong: `--slow` waits for a receipt Injective never serves, so it strands the run after its
+  FIRST transaction. Without it every transaction is broadcast before the receipt polling
+  fails, so they all land — the run then EXITS NON-ZERO with "Failure on receiving a
+  receipt" for each. That is the expected ending, not a failure.
+- 🔴 **Pass an explicit, generous `--gas-limit` on every write.** `eth_estimateGas`
+  under-reports on Injective and the shortfall is silent: `initializePool` estimated 156k,
+  reverted at 156k with no receipt to explain it, and landed at 1.5M. Use 3-5x plus a floor.
+- Use the k8s testnet RPC or (mainnet) sentry / our own node. Never polkachu, which serves no
+  receipts at all.
 - **Never `--resume`.** If a run dies mid-way, replay `broadcast/<script>/<chainId>/run-latest.json`
   one `cast send` at a time after checking the nonce.
-- Confirm every contract with `eth_getCode`, never with a receipt.
+- Confirm every contract with `eth_getCode`, never with a receipt. A cheap extra check: the
+  runtime sizes `forge build --sizes` prints must equal the deployed code lengths.
 - Update `deployments/injective_<network>.json` in the same PR as the broadcast.
 
 The create3 factory is deployed from a dedicated **nonce-0 EOA**, never through the Arachnid
@@ -74,10 +83,15 @@ and pulls only fees - the plan hard-codes a liquidity delta of zero - splitting 
 creator / launchpad treasury by the launch's own `creatorFeeShareBps`. Choice's own share of
 the same swaps arrives separately, through `ChoiceFeeController.harvest`.
 
-Graduation costs about **900k gas** end to end (pool init + full-range mint + the callback);
-`test_graduationGasBudget` pins it. That matters on the pad side, not ours: Injective's
-`eth_estimateGas` under-reports, so whatever sends `triggerGraduation` needs an explicit,
-generous gas limit rather than an estimate.
+🔴 **Graduation costs 1,595,080 gas, measured on testnet — not the ~900k
+`test_graduationGasBudget` pins.** The test is not wrong about what it measures; it cannot
+measure the rest. Its mocks are plain ERC20s, while the real launch token and quote are MTS
+bank ERC20s whose transfers run through the `0x64` precompile, and the core moves BOTH legs
+inside `triggerGraduation` before the settler is even called. No forked local EVM can price
+that, because `0x64` has no code to fork. Treat the unit budget as a floor on our half and
+**size the sender off 1.6M**. Injective's `eth_estimateGas` under-reports too, so whatever
+sends `triggerGraduation` needs an explicit, generous limit rather than an estimate — the
+pad keeper's 5M is comfortable.
 
 ### The pool is un-campable, and that needs a hook
 
@@ -106,10 +120,22 @@ would come back as `type(int24).max` instead of a revert.
 Deploy with `script/05_DeployLaunchpadSettler.s.sol`. All three contracts are born owned by the
 timelock — the locker and the hook are constructed already pointing at the settler, whose
 CREATE3 address is known before it exists — so there is no ownership handoff and no
-pending-owner window. One step remains, and the key is not ours: the **launchpad admin** must
-call `setSeederFactory(<settler>)` on its core. Only launches created after that call graduate
-onto v2; the pad snapshots the settler per launch, so everything in flight keeps the CosmWasm
-path.
+pending-owner window. One step is not ours: the **launchpad admin** must call
+`setSeederFactory(<settler>)` on its core. Only launches created after that call graduate onto
+v2; the pad snapshots the settler per launch, so everything in flight keeps the CosmWasm path.
+
+✅ **This is live on testnet 1439 and has been walked end to end (2026-09-05).** The addresses
+are in `deployments/injective_testnet.json`; the pad admin has flipped `setSeederFactory`, so
+every new testnet launch now graduates here. Launch #13 filled its curve to its exact 10,950
+USDC target and graduated under ONE transaction hash — pool initialised at
+`realPair / poolTokenAmount`, one full-range position minted to the locker and registered,
+`onSettled` called. The pool's `sqrtPriceX96` was **0 one block earlier and the exact target in
+that block**, which is the whole atomicity claim in two reads. A swap each way then accrued
+fees; `collect` paid creator 7000 / launchpad 3000 bps in both currencies, and `harvest` paid
+Choice 3299 pips of each swap's input, to the pip. Both were called from an address that is
+neither the creator nor an owner, which is what makes them permissionless rather than merely
+documented as such. `meta.firstGraduation` in the address book carries the poolId, tokenId and
+transaction: with no receipts served on Injective, those are the only durable handles on it.
 
 ### The one coupling to watch
 
