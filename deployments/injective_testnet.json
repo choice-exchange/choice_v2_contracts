@@ -90,6 +90,25 @@
       "currency1": "external.usdc",
       "seedSqrtPriceX96": "250541448375047923607155",
       "seededOn": "2026-09-04"
+    },
+    {
+      "pair": "wINJ/USDT",
+      "poolType": "bin",
+      "poolId": "0x3d1f22ca8744b8743a440d402d3def3140338016a8ff021e002aa423ebc75c47",
+      "tierTotalPips": 500,
+      "lpFeePips": 335,
+      "protocolFeePipsPerDirection": 164,
+      "binStep": 10,
+      "parameters": "0x00000000000000000000000000000000000000000000000000000000000a0000",
+      "currency0": "external.wINJ",
+      "currency1": "external.usdt",
+      "seedActiveId": 8363267,
+      "seededOn": "2026-09-05",
+      "seedTxs": {
+        "initialize": "0x5fb17303447b92192dcb8c5c1ef88b63590f7dfb6a5f3dbed2209d55a8ba1ec0",
+        "addLiquidity": "0xf1fd3cfe15c8b513112aba77d8e2ec112a5dbfaa425237fbbce9e6dc7c5459b6",
+        "firstSwap": "0xa5ec23ee18b83f376d257fc50951e672ec5bbc3a7b6f4298d3c2022e680379eb"
+      }
     }
   ],
   "meta": {
@@ -114,7 +133,8 @@
       "choice.infinitySettler": "M4 graduation adapter. The launchpad core's seederFactory since 2026-09-05: LaunchpadCore.triggerGraduation transfers both legs here and calls settle, which initialises the CL pool at realPair/poolTokenAmount, mints one full-range position to positionLocker and calls onSettled - all in that one transaction.",
       "choice.positionLocker": "Permanent home for every graduated launch's seed position. collect(launchId) is permissionless and splits the LP fees creator / launchpad.treasury by the launch's own creatorFeeShareBps; nothing in it can move the liquidity or the NFT.",
       "choice.launchPoolGuardHook": "beforeInitialize ONLY (bitmap 1), so it is consulted once in a pool's life and can never tax, block or freeze a swap. It permissions graduation-pool creation to the settler (D15), which is why every graduation pool is keyed to it forever.",
-      "choice.choiceRouter": "M5.4 cross-vault router: one end-to-end minimumReceive across TWO Infinity deployments. Only Choice's vault exists on 1439, so execute() reverts NotCrossVault here by design - single-deployment routes go straight to the universalRouter. A second vault is added with setVault from the timelock."
+      "choice.choiceRouter": "M5.4 cross-vault router: one end-to-end minimumReceive across TWO Infinity deployments. Only Choice's vault exists on 1439, so execute() reverts NotCrossVault here by design - single-deployment routes go straight to the universalRouter. A second vault is added with setVault from the timelock.",
+      "pools": "The bin entry carries binStep where the CL ones carry tickSpacing. Both pack at offset 16 of `parameters`, so the words are identical for the same number and only `poolType` tells them apart here - as on chain, where only PoolKey.poolManager does."
     },
     "vaultDeployBlock": 138923726,
     "blockscoutApi": "https://testnet.blockscout-api.injective.network",
