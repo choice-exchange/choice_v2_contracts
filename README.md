@@ -63,6 +63,37 @@ ten minutes on a real deploy.
   runtime sizes `forge build --sizes` prints must equal the deployed code lengths.
 - Update `deployments/injective_<network>.json` in the same PR as the broadcast.
 
+### Finish with `08_VerifyOwnership`
+
+```bash
+NETWORK=injective_testnet forge script script/08_VerifyOwnership.s.sol:VerifyOwnership \
+    -vv --rpc-url $RPC_URL
+```
+
+Read-only, broadcasts nothing, exits non-zero if the deploy is not actually finished. It is
+here because the one irreversible step has no other guard.
+
+`02_DeployFeeControllers` deploys the fee controllers through CREATE3, so `Ownable(msg.sender)`
+makes the factory's one-shot proxy child the owner and the backrun's `transferOwnership` only
+sets `pendingOwner` - `ProtocolFeeController` is `Ownable2Step`. Until the timelock calls
+`acceptOwnership`, the controller is owned by a proxy child that can never be called again: a
+live contract holding protocol revenue that nobody can point at a different treasury, split or
+sink. Nothing fails if the step is skipped, until somebody needs to change one of those.
+
+The script checks every contract that should be behind the timelock, checks the two pool
+managers are behind their `PoolManagerOwner` contracts, and prints the Safe → timelock
+`schedule` / `execute` calldata for anything still only pending. A key absent from the book is
+skipped, so it is runnable part way through a deploy; a key that is present must be right.
+
+Two things it treats as warnings on testnet and failures on **1776**:
+
+- the create3 factory owned by an EOA. Salts are not namespaced by `msg.sender`, so whoever
+  the factory whitelists can deploy any bytecode at any unused salt - and the locker and the
+  guard hook are both born pointing at the settler's *predicted* address. Move the factory to
+  the Safe before the first deploy and revoke the whitelist once the last salt is consumed.
+- a timelock delay under 24h. The executor set is `[address(0)]`, the open role, so anybody
+  may execute an operation that has sat out its delay. The delay is the only barrier there is.
+
 The create3 factory is deployed from a dedicated **nonce-0 EOA**, never through the Arachnid
 CREATE2 deployer: `Create3Factory`'s constructor owns and whitelists to `msg.sender`, so a
 CREATE2 deploy hands both to a stub that can call nothing and bricks the factory permanently.
