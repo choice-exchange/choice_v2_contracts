@@ -32,9 +32,9 @@ interface IWINJ {
  * test is derived from the ABI and the upstream source alone - never from a log this chain
  * actually produced. Nothing downstream of here can be verified until this lands.
  *
- * The pair mirrors 04_SeedPool - wINJ/USDT at 10 USDT per INJ - so the two pools are directly
- * comparable and the indexer's bin numbers can be diffed against a CL pool holding the same
- * value at the same price.
+ * The pair mirrors 04_SeedPool - wINJ/USDT at 10 USDT per INJ - so the indexer's bin numbers
+ * can be diffed against a CL pool at the same price. The SIZE is a tenth of the CL pool's, for
+ * the funding reason on WINJ_SEED below.
  *
  * 🔴 Broadcast WITHOUT `--slow`. It strands a multi-tx script after the first transaction on
  * Injective EVM, and this one sends four.
@@ -68,8 +68,15 @@ contract SeedBinPool is BaseScript {
     /// twelve orders of magnitude off and it would still initialise cleanly.
     uint256 internal constant SEED_PRICE_18DP = 1e7;
 
-    uint128 internal constant WINJ_SEED = 1e18; // 1 wINJ
-    uint128 internal constant USDT_SEED = 10e6; // 10 USDT, matching the seed price
+    /// @notice A TENTH of what 04_SeedPool put into the CL pool, at the same price.
+    ///
+    /// Sized to what the testnet deployer actually holds (0.355 INJ native, 0.110 wINJ), not
+    /// to the CL pool: wrapping up to 1 wINJ would need INJ this key does not have, and the
+    /// only other funded testnet EOA is the CREATE3 deployer, whose balance is not ours to
+    /// spend. The price is identical, so the two pools are still directly comparable per unit
+    /// - a bin figure diffed against the CL pool's is off by exactly 10x and nothing else.
+    uint128 internal constant WINJ_SEED = 1e17; // 0.1 wINJ, held already - no wrap needed
+    uint128 internal constant USDT_SEED = 1e6; // 1 USDT, matching the seed price
 
     /// @notice Bins either side of the active one that receive liquidity.
     ///
