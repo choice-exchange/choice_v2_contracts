@@ -154,7 +154,7 @@ contract BuybackBurnSinkTest is Test {
         assertEq(sprout.balanceOf(TREASURY), 0, "nothing should have been bought");
     }
 
-    /// D19: without a rate limit a searcher picks the moment of every buyback. With one, a
+    /// D20: without a rate limit a searcher picks the moment of every buyback. With one, a
     /// second call in the same window parks instead of trading.
     function test_rateLimitParksASecondBuybackInTheSameWindow() public {
         vm.prank(TIMELOCK);

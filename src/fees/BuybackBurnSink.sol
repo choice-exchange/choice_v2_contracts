@@ -100,7 +100,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// See `_priceLimit` for why sqrt, and for the (conservative) relationship to price.
     uint16 public maxImpactBps;
 
-    /// @notice Minimum seconds between buybacks. This is the D19 answer: `harvest` is
+    /// @notice Minimum seconds between buybacks. This is the D20 answer: `harvest` is
     /// permissionless and the buyback is atomic inside it, so without a rate limit a searcher
     /// picks the moment of every buyback and sandwiches it on demand. Rate-limiting turns that
     /// into a bounded, occasional cost instead of an open invitation, and unlike a private
