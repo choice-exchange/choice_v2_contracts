@@ -2,8 +2,6 @@
 pragma solidity 0.8.26;
 
 import "forge-std/Script.sol";
-import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {Currency} from "infinity-core/src/types/Currency.sol";
 import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "infinity-core/src/interfaces/IPoolManager.sol";
@@ -14,14 +12,8 @@ import {BinPoolParametersHelper} from "infinity-core/src/pool-bin/libraries/BinP
 import {PriceHelper} from "infinity-core/src/pool-bin/libraries/PriceHelper.sol";
 import {Actions} from "infinity-periphery/src/libraries/Actions.sol";
 import {Plan, Planner} from "infinity-periphery/src/libraries/Planner.sol";
-import {IPositionManager} from "infinity-periphery/src/interfaces/IPositionManager.sol";
 import {IBinPositionManager} from "infinity-periphery/src/pool-bin/interfaces/IBinPositionManager.sol";
 import {BaseScript} from "./BaseScript.sol";
-
-interface IWINJ {
-    function deposit() external payable;
-    function balanceOf(address) external view returns (uint256);
-}
 
 /**
  * M7 step 2: open the FIRST bin pool that has ever existed on this deployment and seed it.
@@ -36,10 +28,21 @@ interface IWINJ {
  * can be diffed against a CL pool at the same price. The SIZE is a tenth of the CL pool's, for
  * the funding reason on WINJ_SEED below.
  *
- * 🔴 Broadcast WITHOUT `--slow`. It strands a multi-tx script after the first transaction on
- * Injective EVM, and this one sends four.
+ * ⛔ THIS SCRIPT DOES NOT BROADCAST, and that is not an oversight. wINJ and USDT are MTS bank
+ * ERC20s backed by the `0x64` precompile, which has no code for a forked local EVM to execute,
+ * so a forge script reverts with "call to non-contract address" on so much as a `balanceOf`.
+ * `--skip-simulation` does not help: forge still runs the script body locally to collect the
+ * calls (plan §1 item 6, which is also why `04_SeedPool.s.sol` is not what seeded the CL pool).
  *
- * forge script script/06_SeedBinPool.s.sol:SeedBinPool -vv --rpc-url $RPC_URL --broadcast
+ * So this is an ENCODER. It derives the active id, the pool id and the `modifyLiquidities`
+ * payload - the parts worth keeping in checked Solidity - and prints them for a driver that
+ * sends them with `cast`, against a node that has the precompiles:
+ *
+ *   script/tools/seed-bin-pool.sh
+ *
+ * Run it alone to see what the driver will send, without sending anything:
+ *
+ *   forge script script/06_SeedBinPool.s.sol:SeedBinPool -vv --rpc-url $RPC_URL
  */
 contract SeedBinPool is BaseScript {
     using BinPoolParametersHelper for bytes32;
@@ -86,19 +89,21 @@ contract SeedBinPool is BaseScript {
     /// three hold currency1 (at and below it), and the active bin holds both.
     uint256 internal constant BIN_COUNT = 5;
 
-    function run() public {
+    /// @notice Who the seeded position belongs to: the deployer EOA from the address book's
+    /// governance block. A constant rather than `vm.addr(deployerKey())`, because this script
+    /// never sees the key - the driver holds it - and the position owner is part of the payload
+    /// being encoded, so it has to be decided here.
+    address internal constant OWNER = 0xAcA0d67c52B503ED15706df5fE29E19677338bc6;
+
+    function run() public view {
         address winj = readAddress("external.wINJ");
         address usdt = readAddress("external.usdt");
-        address permit2 = readAddress("external.permit2");
         address binPoolManager = readAddress("infinity.binPoolManager");
         address positionManager = readAddress("infinity.binPositionManager");
 
         // Same ordering assertion as the CL seed: getting it backwards inverts the seed price
         // silently rather than reverting.
         require(winj < usdt, "currency ordering: wINJ must sort below USDT");
-
-        uint256 pk = deployerKey();
-        address deployer = vm.addr(pk);
 
         PoolKey memory key = PoolKey({
             currency0: Currency.wrap(winj),
@@ -112,41 +117,18 @@ contract SeedBinPool is BaseScript {
         uint24 activeId =
             PriceHelper.getIdFromPrice(PriceHelper.convertDecimalPriceTo128x128(SEED_PRICE_18DP), BIN_STEP);
         _requirePriceRoundTrips(activeId);
-        console.log("active id:", activeId);
 
-        (int256[] memory deltaIds, uint256[] memory distX, uint256[] memory distY) = _spotShape();
-
-        vm.startBroadcast(pk);
-
-        // --- funding ----------------------------------------------------------------------
-        if (IWINJ(winj).balanceOf(deployer) < WINJ_SEED) {
-            IWINJ(winj).deposit{value: WINJ_SEED - IWINJ(winj).balanceOf(deployer)}();
-            console.log("wrapped INJ; wINJ balance now", IWINJ(winj).balanceOf(deployer));
-        }
-        require(IERC20(usdt).balanceOf(deployer) >= USDT_SEED, "not enough USDT");
-
-        // --- allowances -------------------------------------------------------------------
-        // Two hops, because the periphery pulls through Permit2 rather than directly. The
-        // spender is the BIN position manager: an approval granted to the CL one moves nothing
-        // here and looks identical on a block explorer.
-        _approvePermit2(deployer, winj, permit2, positionManager);
-        _approvePermit2(deployer, usdt, permit2, positionManager);
-
-        // --- initialize -------------------------------------------------------------------
-        // 🔴 Straight at the pool manager, NOT through `BinPositionManager.initializePool`,
-        // which wraps the call in `try ... {} catch {}` and swallows every revert. The same
-        // reasoning is written up at D15 for the settler; here it is only about the failure
-        // being loud, since this pool carries no hook.
+        // If the pool is already open, the live id wins: the seed must land where the pool
+        // actually is, not where this script would have put it. Reading it is safe - the pool
+        // manager is ordinary bytecode, unlike the tokens.
         (uint24 existing,,) = IBinPoolManager(binPoolManager).getSlot0(key.toId());
-        if (existing == 0) {
-            IBinPoolManager(binPoolManager).initialize(key, activeId);
-            console.log("pool initialized at active id", activeId);
-        } else {
-            console.log("pool already initialized at active id", existing);
+        if (existing != 0) {
+            console.log("pool already open; using its live active id instead of the derived one");
             activeId = existing;
         }
 
-        // --- seed the five bins -----------------------------------------------------------
+        (int256[] memory deltaIds, uint256[] memory distX, uint256[] memory distY) = _spotShape();
+
         Plan memory plan = Planner.init();
         plan = plan.add(
             Actions.BIN_ADD_LIQUIDITY,
@@ -158,27 +140,33 @@ contract SeedBinPool is BaseScript {
                     amount0Max: WINJ_SEED,
                     amount1Max: USDT_SEED,
                     activeIdDesired: activeId,
-                    // Zero: this script either just initialised the pool or read the live id
-                    // back one call ago, so any drift here is a racing third party and the
-                    // seed should fail rather than land somewhere else.
+                    // Zero: the driver reads the live id one call before it sends this, so any
+                    // drift is a racing third party and the seed should fail rather than land
+                    // somewhere else.
                     idSlippage: 0,
                     deltaIds: deltaIds,
                     distributionX: distX,
                     distributionY: distY,
                     minLiquidities: new uint256[](BIN_COUNT),
-                    to: deployer,
+                    to: OWNER,
                     hookData: bytes("")
                 })
             )
         );
         plan = plan.add(Actions.SETTLE_PAIR, abi.encode(key.currency0, key.currency1));
-        IPositionManager(positionManager)
-            .modifyLiquidities(abi.encode(plan.actions, plan.params), block.timestamp + 600);
 
-        vm.stopBroadcast();
-
-        console.log("poolId:");
-        console.logBytes32(PoolId.unwrap(key.toId()));
+        console.log("SEED_POOL_MANAGER=%s", binPoolManager);
+        console.log("SEED_POSITION_MANAGER=%s", positionManager);
+        console.log("SEED_CURRENCY0=%s", winj);
+        console.log("SEED_CURRENCY1=%s", usdt);
+        console.log("SEED_FEE=%s", uint256(LP_FEE));
+        console.log("SEED_BIN_STEP=%s", uint256(BIN_STEP));
+        console.log("SEED_ACTIVE_ID=%s", uint256(activeId));
+        console.log("SEED_AMOUNT0=%s", uint256(WINJ_SEED));
+        console.log("SEED_AMOUNT1=%s", uint256(USDT_SEED));
+        console.log("SEED_PARAMETERS=%s", vm.toString(key.parameters));
+        console.log("SEED_POOL_ID=%s", vm.toString(PoolId.unwrap(key.toId())));
+        console.log("SEED_PAYLOAD=%s", vm.toString(abi.encode(plan.actions, plan.params)));
     }
 
     /// @dev A flat five-bin spread. currency0 sits at and above the active id, currency1 at and
@@ -215,12 +203,5 @@ contract SeedBinPool is BaseScript {
         uint256 roundTripped = PriceHelper.convert128x128PriceToDecimal(PriceHelper.getPriceFromId(activeId, BIN_STEP));
         uint256 diff = roundTripped > SEED_PRICE_18DP ? roundTripped - SEED_PRICE_18DP : SEED_PRICE_18DP - roundTripped;
         require(diff * 10_000 <= uint256(BIN_STEP) * SEED_PRICE_18DP, "active id does not round-trip to the seed price");
-    }
-
-    function _approvePermit2(address owner, address token, address permit2, address spender) internal {
-        if (IERC20(token).allowance(owner, permit2) == 0) {
-            IERC20(token).approve(permit2, type(uint256).max);
-        }
-        IAllowanceTransfer(permit2).approve(token, spender, type(uint160).max, type(uint48).max);
     }
 }

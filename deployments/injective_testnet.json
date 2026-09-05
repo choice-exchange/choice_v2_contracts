@@ -90,6 +90,25 @@
       "currency1": "external.usdc",
       "seedSqrtPriceX96": "250541448375047923607155",
       "seededOn": "2026-09-04"
+    },
+    {
+      "pair": "wINJ/USDT",
+      "poolType": "bin",
+      "poolId": "0x3d1f22ca8744b8743a440d402d3def3140338016a8ff021e002aa423ebc75c47",
+      "tierTotalPips": 500,
+      "lpFeePips": 335,
+      "protocolFeePipsPerDirection": 164,
+      "binStep": 10,
+      "parameters": "0x00000000000000000000000000000000000000000000000000000000000a0000",
+      "currency0": "external.wINJ",
+      "currency1": "external.usdt",
+      "seedActiveId": 8363267,
+      "seededOn": "2026-09-05",
+      "seedTxs": {
+        "initialize": "0x5fb17303447b92192dcb8c5c1ef88b63590f7dfb6a5f3dbed2209d55a8ba1ec0",
+        "addLiquidity": "0xf1fd3cfe15c8b513112aba77d8e2ec112a5dbfaa425237fbbce9e6dc7c5459b6",
+        "firstSwap": "0xa5ec23ee18b83f376d257fc50951e672ec5bbc3a7b6f4298d3c2022e680379eb"
+      }
     }
   ],
   "meta": {
@@ -103,14 +122,15 @@
       "infinity-periphery": "8261f8d93a23c9ba8a73060823251ba8b5ac46de",
       "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
     },
-    "lastUpdated": "2026-09-04",
+    "lastUpdated": "2026-09-05",
     "addressAliases": {
       "choice.treasury": "the Safe: protocol revenue lands where the signers can move it without waiting out a timelock delay",
       "launchpad": {
         "core": "shroom_launchpad LaunchpadCore on 1439, deployed 2026-08-24. Not ours; the pad admin owns it and only the pad admin can setSeederFactory.",
         "treasury": "the launchpad's FeeTreasury: PositionLocker sends the non-creator share of graduated LP fees here",
         "phase3Settler": "the CW graduation path this one replaces, kept for reference"
-      }
+      },
+      "pools": "The bin entry carries binStep where the CL ones carry tickSpacing. Both pack at offset 16 of `parameters`, so the words are identical for the same number and only `poolType` tells them apart here - as on chain, where only PoolKey.poolManager does."
     },
     "vaultDeployBlock": 138923726,
     "blockscoutApi": "https://testnet.blockscout-api.injective.network",
