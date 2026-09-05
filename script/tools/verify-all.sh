@@ -28,6 +28,12 @@ DEAD=0x000000000000000000000000000000000000dEaD
 CLQ=0xb7a4f84508c36255Bc29cc4dECaD6cBabd651a60
 BNQ=0x0e41128C6Eb88E1DDc97683d78Cf58035eeabD46
 DESC=0xd5817F090C8F9939e086861d6EEAB95004072956
+POSM=0x823F6dBB3e92f15FdA79A6b0e11e47dB1f3FEd54
+CORE=0xb03fb1c05f7853601ae05ba7e3700a59dc14a71d
+PADT=0xBf08c09Fe227ada4A86d279e98E695344848d33D
+SETTLER=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
+LOCKER=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
+GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
 
 # address | fork-dir | src path:Name | constructor args (hex, may be empty)
 MANIFEST=(
@@ -49,6 +55,10 @@ MANIFEST=(
 "0x95B0B855108CA5A8D5c43D9bc3A5994A479043e0|infinity-periphery|src/MixedQuoter.sol:MixedQuoter|$(CA address,address,address,address,address,address $DEAD $DEAD $DEAD $WETH $CLQ $BNQ)"
 "0x9D29c5BA79Ff9b173EADa6b8C0Fae10307cC9400|infinity-periphery|src/pool-cl/lens/TickLens.sol:TickLens|$(CA address $CLPM)"
 "0xCB7340356Df545a6DCc10998078F3E0089640E2d|infinity-universal-router|src/deploy/UnsupportedProtocol.sol:UnsupportedProtocol|"
+"$LOCKER|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $PADT $TL $SETTLER)"
+"$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER)"
+"$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
+"0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
 )
 
 for pass in $(seq 1 "$PASSES"); do

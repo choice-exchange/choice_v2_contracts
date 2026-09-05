@@ -50,10 +50,10 @@
   "choice": {
     "clFeeController": "0x36ab137ac1647c16646CA851c2715FBb60f4FD3C",
     "binFeeController": "0x1aceba7d060Af651553fE850C17938e2F0580066",
-    "infinitySettler": null,
-    "positionLocker": null,
-    "launchPoolGuardHook": null,
-    "choiceRouter": null,
+    "infinitySettler": "0xC3ED6d3f97D85B243108446a17ed53d896331ac9",
+    "positionLocker": "0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe",
+    "launchPoolGuardHook": "0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B",
+    "choiceRouter": "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98",
     "treasury": "0x0ee0Db41E787FdFcD0a35680074935C6bdC00237",
     "directTransferBurnSink": "0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215",
     "exchangeSubaccountBurnSink": "0xefe613636921D9d683CDe6d91FD0485D9DD2987f"
@@ -130,10 +130,35 @@
         "treasury": "the launchpad's FeeTreasury: PositionLocker sends the non-creator share of graduated LP fees here",
         "phase3Settler": "the CW graduation path this one replaces, kept for reference"
       },
+      "choice.infinitySettler": "M4 graduation adapter. The launchpad core's seederFactory since 2026-09-05: LaunchpadCore.triggerGraduation transfers both legs here and calls settle, which initialises the CL pool at realPair/poolTokenAmount, mints one full-range position to positionLocker and calls onSettled - all in that one transaction.",
+      "choice.positionLocker": "Permanent home for every graduated launch's seed position. collect(launchId) is permissionless and splits the LP fees creator / launchpad.treasury by the launch's own creatorFeeShareBps; nothing in it can move the liquidity or the NFT.",
+      "choice.launchPoolGuardHook": "beforeInitialize ONLY (bitmap 1), so it is consulted once in a pool's life and can never tax, block or freeze a swap. It permissions graduation-pool creation to the settler (D15), which is why every graduation pool is keyed to it forever.",
+      "choice.choiceRouter": "M5.4 cross-vault router: one end-to-end minimumReceive across TWO Infinity deployments. Only Choice's vault exists on 1439, so execute() reverts NotCrossVault here by design - single-deployment routes go straight to the universalRouter. A second vault is added with setVault from the timelock.",
       "pools": "The bin entry carries binStep where the CL ones carry tickSpacing. Both pack at offset 16 of `parameters`, so the words are identical for the same number and only `poolType` tells them apart here - as on chain, where only PoolKey.poolManager does."
     },
     "vaultDeployBlock": 138923726,
     "blockscoutApi": "https://testnet.blockscout-api.injective.network",
-    "blockscoutVerified": "19/19 as of 2026-09-04"
+    "blockscoutVerified": "23/23 as of 2026-09-05",
+    "firstGraduation": {
+      "note": "The first launch to graduate onto Choice v2, walked end to end on testnet 2026-09-05. Recorded because the poolId and tokenId are the only durable handles on it: Injective serves no receipt, so nothing else can be looked up from the transaction hash.",
+      "launchpadCore": "launchpad.core",
+      "launchId": 13,
+      "launchToken": "0x6B5a43BaaA23A50A756daAC4A80Dd368877352E4",
+      "quoteAsset": "0xebc7c587e6551dEbE23D17ca253DE176365b3465",
+      "quoteAssetNote": "the launchpad's own testnet USDC (6dp), NOT external.usdc - the pad quotes its own",
+      "poolId": "0xad59bd6c842e6099103db09170117c80623e908fc9c588574d78d4ce81e4a286",
+      "lpFeePips": 6722,
+      "protocolFeePipsPerDirection": 3299,
+      "tickSpacing": 200,
+      "parameters": "0x0000000000000000000000000000000000000000000000000000000000c80001",
+      "positionTokenId": 4,
+      "seedSqrtPriceX96": "542471323114939258389",
+      "seedLiquidity": "1599252057324655392",
+      "graduationTx": "0x698078e4c762b07a05dc1de1c03c1534c2ff45b63fb2635e821c3cbd4b77858b",
+      "graduationBlock": 139052885,
+      "graduationGasUsed": 1595080,
+      "graduationGasNote": "measured, not estimated: block 139052885 held this transaction alone, so the block's gasUsed IS the transaction's",
+      "creatorFeeShareBps": 7000
+    }
   }
 }
