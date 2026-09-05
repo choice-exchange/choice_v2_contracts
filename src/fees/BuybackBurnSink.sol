@@ -31,7 +31,8 @@ import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 /// minutes. Their 80/20 burn/ops split is a team policy their own docs say "isn't locked in
 /// permanently yet", and a custodial wallet holds the fees in between. Here the buyback happens
 /// inside the same transaction as the harvest, and `burnBps` can never fall below the
-/// `MIN_BURN_BPS` set in this contract's constructor. The ratchet runs one way only.
+/// `MIN_BURN_BPS` fixed in this contract's constructor. That floor is the promise: the share
+/// can be raised and lowered above it, but nothing - owner included - can take it under.
 ///
 /// ## `burn` must never revert
 ///
@@ -41,6 +42,17 @@ import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 /// than reverting**: funds it cannot act on yet simply stay here and are picked up by a later
 /// call. Nothing is stranded, because the balance - not the `amount` argument - is what each
 /// path acts on.
+///
+/// That guarantee is STRUCTURAL rather than a property of each gate in turn. The whole vault
+/// lock runs inside `try/catch`, so anything that reverts underneath it - a pool the manager
+/// has paused, a price bound the pool rejects, a hook that fails, something not thought of
+/// here - parks the tranche instead of propagating. Enumerating the failure modes and gating
+/// them one at a time was the earlier design, and it is the wrong shape: the list has to stay
+/// complete forever, and it was not. Four escapes were reachable, `maxImpactBps = 0` - the
+/// value a sink carries until `setGuards` is first called - among them.
+///
+/// The named guards below still exist, because failing inside `setGuards` / `setBuybackPool`
+/// says what is wrong while somebody is looking at it, where a park is silent.
 ///
 /// That is also why the price guard is a `sqrtPriceLimitX96` on the swap rather than a
 /// `minAmountOut` check afterwards. A limit makes the pool fill only as far as the bound and
@@ -60,6 +72,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
     uint16 public constant BPS_DENOMINATOR = 10_000;
 
+    /// @notice Smallest `maxImpactBps` that describes a real price bound.
+    /// @dev `_priceLimit` halves the setting, so 0 and 1 both truncate to a limit equal to the
+    /// pool's current sqrt price - which `CLPool.swap` rejects with `InvalidSqrtPriceLimit`.
+    /// The `try/catch` makes that park rather than revert, but a guard that can never let a
+    /// swap through is a misconfiguration, not a policy, so it is refused where it is set.
+    uint16 public constant MIN_IMPACT_BPS = 2;
+
     /// @notice The token bought and burnt. Immutable: a sink that could be repointed at another
     /// token is a sink whose burn is a promise again.
     IBurnableERC20 public immutable BURN_TOKEN;
@@ -75,8 +94,11 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice Floor under `burnBps`, fixed at construction. THE differentiator; see the notice.
     uint16 public immutable MIN_BURN_BPS;
 
-    /// @notice Share of bought tokens destroyed; the remainder funds infrastructure. Settable
-    /// UPWARDS only, never below `MIN_BURN_BPS`.
+    /// @notice Share of bought tokens destroyed; the remainder funds infrastructure. Free to
+    /// move, but never below `MIN_BURN_BPS`.
+    /// @dev A floor, deliberately, and not a one-way ratchet. `SPROUT_TOKENOMICS.md` §11 argues
+    /// that revenue is reflexive and that the burn share is what should flex when it falls, so
+    /// the guarantee worth making is the floor rather than monotonicity.
     uint16 public burnBps;
 
     /// @notice Receives the non-burnt share.
@@ -105,6 +127,10 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// picks the moment of every buyback and sandwiches it on demand. Rate-limiting turns that
     /// into a bounded, occasional cost instead of an open invitation, and unlike a private
     /// relay it keeps the trigger permissionless.
+    ///
+    /// @dev `setGuards` refuses zero. The real setting is 30-60 minutes; zero is not a looser
+    /// policy, it is the absence of the one guard that makes `maxImpactBps` hold - and it is
+    /// the value a deploy script copied from a test fixture would carry.
     uint32 public minBuybackInterval;
 
     /// @notice When the last buyback ran.
@@ -120,6 +146,9 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     error InvalidBps(uint16 bps);
     error BurnBpsBelowFloor(uint16 given, uint16 floor);
     error PoolMissingLeg();
+    error PoolNotInitialised();
+    error ImpactBpsTooLow(uint16 given, uint16 floor);
+    error RateLimitRequired();
     error NotVault();
     error LockNotOpen();
     error CannotSweepBuybackLeg(Currency currency);
@@ -129,7 +158,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @param burnt destroyed via `BURN_TOKEN.burn`; `toTreasury` is the ops remainder.
     event Burnt(uint256 burnt, uint256 toTreasury);
     /// @param reason 0 = below `minBuybackAmount`, 1 = inside `minBuybackInterval`,
-    /// 2 = currency has no buyback route. Funds stay here in every case.
+    /// 2 = currency has no buyback route, 3 = the swap itself reverted. Funds stay here in
+    /// every case.
     event Parked(Currency indexed currency, uint256 amount, uint8 reason);
     event BurnBpsUpdated(uint16 oldBps, uint16 newBps);
     event TreasuryUpdated(address oldTreasury, address newTreasury);
@@ -140,6 +170,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     uint8 private constant PARK_BELOW_MINIMUM = 0;
     uint8 private constant PARK_RATE_LIMITED = 1;
     uint8 private constant PARK_NO_ROUTE = 2;
+    uint8 private constant PARK_SWAP_FAILED = 3;
 
     constructor(
         IBurnableERC20 _burnToken,
@@ -224,14 +255,35 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             return;
         }
 
-        // Written BEFORE the external call, so a reentrant path cannot see the old timestamp.
-        lastBuybackAt = uint64(block.timestamp);
-
         uint256 tokensBefore = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
 
+        // The one gate that cannot be enumerated. Everything reachable from inside the lock -
+        // the pool manager's `whenNotPaused`, the pool's own price-limit validation, a hook,
+        // the vault refusing a nested lock because `harvest` was called from inside somebody
+        // else's - reverts the sub-call and lands here instead of unwinding the harvest.
+        bool swapped;
         _setLockOpen(true);
-        VAULT.lock(abi.encode(amountIn, _priceLimit()));
+        try VAULT.lock(abi.encode(amountIn)) returns (bytes memory) {
+            swapped = true;
+        } catch {
+            swapped = false;
+        }
+        // Unconditional, and NOT inside the `try`. `tstore` reverts with the frame that wrote
+        // it, and this one was written in THIS frame - the revert being caught belongs to the
+        // sub-call. Clearing it only on the success path would leave `lockAcquired` open to
+        // the vault for the rest of the transaction after a failed buyback.
         _setLockOpen(false);
+
+        if (!swapped) {
+            emit Parked(QUOTE, amountIn, PARK_SWAP_FAILED);
+            return;
+        }
+
+        // Only now, so a transient failure - a paused pool manager, a bad tier - does not also
+        // spend the rate-limit window and push the next real buyback out by a full interval.
+        // Safe to write after the call because `burn` and `buyback` are the only ways in and
+        // both are `nonReentrant`.
+        lastBuybackAt = uint64(block.timestamp);
 
         uint256 received = IERC20(address(BURN_TOKEN)).balanceOf(address(this)) - tokensBefore;
         uint256 spent = amountIn - QUOTE.balanceOfSelf();
@@ -248,7 +300,11 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         if (msg.sender != address(VAULT)) revert NotVault();
         if (!_lockOpen()) revert LockNotOpen();
 
-        (uint256 amountIn, uint160 limit) = abi.decode(data, (uint256, uint160));
+        uint256 amountIn = abi.decode(data, (uint256));
+        // Read inside the lock rather than passed in, so a `getSlot0` that reverts - an
+        // uninitialised pool reached despite `setBuybackPool`'s check - is caught by the
+        // `try/catch` in `_tryBuyback` along with everything else, instead of escaping it.
+        uint160 limit = _priceLimit();
         PoolKey memory key = buybackPool;
         bool zeroForOne = quoteIsCurrency0;
 
@@ -382,6 +438,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         bool burnFirst = c0 == burnToken && c1 == quote;
         if (!quoteFirst && !burnFirst) revert PoolMissingLeg();
 
+        // Both legs being right does not make the pool exist. A key on a tier nobody has
+        // opened installs cleanly and then parks every tranche for as long as nobody notices,
+        // so it is refused here where the error names the cause. Doubles as a check that
+        // `poolManager` is a CL manager at all - this sink swaps through `ICLPoolManager`.
+        (uint160 sqrtPriceX96,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
+        if (sqrtPriceX96 == 0) revert PoolNotInitialised();
+
         buybackPool = key;
         quoteIsCurrency0 = quoteFirst;
         emit BuybackPoolUpdated(key, quoteFirst);
@@ -395,6 +458,12 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // Half of BPS, because `_priceLimit` halves it and a limit at or past zero is not a
         // price. Well above anything sane; the real setting is in the hundreds.
         if (newMaxImpactBps >= BPS_DENOMINATOR) revert InvalidBps(newMaxImpactBps);
+        // And below the floor it is not a bound at all - it truncates to the pool's own price,
+        // which no swap can cross. See `MIN_IMPACT_BPS`.
+        if (newMaxImpactBps < MIN_IMPACT_BPS) revert ImpactBpsTooLow(newMaxImpactBps, MIN_IMPACT_BPS);
+        // D20: without this, `maxImpactBps` bounds one buyback and nothing bounds how many a
+        // searcher can trigger. Zero is the absence of the policy, not a loose version of it.
+        if (newMinBuybackInterval == 0) revert RateLimitRequired();
         minBuybackAmount = newMinBuybackAmount;
         maxImpactBps = newMaxImpactBps;
         minBuybackInterval = newMinBuybackInterval;
