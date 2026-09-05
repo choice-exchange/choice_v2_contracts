@@ -35,6 +35,7 @@ contract BuybackBurnSinkTest is Test {
     uint160 internal constant SQRT_1_1 = 79228162514264337593543950336;
 
     uint16 internal constant FLOOR = 8000;
+    uint32 internal constant INTERVAL = 30 minutes;
 
     Vault internal vault;
     CLPoolManager internal manager;
@@ -72,8 +73,10 @@ contract BuybackBurnSinkTest is Test {
 
         vm.startPrank(TIMELOCK);
         sink.setBuybackPool(pool);
-        // 1 wINJ minimum, 500 bps of sqrt-price headroom, no rate limit unless a test sets one.
-        sink.setGuards(1 ether, 500, 0);
+        // 1 wINJ minimum, 500 bps of sqrt-price headroom, one window per half hour. The rate
+        // limit is not optional any more - `setGuards` refuses zero - so the fixture carries a
+        // production-shaped value and tests that want a second buyback warp past it.
+        sink.setGuards(1 ether, 500, INTERVAL);
         vm.stopPrank();
     }
 
@@ -134,7 +137,7 @@ contract BuybackBurnSinkTest is Test {
     /// and the remainder stays for next time. A `minAmountOut` check would have had to revert.
     function test_impactLimitCapsTheFillAndLeavesTheRestForNextTime() public {
         vm.prank(TIMELOCK);
-        sink.setGuards(1 ether, 50, 0); // 50 bps of sqrt price: very tight
+        sink.setGuards(1 ether, 50, INTERVAL); // 50 bps of sqrt price: very tight
 
         quote.mint(address(sink), 500_000 ether);
         sink.burn(Currency.wrap(address(quote)), 500_000 ether);
@@ -189,6 +192,81 @@ contract BuybackBurnSinkTest is Test {
         assertFalse(sink.canBuyback(), "inside the interval it should report false");
     }
 
+    // ── the invariant: `burn` cannot revert, whatever the pool does ────────
+
+    /// The whole point of the `try/catch`. `CLPoolManager.swap` is `whenNotPaused`, and the
+    /// pause role exists to be used in an incident - so without this, reaching for the pause
+    /// would also stop every protocol-fee harvest on the deployment.
+    function test_aPausedPoolManagerParksInsteadOfBrickingTheHarvest() public {
+        manager.pause();
+        quote.mint(address(sink), 100 ether);
+
+        vm.expectEmit(true, false, false, true, address(sink));
+        emit BuybackBurnSink.Parked(Currency.wrap(address(quote)), 100 ether, 3);
+        sink.burn(Currency.wrap(address(quote)), 100 ether);
+
+        assertEq(quote.balanceOf(address(sink)), 100 ether, "the tranche should have parked here");
+    }
+
+    /// A caught failure must not spend the rate-limit window, or one paused block would push
+    /// the next real buyback out by a full interval.
+    function test_aFailedBuybackDoesNotConsumeTheRateLimitWindow() public {
+        manager.pause();
+        quote.mint(address(sink), 100 ether);
+        sink.burn(Currency.wrap(address(quote)), 100 ether);
+        assertEq(sink.lastBuybackAt(), 0, "a failed buyback moved the clock");
+
+        manager.unpause();
+        sink.buyback();
+        assertGt(sink.lastBuybackAt(), 0, "the retry was rate-limited by a failure");
+        assertEq(quote.balanceOf(address(sink)), 0, "the parked tranche was not picked up");
+    }
+
+    /// `_setLockOpen(true)` is written in `_tryBuyback`'s own frame, so the caught revert does
+    /// NOT roll it back. If the flag were cleared only on the success path, the vault could
+    /// call `lockAcquired` for the rest of the transaction after any failed buyback.
+    function test_aFailedBuybackLeavesNoOpenLockBehind() public {
+        manager.pause();
+        quote.mint(address(sink), 100 ether);
+        sink.burn(Currency.wrap(address(quote)), 100 ether);
+
+        vm.prank(address(vault));
+        vm.expectRevert(BuybackBurnSink.LockNotOpen.selector);
+        sink.lockAcquired(abi.encode(uint256(1)));
+    }
+
+    // ── guards that fail where they are set, not where they bite ───────────
+
+    /// `_priceLimit` halves the setting, so 0 and 1 both produce a bound equal to the pool's
+    /// own price - which no swap can cross. This was the value a sink carried before
+    /// `setGuards` had ever been called.
+    function test_anImpactGuardBelowItsFloorIsRefused() public {
+        vm.startPrank(TIMELOCK);
+        for (uint16 bps = 0; bps < 2; bps++) {
+            vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.ImpactBpsTooLow.selector, bps, uint16(2)));
+            sink.setGuards(1 ether, bps, INTERVAL);
+        }
+        sink.setGuards(1 ether, 2, INTERVAL); // the floor itself is fine
+        vm.stopPrank();
+        assertEq(sink.maxImpactBps(), 2);
+    }
+
+    /// D20 is answered by the rate limit, so the rate limit is not optional.
+    function test_aRateLimitOfZeroIsRefused() public {
+        vm.prank(TIMELOCK);
+        vm.expectRevert(BuybackBurnSink.RateLimitRequired.selector);
+        sink.setGuards(1 ether, 500, 0);
+    }
+
+    /// Both legs being right does not make the pool exist. A key on an unopened tier used to
+    /// install cleanly and then park every tranche silently.
+    function test_setBuybackPoolRejectsAPoolThatWasNeverInitialised() public {
+        PoolKey memory ghost = _key(quote, sprout, 3000); // same legs, a tier nobody opened
+        vm.prank(TIMELOCK);
+        vm.expectRevert(BuybackBurnSink.PoolNotInitialised.selector);
+        sink.setBuybackPool(ghost);
+    }
+
     // ── the floor: the whole differentiator ───────────────────────────────
 
     function test_burnBpsCannotBeLoweredPastTheFloor() public {
@@ -199,10 +277,10 @@ contract BuybackBurnSinkTest is Test {
         assertEq(sink.burnBps(), FLOOR, "burnBps moved despite the revert");
     }
 
-    function test_burnBpsRatchetsUpAndThenCannotComeBackDown() public {
+    function test_burnBpsIsBoundedByItsFloorNotByItsCurrentValue() public {
         vm.startPrank(TIMELOCK);
         sink.setBurnBps(9500);
-        assertEq(sink.burnBps(), 9500, "the ratchet did not move up");
+        assertEq(sink.burnBps(), 9500, "the share did not move up");
 
         // Still bounded by the FLOOR, not by the new value: the floor is the promise.
         sink.setBurnBps(FLOOR);
@@ -288,14 +366,14 @@ contract BuybackBurnSinkTest is Test {
     function test_lockAcquiredRejectsANonVaultCaller() public {
         vm.prank(STRANGER);
         vm.expectRevert(BuybackBurnSink.NotVault.selector);
-        sink.lockAcquired(abi.encode(uint256(1), uint160(SQRT_1_1)));
+        sink.lockAcquired(abi.encode(uint256(1)));
     }
 
     /// Gated on a lock THIS contract opened, not merely on the vault's identity.
     function test_lockAcquiredRejectsTheVaultOutsideAnOpenLock() public {
         vm.prank(address(vault));
         vm.expectRevert(BuybackBurnSink.LockNotOpen.selector);
-        sink.lockAcquired(abi.encode(uint256(1), uint160(SQRT_1_1)));
+        sink.lockAcquired(abi.encode(uint256(1)));
     }
 
     function test_transientSlotMatchesItsDerivation() public pure {
