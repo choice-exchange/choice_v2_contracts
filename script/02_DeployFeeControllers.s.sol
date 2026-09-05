@@ -73,8 +73,10 @@ contract DeployFeeControllers is BaseScript {
         // factory's one-shot proxy child, so `Ownable(msg.sender)` makes that proxy the owner
         // and it can never be called again. The backrun runs FROM the same proxy, which is the
         // only moment it can hand ownership on. `ProtocolFeeController` is Ownable2Step, so
-        // this only sets pendingOwner: the timelock MUST call acceptOwnership (script 04) or
-        // the controller is stranded with a dead owner. That is the D2 brick, one level down.
+        // this only sets pendingOwner: the timelock MUST call acceptOwnership or the
+        // controller is stranded with a dead owner. That is the D2 brick, one level down.
+        // `08_VerifyOwnership` is what checks it happened and prints the Safe payload if it
+        // has not; run it at the end of every deploy.
         bytes memory toTimelock = abi.encodeWithSelector(Ownable.transferOwnership.selector, timelock);
 
         address clFeeController = _deploy(
