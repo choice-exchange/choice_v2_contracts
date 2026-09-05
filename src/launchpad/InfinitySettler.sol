@@ -235,7 +235,7 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         uint256 tokenId = POSITION_MANAGER.nextTokenId();
         (uint256 spent0, uint256 spent1) = _mintLockedPosition(key, tickLower, tickUpper, liquidity, amount0, amount1);
 
-        LOCKER.register(launchId, tokenId, creator, creatorBps);
+        LOCKER.register(launchId, tokenId, creator, creatorBps, key);
 
         CORE.onSettled(launchId);
 
