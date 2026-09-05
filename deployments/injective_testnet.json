@@ -56,7 +56,9 @@
     "choiceRouter": "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98",
     "treasury": "0x0ee0Db41E787FdFcD0a35680074935C6bdC00237",
     "directTransferBurnSink": "0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215",
-    "exchangeSubaccountBurnSink": "0xefe613636921D9d683CDe6d91FD0485D9DD2987f"
+    "exchangeSubaccountBurnSink": "0xefe613636921D9d683CDe6d91FD0485D9DD2987f",
+    "buybackBurnSink": "0xe0248Ebc4C87669aDCf8edf926B81D41319bB4af",
+    "buybackBurnSinkNote": "TEST deployment, 2026-09-06. Burn token is the TEST SPROUT 0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835 (launch 15), quote wINJ. Owner = timelock. MIN_BURN_BPS 8000 (immutable), burnBps 8000. Guards are TEST values chosen to make one session's volume visible - minBuybackInterval 60s, maxImpactBps 500, minBuybackAmount 1e15. See SPROUT_TOKENOMICS.md 9.0 and 9.3; do NOT copy these guards to mainnet."
   },
   "launchpad": {
     "core": "0xb03fb1c05f7853601ae05ba7e3700a59dc14a71d",
