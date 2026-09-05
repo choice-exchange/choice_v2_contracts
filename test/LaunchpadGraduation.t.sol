@@ -61,11 +61,13 @@ interface IReenterHook {
     function hook() external;
 }
 
-/// @dev A creator that tries to collect again while being paid its share of a collect.
+/// @dev A creator that tries to claim again while being paid. `collect` no longer transfers
+/// anything, so the only moment a recipient gets control is inside its own `claim`.
 contract ReenteringCreator is IReenterHook {
     PositionLocker internal immutable LOCKER;
     uint256 internal immutable LAUNCH_ID_;
 
+    Currency public reentryCurrency;
     bool public tried;
     bool public reentryReverted;
 
@@ -74,10 +76,14 @@ contract ReenteringCreator is IReenterHook {
         LAUNCH_ID_ = launchId;
     }
 
+    function arm(Currency currency) external {
+        reentryCurrency = currency;
+    }
+
     function hook() external override {
         if (tried) return;
         tried = true;
-        try LOCKER.collect(LAUNCH_ID_) {
+        try LOCKER.claim(reentryCurrency, address(this)) {
             reentryReverted = false;
         } catch {
             reentryReverted = true;
@@ -300,8 +306,8 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
 
         (uint256 amount0, uint256 amount1) = locker.collect(LAUNCH_ID);
         assertGt(amount0 + amount1, 0, "no fees collected");
-        assertEq(pairToken.balanceOf(CREATOR), 0, "creator paid despite a zero share");
-        assertEq(launchToken.balanceOf(CREATOR), 0, "creator paid despite a zero share");
+        assertEq(locker.owed(Currency.wrap(address(pairToken)), CREATOR), 0, "creator credited a zero share");
+        assertEq(locker.owed(Currency.wrap(address(launchToken)), CREATOR), 0, "creator credited a zero share");
 
         (Currency currency0, Currency currency1) = _currencies();
         _assertSplit(currency0, amount0, 0);
@@ -340,8 +346,18 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
 
         locker.collect(LAUNCH_ID);
 
+        Currency hooking = Currency.wrap(address(hookToken));
+        uint256 credited = locker.owed(hooking, address(badCreator));
+        assertGt(credited, 0, "the creator was never credited - the test proves nothing");
+
+        badCreator.arm(hooking);
+        locker.claim(hooking, address(badCreator));
+
         assertTrue(badCreator.tried(), "the creator never got control - the test proves nothing");
-        assertTrue(badCreator.reentryReverted(), "a reentrant collect went through");
+        assertTrue(badCreator.reentryReverted(), "a reentrant claim went through");
+        // The property, whichever mechanism enforced it: paid exactly once.
+        assertEq(hookToken.balanceOf(address(badCreator)), credited, "the creator was paid twice");
+        assertEq(locker.owed(hooking, address(badCreator)), 0, "the credit was not cleared");
     }
 
     function test_collectRevertsWhenThereIsNothingToCollect() public {
@@ -358,6 +374,87 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     }
 
     /// @dev A donation sitting on the locker must not be paid out as if it were fee revenue.
+    /// The reason `collect` credits instead of pushing. Four transfers in one call meant any
+    /// one recipient that could not be paid froze the OTHER side's fees too, permanently -
+    /// `creator` is snapshotted at graduation and nothing here can skip a leg or re-route it.
+    function test_anUnpayableCreatorDoesNotStrandTheLaunchpad() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        _swap(_key(), true, 10e18);
+        _swap(_key(), false, 1e18);
+
+        // The shape of a quote asset with a transfer blocklist, or of a creator contract that
+        // reverts on a native leg: this recipient cannot be paid in this currency, ever.
+        Currency pair = Currency.wrap(address(pairToken));
+        vm.mockCallRevert(address(pairToken), abi.encodeWithSelector(IERC20.transfer.selector, CREATOR), "BLACKLISTED");
+
+        vm.prank(RANDOM);
+        (, uint256 amount1) = locker.collect(LAUNCH_ID);
+        assertGt(amount1, 0, "no pair fees collected - the test proves nothing");
+
+        // The creator's own claim is the only thing that fails.
+        vm.expectRevert();
+        locker.claim(pair, CREATOR);
+
+        // The launchpad's share is unaffected, and so is the other currency entirely.
+        uint256 treasuryOwed = locker.owed(pair, PAD_TREASURY);
+        assertGt(treasuryOwed, 0, "launchpad was credited nothing");
+        vm.prank(RANDOM);
+        locker.claim(pair, PAD_TREASURY);
+        assertEq(pairToken.balanceOf(PAD_TREASURY), treasuryOwed, "launchpad could not be paid");
+
+        // And the creator's credit is still there, waiting, not burnt.
+        assertGt(locker.owed(pair, CREATOR), 0, "the creator's credit was lost");
+        assertGt(locker.owed(Currency.wrap(address(launchToken)), CREATOR), 0, "the other leg was lost too");
+    }
+
+    /// The coupling the pull payment creates. Fees now sit here between `collect` and
+    /// `claim`, so `sweep` has to subtract them - otherwise liveness was traded for custody.
+    function test_sweepCannotReachCreditedFees() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        _swap(_key(), true, 10e18);
+        _swap(_key(), false, 1e18);
+
+        uint256 donation = 1_000e18;
+        pairToken.mint(address(locker), donation);
+
+        Currency pair = Currency.wrap(address(pairToken));
+        (, uint256 amount1) = locker.collect(LAUNCH_ID);
+        assertEq(locker.totalOwed(pair), amount1, "collected fees were not reserved");
+
+        vm.prank(OWNER);
+        uint256 swept = locker.sweep(pair, RANDOM);
+        assertEq(swept, donation, "sweep took more (or less) than the donation");
+        assertEq(pairToken.balanceOf(RANDOM), donation, "sweep paid out the wrong amount");
+
+        // Everything owed is still here and still claimable.
+        locker.claim(pair, CREATOR);
+        locker.claim(pair, PAD_TREASURY);
+        assertEq(
+            pairToken.balanceOf(CREATOR) + pairToken.balanceOf(PAD_TREASURY), amount1, "fees survived the sweep short"
+        );
+    }
+
+    /// `ownerOf` is a presence check. The binding `register` writes is permanent, so it also
+    /// has to be a position in the pool the settler just seeded.
+    function test_registerRejectsAPositionInAnotherPool() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        // A position in a DIFFERENT pool that this contract nonetheless holds - the shape a
+        // mid-graduation mint to the locker would have taken.
+        uint256 strayTokenId = _mintPositionTo(address(locker));
+        assertEq(IERC721(address(posm)).ownerOf(strayTokenId), address(locker));
+
+        PoolKey memory otherPool = _key();
+        otherPool.fee = 500; // same legs and hook, a tier the graduation did not use
+
+        vm.prank(address(settler));
+        vm.expectRevert(abi.encodeWithSelector(PositionLocker.PositionPoolMismatch.selector, strayTokenId));
+        locker.register(99, strayTokenId, CREATOR, CREATOR_BPS, otherPool);
+    }
+
     function test_donationToTheLockerIsNotSplitAsFees() public {
         _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
@@ -367,6 +464,9 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         pairToken.mint(address(locker), donation);
 
         (, uint256 amount1) = locker.collect(LAUNCH_ID);
+        Currency pair = Currency.wrap(address(pairToken));
+        _claimIfAny(pair, CREATOR);
+        _claimIfAny(pair, PAD_TREASURY);
         assertEq(pairToken.balanceOf(CREATOR), amount1 * CREATOR_BPS / 10_000, "donation leaked into the split");
         assertEq(pairToken.balanceOf(address(locker)), donation, "donation was paid out");
     }
@@ -544,9 +644,12 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     }
 
     function test_registerRejectsEveryCallerButTheSettler() public {
+        // Hoisted: `_key()` reads the settler, and those external calls would otherwise eat
+        // the prank before `register` is reached.
+        PoolKey memory key = _key();
         vm.prank(RANDOM);
         vm.expectRevert(PositionLocker.NotSettler.selector);
-        locker.register(LAUNCH_ID, 1, CREATOR, CREATOR_BPS);
+        locker.register(LAUNCH_ID, 1, CREATOR, CREATOR_BPS, key);
     }
 
     /// @dev A settler that reported a position it never minted here would otherwise point a
@@ -560,22 +663,25 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         uint256 outsiderTokenId = _mintPositionTo(RANDOM);
         assertEq(IERC721(address(posm)).ownerOf(outsiderTokenId), RANDOM);
 
+        PoolKey memory key = _key();
         vm.prank(address(settler));
         vm.expectRevert(abi.encodeWithSelector(PositionLocker.PositionNotHeld.selector, outsiderTokenId));
-        locker.register(99, outsiderTokenId, CREATOR, CREATOR_BPS);
+        locker.register(99, outsiderTokenId, CREATOR, CREATOR_BPS, key);
     }
 
     function test_registerRejectsADuplicateLaunchOrToken() public {
         _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
 
+        PoolKey memory key = _key();
+
         vm.prank(address(settler));
         vm.expectRevert(abi.encodeWithSelector(PositionLocker.AlreadyRegistered.selector, LAUNCH_ID));
-        locker.register(LAUNCH_ID, 1, CREATOR, CREATOR_BPS);
+        locker.register(LAUNCH_ID, 1, CREATOR, CREATOR_BPS, key);
 
         vm.prank(address(settler));
         vm.expectRevert(abi.encodeWithSelector(PositionLocker.TokenAlreadyRegistered.selector, uint256(1)));
-        locker.register(LAUNCH_ID + 1, 1, CREATOR, CREATOR_BPS);
+        locker.register(LAUNCH_ID + 1, 1, CREATOR, CREATOR_BPS, key);
     }
 
     function test_ownerOnlyConfiguration() public {
@@ -659,14 +765,38 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         assertLt(diff * 1e9, amount1, "pool price is not the curve ratio");
     }
 
-    function _assertSplit(Currency currency, uint256 amount, uint16 creatorBps) internal view {
+    /// @dev A one-directional swap earns fees in one currency only, so a zero credit is a
+    /// legitimate outcome rather than something to assert against.
+    function _claimIfAny(Currency currency, address who) internal {
+        if (locker.owed(currency, who) > 0) locker.claim(currency, who);
+    }
+
+    /// @dev Asserts the credit `collect` wrote AND that `claim` delivers exactly it, so the
+    /// two halves of the pull cannot drift apart.
+    function _assertSplit(Currency currency, uint256 amount, uint16 creatorBps) internal {
         uint256 expectedCreator = amount * creatorBps / 10_000;
-        assertEq(IERC20(Currency.unwrap(currency)).balanceOf(CREATOR), expectedCreator, "creator's share is wrong");
+        uint256 expectedTreasury = amount - expectedCreator;
+
+        assertEq(locker.owed(currency, CREATOR), expectedCreator, "creator's credit is wrong");
+        assertEq(locker.owed(currency, PAD_TREASURY), expectedTreasury, "launchpad's credit is wrong");
+        assertEq(locker.totalOwed(currency), amount, "totalOwed does not match what was collected");
+
+        uint256 creatorBefore = IERC20(Currency.unwrap(currency)).balanceOf(CREATOR);
+        uint256 treasuryBefore = IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY);
+        if (expectedCreator > 0) locker.claim(currency, CREATOR);
+        if (expectedTreasury > 0) locker.claim(currency, PAD_TREASURY);
+
         assertEq(
-            IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY),
-            amount - expectedCreator,
+            IERC20(Currency.unwrap(currency)).balanceOf(CREATOR) - creatorBefore,
+            expectedCreator,
+            "creator's share is wrong"
+        );
+        assertEq(
+            IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY) - treasuryBefore,
+            expectedTreasury,
             "launchpad's share is wrong"
         );
+        assertEq(locker.totalOwed(currency), 0, "totalOwed did not clear");
     }
 
     function _swap(PoolKey memory key, bool zeroForOne, uint256 amountIn) internal {
