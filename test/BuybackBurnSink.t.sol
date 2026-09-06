@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {Vault} from "infinity-core/src/Vault.sol";
@@ -233,6 +234,95 @@ contract BuybackBurnSinkTest is Test {
         vm.prank(address(vault));
         vm.expectRevert(BuybackBurnSink.LockNotOpen.selector);
         sink.lockAcquired(abi.encode(uint256(1)));
+    }
+
+    // ── the same invariant, on the SETTLE rather than the pool ─────────────
+    //
+    // Every test above mocks a POOL failure, which is what the swap's `try/catch` covers. The
+    // settle was outside that wrapper: `BURN_TOKEN.burn` and the transfer to `treasury` both
+    // reach the bank precompile on a real `MintBurnBankERC20`, and `treasury` is owner-settable
+    // to any address. Neither is unfailable, and either one reverting bricked the harvest.
+
+    /// The direct path: `harvest` sent the burn token itself, so there is no swap to hide
+    /// behind. A failing `burn` must park the tranche whole.
+    function test_aFailingBurnParksTheTokensInsteadOfBrickingTheHarvest() public {
+        sprout.mint(address(sink), 10 ether);
+        vm.mockCallRevert(address(sprout), abi.encodeWithSelector(MockBurnableERC20.burn.selector), "burn is down");
+
+        vm.expectEmit(true, false, false, true, address(sink));
+        emit BuybackBurnSink.Parked(Currency.wrap(address(sprout)), 10 ether, 4);
+        sink.burn(Currency.wrap(address(sprout)), 10 ether);
+
+        assertEq(sprout.balanceOf(address(sink)), 10 ether, "the tranche should have parked here intact");
+        assertEq(sprout.balanceOf(TREASURY), 0, "the treasury leg must not land on its own");
+    }
+
+    /// ⛔ THE reason the settle is one atomic self-call and not a `try` around each leg.
+    ///
+    /// With separate wrappers the burn lands, the transfer fails, and only the ops share is left
+    /// sitting here - so the retry, which acts on the BALANCE like everything else in this
+    /// contract, applies `burnBps` a second time and destroys 80% of the treasury's money. The
+    /// split has to survive the failure whole, which means neither leg may land without the
+    /// other.
+    function test_aFailingTreasuryTransferLeavesTheWholeSplitForTheRetry() public {
+        uint256 supplyBefore = sprout.totalSupply();
+        sprout.mint(address(sink), 10 ether);
+        vm.mockCallRevert(
+            address(sprout), abi.encodeWithSelector(IERC20.transfer.selector, TREASURY), "treasury is blocked"
+        );
+
+        sink.burn(Currency.wrap(address(sprout)), 10 ether);
+
+        assertEq(sprout.totalSupply(), supplyBefore + 10 ether, "the burn leg landed without the treasury leg");
+        assertEq(sprout.balanceOf(address(sink)), 10 ether, "the tranche should have parked here intact");
+
+        vm.clearMockedCalls();
+        sink.burn(Currency.wrap(address(sprout)), 10 ether);
+
+        uint256 burnt = supplyBefore + 10 ether - sprout.totalSupply();
+        assertEq(burnt, 10 ether * uint256(FLOOR) / 10_000, "the retry did not burn burnBps of the WHOLE tranche");
+        assertEq(sprout.balanceOf(TREASURY), 10 ether - burnt, "the treasury did not get the remainder");
+        assertEq(sprout.balanceOf(address(sink)), 0, "the retry left something behind");
+    }
+
+    /// The buyback path is the worse of the two call sites: by the time the settle runs the swap
+    /// has landed and `lastBuybackAt` is written, so a propagated revert would throw away a good
+    /// buyback along with the harvest.
+    function test_aFailingSettleDoesNotUnwindTheBuybackThatPrecededIt() public {
+        quote.mint(address(sink), 100 ether);
+        vm.mockCallRevert(address(sprout), abi.encodeWithSelector(MockBurnableERC20.burn.selector), "burn is down");
+
+        sink.burn(Currency.wrap(address(quote)), 100 ether);
+
+        assertGt(sink.lastBuybackAt(), 0, "the swap was unwound along with the settle");
+        assertEq(quote.balanceOf(address(sink)), 0, "the quote was not spent, so the swap did not stand");
+        assertGt(sprout.balanceOf(address(sink)), 0, "the bought SPROUT should be parked here");
+        assertEq(sprout.balanceOf(TREASURY), 0, "nothing should have reached the treasury");
+
+        // Nothing is stranded: the balance is what the next call acts on.
+        vm.clearMockedCalls();
+        uint256 parked = sprout.balanceOf(address(sink));
+        sink.burn(Currency.wrap(address(sprout)), 0);
+        assertEq(sprout.balanceOf(address(sink)), 0, "a later call did not pick the parked tranche up");
+        assertEq(sprout.balanceOf(TREASURY), parked - parked * FLOOR / 10_000, "the retry shortchanged the treasury");
+    }
+
+    /// It moves the burn token, so it exists only to be `try`ed from inside this contract. An
+    /// open one would be a permissionless way to force the split at a chosen moment.
+    function test_settleBurnTokenSelfIsCallableOnlyByTheContractItself() public {
+        sprout.mint(address(sink), 10 ether);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(BuybackBurnSink.NotSelf.selector);
+        sink.settleBurnTokenSelf();
+
+        // Not an ownership gate either - the timelock has no more business calling it than
+        // anyone else.
+        vm.prank(TIMELOCK);
+        vm.expectRevert(BuybackBurnSink.NotSelf.selector);
+        sink.settleBurnTokenSelf();
+
+        assertEq(sprout.balanceOf(address(sink)), 10 ether, "a refused call moved something anyway");
     }
 
     // ── guards that fail where they are set, not where they bite ───────────
