@@ -34,8 +34,24 @@ PADT=0xBf08c09Fe227ada4A86d279e98E695344848d33D
 SETTLER=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 LOCKER=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
+# The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is the REPLACEMENT deployed
+# 2026-09-06 (#13); the sink it superseded, 0xe0248Ebc…, is intentionally absent — nothing points
+# at it and re-verifying a dead contract on every pass buys nothing.
+SPROUT=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
+BBSINK=0x498b0ABd90aAD26CD03323511235BD1503f8115b
+# ⛔ The sink's constructor `_owner` was the DEPLOY EOA, not the timelock: it was configured
+# EOA-owned and handed over afterwards. Verification hashes the args as CONSTRUCTED, so passing
+# $TL here would fail with a bytecode mismatch that reads like a compiler-settings problem.
+DEPLOYER=0xAcA0d67c52B503ED15706df5fE29E19677338bc6
 
 # address | fork-dir | src path:Name | constructor args (hex, may be empty)
+#
+# ⚠️ This list is hand-maintained and has silently fallen behind twice — it never gained the
+# BuybackBurnSink after #11 deployed one, and `infinity.universalRouter`
+# (0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7) is verified on Blockscout but is STILL not here,
+# because its constructor takes a `RouterParameters` struct that nothing has encoded for this
+# script yet. So "verify-all passed" means "every contract IN THIS LIST is verified", never
+# "every contract we deployed is". Add the row in the same change that deploys the contract.
 MANIFEST=(
 "0x17BDb95424cA07c31C23ecA9925CBA10818CBF6e|infinity-core|src/Vault.sol:Vault|"
 "$CLPM|infinity-core|src/pool-cl/CLPoolManager.sol:CLPoolManager|$(CA address $VAULT)"
@@ -59,6 +75,7 @@ MANIFEST=(
 "$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
 "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
+"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $DEPLOYER 8000 8000)"
 )
 
 for pass in $(seq 1 "$PASSES"); do
