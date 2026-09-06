@@ -10,6 +10,7 @@ import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLP
 import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {ChoiceFeeController} from "../src/fees/ChoiceFeeController.sol";
+import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ILaunchpadCore} from "../src/interfaces/ILaunchpadCore.sol";
 import {InfinitySettler} from "../src/launchpad/InfinitySettler.sol";
 import {LaunchPoolGuardHook} from "../src/launchpad/LaunchPoolGuardHook.sol";
@@ -35,13 +36,17 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployLaunchpadSettler is BaseScript {
-    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.0.0");
+    // 1.1.0 is plan A3: the PULL version of `collect` (credit + `claim`) and a `register`
+    // that binds the position to its pool. 1.0.0 predates `2cf25cc` and its `register` takes
+    // FOUR arguments, no `PoolKey` - see `_preflightLockerAbi` for why that has to be checked
+    // rather than assumed.
+    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.1.0");
     // 1.1.0 is plan A0: the LP fee carries the WHOLE 1.00% tier (10000, not 6722) and `settle`
     // calls `ChoiceFeeController.zeroLaunchPoolProtocolFee` so a graduate never pays Choice's
     // protocol fee for even one block. The locker and the guard hook are UNCHANGED and keep
     // their 1.0.0 addresses - which is why a re-deploy needs `setSettler` and `setInitializer`
     // from the timelock, printed at the end of this script.
-    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.1.0");
+    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.2.0");
     bytes32 internal constant GUARD_HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolGuardHook/1.0.0");
 
     Create3Factory internal factory;
@@ -102,6 +107,7 @@ contract DeployLaunchpadSettler is BaseScript {
         // than steps. The other direction is NOT, on a re-deploy: the locker and the hook were
         // constructed pointing at the PREVIOUS settler and each needs one owner call to follow.
         require(address(InfinitySettler(settler).LOCKER()) == locker, "settler is not wired to the locker");
+        _requireLockerSpeaksOurAbi(locker);
         require(address(InfinitySettler(settler).hooks()) == guardHook, "settler is not wired to the guard hook");
 
         writeAddress("choice.positionLocker", locker);
@@ -177,12 +183,23 @@ contract DeployLaunchpadSettler is BaseScript {
             console.log("  [ok]   the pool manager has no fee controller, so graduates are born at zero");
             return;
         }
-        if (address(ChoiceFeeController(payable(controller)).launchPoolGuardHook()) == guardHook) {
+        // 🔴 A staticcall, not an interface call. Mid-migration the manager still points at
+        // the PREVIOUS controller, which has no `launchPoolGuardHook` at all - and a plain
+        // call to a missing selector reverts, which would take this whole script down AFTER
+        // the settler is already on chain. A controller that cannot answer is exactly the
+        // "outstanding" case, so it has to be reported rather than thrown.
+        (bool answered, bytes memory data) = controller.staticcall(abi.encodeWithSignature("launchPoolGuardHook()"));
+        if (answered && data.length == 32 && abi.decode(data, (address)) == guardHook) {
             console.log("  [ok]   clFeeController.launchPoolGuardHook");
             return;
         }
         outstanding++;
-        console.log("  [TODO] the fee controller's launch-pool gate is not set to this hook");
+        if (!answered) {
+            console.log("  [TODO] the live fee controller has no launch-pool gate - it predates A0.");
+            console.log("           Point the pool manager at the 1.1.0 controller first (script 02).");
+        } else {
+            console.log("  [TODO] the fee controller's launch-pool gate is not set to this hook");
+        }
         console.log("           controller", controller);
         _printTimelockPayloads(
             controller, abi.encodeCall(ChoiceFeeController.setLaunchPoolGuardHook, (IHooks(guardHook)))
@@ -251,6 +268,41 @@ contract DeployLaunchpadSettler is BaseScript {
         require(decodedToken == reportedToken, "core layout: token word does not match getLaunchToken");
 
         console.log("[preflight] core storage layout agrees with its getters on launch", launchId);
+    }
+
+    /// @dev 🔴 The settler and the locker must agree on `register`, and a mismatch is SILENT.
+    ///
+    /// `InfinitySettler.LOCKER` is immutable and the locker's `settler` is a setter, so the two
+    /// look independently upgradeable - and they are not. `2cf25cc` changed `register` from
+    /// four arguments to five (it now binds the position to its `PoolKey`), which changed the
+    /// SELECTOR. A settler built from `main` calling a locker deployed before that commit hits
+    /// no function at all, falls through to a contract with no `fallback`, and reverts with
+    /// EMPTY returndata - inside `settle`, inside `triggerGraduation`, with every gate and
+    /// every canary having passed. It cost a full graduation to find, on testnet, on 2026-09-06.
+    ///
+    /// Checked against the locker THIS RUN will wire the settler to, not the one in the address
+    /// book: `_deploy` reuses whatever already sits at `LOCKER_SALT`, so a stale salt is exactly
+    /// the case that has to fail here.
+    ///
+    /// 🔑 The check is a NAMED error. `register` is `onlyCore`-shaped: called from anywhere
+    /// else it reverts `NotSettler()`. So `NotSettler` coming back IS proof the selector
+    /// exists, and empty returndata IS proof it does not. A `code.length` check cannot tell
+    /// those apart, and neither can reading the address book.
+    function _requireLockerSpeaksOurAbi(address locker) internal view {
+        PoolKey memory probe;
+        (bool ok, bytes memory ret) =
+            locker.staticcall(abi.encodeCall(PositionLocker.register, (0, 0, address(0), 0, probe)));
+        require(!ok, "locker.register did not revert from a non-settler - is this a PositionLocker?");
+        require(
+            ret.length >= 4 && bytes4(ret) == PositionLocker.NotSettler.selector,
+            string.concat(
+                "locker at ",
+                vm.toString(locker),
+                " does not implement this repo's register(uint256,uint256,address,uint16,PoolKey)",
+                " - it predates contracts 2cf25cc. Bump LOCKER_SALT and deploy the pull version (plan A3)."
+            )
+        );
+        console.log("[check] the locker at LOCKER_SALT speaks this repo's register()");
     }
 
     /// @dev CREATE3 addresses depend only on the salt, so "already there" is a code check.

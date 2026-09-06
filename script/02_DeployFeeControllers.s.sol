@@ -41,10 +41,15 @@ contract DeployFeeControllers is BaseScript {
     bytes32 internal constant EXCHANGE_SINK_SALT = keccak256("CHOICE-V2/ExchangeSubaccountBurnSink/1.0.0");
     // 1.1.0 carries `zeroLaunchPoolProtocolFee` (plan A0, tokenomics D30/D31): a sprout
     // graduate pays Choice no protocol fee, so `protocolFeesAccrued` holds only Choice's own
-    // revenue by construction. Bumped on BOTH controllers so a fresh deployment runs one
-    // version of this contract; only the CL one has launch pools to gate.
+    // revenue by construction.
+    //
+    // 🔴 The BIN salt is deliberately NOT bumped. A salt is an address slot, not a version
+    // stamp - both controllers compile from the same `ChoiceFeeController.sol`, so a fresh
+    // deployment gets the new code at either salt. Bumping it would only force a live rewire
+    // of a pool manager that has no launch pools and never will: the settler is CL-only, so
+    // the new function is unreachable there. Bump it if a bin graduation path is ever built.
     bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.1.0");
-    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.1.0");
+    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.0.0");
 
     Create3Factory internal factory;
     address internal timelock;

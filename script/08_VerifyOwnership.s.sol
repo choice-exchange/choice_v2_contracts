@@ -2,16 +2,12 @@
 pragma solidity 0.8.26;
 
 import "forge-std/Script.sol";
-import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {BaseScript} from "./BaseScript.sol";
 
-/// @dev Read-only slices, so this script keeps compiling against a deployment whose contracts
-/// predate any of these functions - the calls are guarded by a book entry, not by a type.
-interface IChoiceFeeControllerView {
-    function launchPoolGuardHook() external view returns (IHooks);
-}
-
+/// @dev Read-only slices of contracts this script must never depend on the version of. The
+/// launch-pool gate is read by raw staticcall instead, because a controller deployed before
+/// plan A0 does not have that function and a missing selector reverts.
 interface IPositionLockerView {
     function settler() external view returns (address);
 }
@@ -162,10 +158,15 @@ contract VerifyOwnership is BaseScript {
         }
 
         if (clFeeController != address(0) && guardHook != address(0)) {
-            address gate = address(IChoiceFeeControllerView(clFeeController).launchPoolGuardHook());
+            // 🔴 A staticcall, because a controller deployed before A0 has no such function
+            // and a plain call to a missing selector reverts - which would take down a script
+            // whose whole job is to REPORT that the deploy is unfinished.
+            (bool answered, bytes memory data) =
+                clFeeController.staticcall(abi.encodeWithSignature("launchPoolGuardHook()"));
+            address gate = (answered && data.length == 32) ? abi.decode(data, (address)) : address(0);
             _wiring(
-                gate == guardHook,
-                "clFeeController.launchPoolGuardHook",
+                answered && gate == guardHook,
+                answered ? "clFeeController.launchPoolGuardHook" : "clFeeController has no launch-pool gate (pre-A0)",
                 gate,
                 guardHook,
                 "choice.clFeeController -> setLaunchPoolGuardHook"
