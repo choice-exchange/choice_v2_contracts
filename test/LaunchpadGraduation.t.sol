@@ -13,6 +13,9 @@ import {WETH} from "solmate/src/tokens/WETH.sol";
 import {Vault} from "infinity-core/src/Vault.sol";
 import {CLPoolManager} from "infinity-core/src/pool-cl/CLPoolManager.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
+import {ProtocolFeeController} from "infinity-core/src/ProtocolFeeController.sol";
+import {IProtocolFeeController} from "infinity-core/src/interfaces/IProtocolFeeController.sol";
+import {ProtocolFeeLibrary} from "infinity-core/src/libraries/ProtocolFeeLibrary.sol";
 import {CLPoolParametersHelper} from "infinity-core/src/pool-cl/libraries/CLPoolParametersHelper.sol";
 import {FixedPoint96} from "infinity-core/src/pool-cl/libraries/FixedPoint96.sol";
 import {FullMath} from "infinity-core/src/pool-cl/libraries/FullMath.sol";
@@ -131,7 +134,11 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     uint256 internal constant SEED_PAIR = 1_500e18;
     uint16 internal constant CREATOR_BPS = 1_000; // 10% of LP fees to the creator
 
-    uint24 internal constant LP_FEE = 6722; // the 1.00% tier's LP leg
+    /// @dev The WHOLE 1.00% tier: a graduate has no protocol leg to share it with (D31).
+    uint24 internal constant LP_FEE = 10_000;
+    /// @dev What the LP leg WAS, when the tier was split with a protocol fee. Kept because
+    /// the point of A0 is that the trader's composite did not move when it changed.
+    uint24 internal constant LP_FEE_BESIDE_A_PROTOCOL_FEE = 6722;
     int24 internal constant TICK_SPACING = 200;
 
     function setUp() public {
@@ -162,6 +169,12 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         settler =
             new InfinitySettler(ILaunchpadCore(address(core)), clPoolManager, posm, permit2, locker, guardHook, OWNER);
         assertEq(address(settler), predictedSettler, "settler address prediction is wrong");
+
+        // A0/D30: what tells the controller which pools are sprout graduates. On chain this is
+        // a timelock call after script 05, because the hook does not exist when the fee
+        // controllers are deployed. Without it every graduation reverts - deliberately, see
+        // `test_graduationRevertsWhileTheControllerHasNoLaunchPoolGate`.
+        feeController.setLaunchPoolGuardHook(guardHook);
 
         (launchToken, pairToken) = _orderedPair({launchIsCurrency0: true, launchDecimals: 18, pairDecimals: 18});
     }
@@ -267,22 +280,31 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     // Fees
     // =====================================================================================
 
-    /// @dev The M4 "done when", end to end: a swap on the graduated pool pays the LP position
-    /// (creator + launchpad, through the locker) AND Choice (through the fee controller).
-    function test_swapFeesReachCreatorLaunchpadAndChoice() public {
+    /// @dev The M4 "done when", end to end, as A0 leaves it: a swap on the graduated pool pays
+    /// the LP position - creator and launchpad, through the locker - and pays Choice NOTHING.
+    ///
+    /// 🔑 The second half is the whole of D30. Choice's `protocolFeesAccrued` is one global
+    /// bucket per currency, so a graduate that paid into it would be inseparable from a
+    /// wINJ/USDC pool by harvest time. A graduate paying zero is what makes "these two
+    /// projects share no money" provable rather than promised, and this is where it is
+    /// checked: the launchpad's legs are non-zero in both currencies, and Choice's is exactly
+    /// zero in both.
+    function test_swapFeesReachCreatorAndLaunchpadAndNeverChoice() public {
         _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
 
         _swap(_key(), true, 10e18);
         _swap(_key(), false, 1e18);
 
-        // Choice's leg.
+        // Choice's leg, in both directions: fees accrue in the INPUT currency, and both
+        // currencies were an input above, so this covers the whole pool.
         Currency pairCurrency = Currency.wrap(address(pairToken));
-        assertGt(feeController.pendingProtocolFee(pairCurrency), 0, "protocol fee did not accrue");
+        Currency launchCurrency = Currency.wrap(address(launchToken));
+        assertEq(feeController.pendingProtocolFee(pairCurrency), 0, "a graduate paid Choice a protocol fee");
+        assertEq(feeController.pendingProtocolFee(launchCurrency), 0, "a graduate paid Choice a protocol fee");
         vm.prank(RANDOM);
-        (uint256 toTreasury,) = feeController.harvest(pairCurrency);
-        assertEq(pairToken.balanceOf(CHOICE_TREASURY), toTreasury, "Choice treasury not paid");
-        assertGt(toTreasury, 0, "Choice earned nothing");
+        vm.expectRevert(ChoiceFeeController.NothingToHarvest.selector);
+        feeController.harvest(pairCurrency);
 
         // The launchpad's leg. Permissionless, like the harvest.
         uint128 liquidityBefore = locker.positionLiquidity(LAUNCH_ID);
@@ -469,6 +491,139 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         _claimIfAny(pair, PAD_TREASURY);
         assertEq(pairToken.balanceOf(CREATOR), amount1 * CREATOR_BPS / 10_000, "donation leaked into the split");
         assertEq(pairToken.balanceOf(address(locker)), donation, "donation was paid out");
+    }
+
+    // =====================================================================================
+    // A0 / D30 / D31 - Choice's revenue and sprout's never mix
+    // =====================================================================================
+
+    /// @dev The A0 "done when", read off the pool the way anyone auditing it would: the
+    /// graduate carries the WHOLE 1.00% tier as LP fee and no protocol fee at all.
+    function test_aGraduateCarriesTheWholeTierAndNoProtocolFee() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        (,, uint24 protocolFee, uint24 poolLpFee) = clPoolManager.getSlot0(_key().toId());
+        assertEq(protocolFee, 0, "a sprout graduate is charging Choice's protocol fee");
+        assertEq(poolLpFee, LP_FEE, "the LP leg is not the whole tier");
+        assertEq(settler.lpFee(), LP_FEE, "the settler's configured LP fee drifted from the pool's");
+    }
+
+    /// @dev The trader-neutrality claim, in the pool's own arithmetic rather than in prose.
+    /// `calculateSwapFee` is what the pool charges, and 6722 beside a 3299 protocol leg came
+    /// to 9999 pips - so moving the whole tier onto the LP leg moves what a trader pays by
+    /// ONE pip in a million, upward, to exactly the advertised 1.00%.
+    function test_theTraderStillPaysOnePercent() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        (,, uint24 protocolFee, uint24 poolLpFee) = clPoolManager.getSlot0(_key().toId());
+        uint24 composite = ProtocolFeeLibrary.calculateSwapFee(uint16(protocolFee & 0xfff), poolLpFee);
+        assertEq(composite, 10_000, "a graduate no longer charges exactly 1.00%");
+
+        // What the same tier charged under the old split, from the controller's own numbers.
+        // 🔴 The protocol fee has to be asked for against the OLD key - `protocolFeeForPool`
+        // reads `key.fee`, so asking it about the graduate's 10000 answers with the 0.4% cap
+        // rather than with the 3299 that 6722 was sized against.
+        PoolKey memory oldKey = _key();
+        oldKey.fee = LP_FEE_BESIDE_A_PROTOCOL_FEE;
+        uint24 oldProtocolFee = feeController.protocolFeeForPool(oldKey) & 0xfff;
+        assertEq(oldProtocolFee, 3299, "the plan's measured protocol fee for this tier drifted");
+        uint24 oldComposite = ProtocolFeeLibrary.calculateSwapFee(uint16(oldProtocolFee), LP_FEE_BESIDE_A_PROTOCOL_FEE);
+        assertEq(oldComposite, 9_999, "the pre-A0 composite is not what the plan measured");
+    }
+
+    /// @dev The wall in the other direction, and the reason it has to be checked separately:
+    /// `protocolFeesAccrued` is ONE bucket, so "graduates pay nothing" is only half a
+    /// separation. Choice's own pools must still pay, or A0 would have zeroed Choice's
+    /// revenue rather than fenced it.
+    function test_aNonLaunchPoolStillPaysChoicesProtocolFee() public {
+        PoolKey memory ordinary = _openOrdinaryPool();
+
+        (,, uint24 protocolFee,) = clPoolManager.getSlot0(ordinary.toId());
+        assertGt(protocolFee, 0, "an ordinary Choice pool stopped charging a protocol fee");
+
+        _swap(ordinary, true, 10e18);
+
+        Currency currency0 = ordinary.currency0;
+        assertGt(feeController.pendingProtocolFee(currency0), 0, "Choice earned nothing on its own pool");
+        vm.prank(RANDOM);
+        (uint256 toTreasury,) = feeController.harvest(currency0);
+        assertGt(toTreasury, 0, "Choice's harvest moved nothing");
+        assertEq(IERC20(Currency.unwrap(currency0)).balanceOf(CHOICE_TREASURY), toTreasury, "Choice was not paid");
+    }
+
+    /// @dev The gate. A key that is not a launch pool cannot be zeroed by anyone, so the
+    /// permissionless entrypoint can never be turned on Choice's own revenue.
+    function test_anOrdinaryPoolCannotBeZeroedByAnybody() public {
+        PoolKey memory ordinary = _openOrdinaryPool();
+
+        vm.prank(RANDOM);
+        vm.expectRevert(abi.encodeWithSelector(ChoiceFeeController.NotALaunchPool.selector, ordinary.hooks));
+        feeController.zeroLaunchPoolProtocolFee(ordinary);
+
+        (,, uint24 protocolFee,) = clPoolManager.getSlot0(ordinary.toId());
+        assertGt(protocolFee, 0, "the pool was zeroed anyway");
+    }
+
+    /// @dev The repair path, kept permissionless on purpose: anyone may re-run it on a
+    /// graduate, and doing so changes nothing. That is what makes it safe to leave open for a
+    /// pool that was somehow initialised outside `settle`.
+    function test_zeroingAGraduateAgainIsPermissionlessAndIdempotent() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        PoolKey memory key = _key();
+        vm.prank(RANDOM);
+        feeController.zeroLaunchPoolProtocolFee(key);
+        vm.prank(RANDOM);
+        feeController.zeroLaunchPoolProtocolFee(key);
+
+        (,, uint24 protocolFee, uint24 poolLpFee) = clPoolManager.getSlot0(key.toId());
+        assertEq(protocolFee, 0, "the fee did not stay zero");
+        assertEq(poolLpFee, LP_FEE, "the LP fee moved");
+    }
+
+    /// @dev The deploy-order hazard, pinned so it fails in CI rather than on mainnet. The fee
+    /// controllers go out in script 02 and the guard hook does not exist until script 05, so
+    /// `setLaunchPoolGuardHook` is a timelock call somebody has to make. Until they do,
+    /// graduation REVERTS - loudly, with the launch left in `CurveFilled` and every token
+    /// still in the core - rather than quietly opening a pool that pays Choice.
+    /// `08_VerifyOwnership` checks the wiring; this is why it has to.
+    function test_graduationRevertsWhileTheControllerHasNoLaunchPoolGate() public {
+        feeController.setLaunchPoolGuardHook(IHooks(address(0)));
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+
+        vm.expectRevert(ChoiceFeeController.LaunchPoolGuardHookNotSet.selector);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        assertEq(uint8(core.getLaunchState(LAUNCH_ID)), uint8(ILaunchpadCore.LaunchState.CurveFilled));
+        (uint160 price,,,) = clPoolManager.getSlot0(_key().toId());
+        assertEq(price, 0, "a pool was opened by a reverted graduation");
+    }
+
+    /// @dev And the same policy one level up: a pool manager pointed at a controller that
+    /// cannot express the separation at all. Fail closed - graduating under it would start a
+    /// launch pool paying into a bucket nobody can ever unpick.
+    function test_graduationRevertsUnderAControllerThatCannotZero() public {
+        clPoolManager.setProtocolFeeController(new ProtocolFeeController(address(clPoolManager)));
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+
+        vm.expectRevert();
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        assertEq(uint8(core.getLaunchState(LAUNCH_ID)), uint8(ILaunchpadCore.LaunchState.CurveFilled));
+    }
+
+    /// @dev A manager with NO controller is the one case that needs no call: `_fetchProtocolFee`
+    /// already answers 0 for every pool it initialises, so the graduate is born at zero.
+    function test_graduationSucceedsWithNoProtocolFeeControllerAtAll() public {
+        clPoolManager.setProtocolFeeController(IProtocolFeeController(address(0)));
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, CREATOR_BPS);
+
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+
+        (,, uint24 protocolFee,) = clPoolManager.getSlot0(_key().toId());
+        assertEq(protocolFee, 0, "a pool born without a controller is not at zero");
     }
 
     // =====================================================================================
@@ -797,6 +952,37 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
             "launchpad's share is wrong"
         );
         assertEq(locker.totalOwed(currency), 0, "totalOwed did not clear");
+    }
+
+    /// @dev A plain Choice pool on the same 1.00% tier: same currencies, NO guard hook, and
+    /// the LP leg 6722 that the tier carries when it is shared with a protocol fee. This is
+    /// what the launch pool has to stay distinguishable from.
+    function _openOrdinaryPool() internal returns (PoolKey memory key) {
+        (Currency currency0, Currency currency1) = _currencies();
+        int24 spacing = settler.tickSpacing();
+        key = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            hooks: IHooks(address(0)),
+            poolManager: IPoolManager(address(clPoolManager)),
+            fee: LP_FEE_BESIDE_A_PROTOCOL_FEE,
+            parameters: bytes32(0).setTickSpacing(spacing)
+        });
+        clPoolManager.initialize(key, uint160(FixedPoint96.Q96));
+
+        int24 tickLower = (TickMath.MIN_TICK / spacing) * spacing;
+        int24 tickUpper = (TickMath.MAX_TICK / spacing) * spacing;
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), 1_000e18);
+        MockERC20(Currency.unwrap(currency1)).mint(address(this), 1_000e18);
+        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
+        MockERC20(Currency.unwrap(currency1)).approve(address(swapRouter), type(uint256).max);
+        swapRouter.modifyPosition(
+            key,
+            ICLPoolManager.ModifyLiquidityParams({
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 100e18, salt: bytes32(0)
+            }),
+            ""
+        );
     }
 
     function _swap(PoolKey memory key, bool zeroForOne, uint256 amountIn) internal {

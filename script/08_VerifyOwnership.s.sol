@@ -2,7 +2,19 @@
 pragma solidity 0.8.26;
 
 import "forge-std/Script.sol";
+import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {BaseScript} from "./BaseScript.sol";
+
+/// @dev Read-only slices of contracts this script must never depend on the version of. The
+/// launch-pool gate is read by raw staticcall instead, because a controller deployed before
+/// plan A0 does not have that function and a missing selector reverts.
+interface IPositionLockerView {
+    function settler() external view returns (address);
+}
+
+interface ILaunchPoolGuardHookView {
+    function isInitializer(address) external view returns (bool);
+}
 
 /**
  * The last step of every deploy, and the only one that fails loudly if the deploy is not
@@ -93,12 +105,112 @@ contract VerifyOwnership is BaseScript {
         _requireOwnedByBookEntry("infinity.binPoolManager", "infinity.binPoolManagerOwner");
 
         console.log("");
+        _checkLaunchPoolWiring();
+
+        console.log("");
         _checkCreate3Factory();
 
         console.log("");
         _checkTimelockDelay();
 
         _report();
+    }
+
+    /// @dev Ownership is not the only thing a deploy can leave half-done. These four links are
+    /// what a graduation actually walks, and every one of them is a call SOMEBODY has to make
+    /// after the contracts are on chain:
+    ///
+    ///   1. the CL pool manager points at Choice's fee controller,
+    ///   2. that controller's launch-pool gate is the guard hook (plan A0 / D30) - without it
+    ///      `zeroLaunchPoolProtocolFee` refuses and every graduation reverts,
+    ///   3. the locker registers for this settler,
+    ///   4. the guard hook lets this settler create pools.
+    ///
+    /// 🔴 2 is the one that is easy to miss, because it did not exist before A0 and the
+    /// controller is deployed two scripts before the hook it has to point at. Failing closed
+    /// is the right behaviour there - a graduate that quietly paid Choice's protocol fee would
+    /// mix sprout's revenue into a global bucket nobody can unpick afterwards - but "fails
+    /// closed" is only safe if the missing step is impossible to miss.
+    ///
+    /// A missing address book entry is SKIPPED, like everything else here, so this is runnable
+    /// on a deployment that has no launchpad.
+    function _checkLaunchPoolWiring() internal {
+        console.log("Launch-pool wiring (a graduation touches all of it)");
+
+        address clPoolManager = readAddressOrZero("infinity.clPoolManager");
+        address clFeeController = readAddressOrZero("choice.clFeeController");
+        address guardHook = readAddressOrZero("choice.launchPoolGuardHook");
+        address settler = readAddressOrZero("choice.infinitySettler");
+        address locker = readAddressOrZero("choice.positionLocker");
+
+        if (clPoolManager != address(0) && clFeeController != address(0)) {
+            address live = address(IProtocolFees(clPoolManager).protocolFeeController());
+            _wiring(
+                live == clFeeController,
+                "clPoolManager.protocolFeeController",
+                live,
+                clFeeController,
+                "infinity.clPoolManagerOwner -> setProtocolFeeController"
+            );
+        } else {
+            skipped++;
+            console.log("  [skip] clPoolManager or clFeeController is not in the book yet");
+        }
+
+        if (clFeeController != address(0) && guardHook != address(0)) {
+            // 🔴 A staticcall, because a controller deployed before A0 has no such function
+            // and a plain call to a missing selector reverts - which would take down a script
+            // whose whole job is to REPORT that the deploy is unfinished.
+            (bool answered, bytes memory data) =
+                clFeeController.staticcall(abi.encodeWithSignature("launchPoolGuardHook()"));
+            address gate = (answered && data.length == 32) ? abi.decode(data, (address)) : address(0);
+            _wiring(
+                answered && gate == guardHook,
+                answered ? "clFeeController.launchPoolGuardHook" : "clFeeController has no launch-pool gate (pre-A0)",
+                gate,
+                guardHook,
+                "choice.clFeeController -> setLaunchPoolGuardHook"
+            );
+        } else {
+            skipped++;
+            console.log("  [skip] clFeeController or launchPoolGuardHook is not in the book yet");
+        }
+
+        if (locker != address(0) && settler != address(0)) {
+            address current = IPositionLockerView(locker).settler();
+            _wiring(
+                current == settler, "positionLocker.settler", current, settler, "choice.positionLocker -> setSettler"
+            );
+        } else {
+            skipped++;
+            console.log("  [skip] positionLocker or infinitySettler is not in the book yet");
+        }
+
+        if (guardHook != address(0) && settler != address(0)) {
+            bool allowed = ILaunchPoolGuardHookView(guardHook).isInitializer(settler);
+            _wiring(
+                allowed,
+                "launchPoolGuardHook.isInitializer(settler)",
+                allowed ? settler : address(0),
+                settler,
+                "choice.launchPoolGuardHook -> setInitializer(settler, true)"
+            );
+        } else {
+            skipped++;
+            console.log("  [skip] launchPoolGuardHook or infinitySettler is not in the book yet");
+        }
+    }
+
+    function _wiring(bool ok, string memory what, address current, address expected, string memory fix) internal {
+        checked++;
+        if (ok) {
+            console.log(string.concat("  [ok]    ", what));
+            return;
+        }
+        wrong++;
+        console.log(string.concat("  [WRONG] ", what));
+        console.log(string.concat("            is ", vm.toString(current), ", should be ", vm.toString(expected)));
+        console.log(string.concat("            fix: Safe -> timelock -> ", fix));
     }
 
     // -------------------------------------------------------------------------------------

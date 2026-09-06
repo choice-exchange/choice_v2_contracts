@@ -7,6 +7,10 @@ import {Create3Factory} from "pancake-create3-factory/src/Create3Factory.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
+import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
+import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
+import {ChoiceFeeController} from "../src/fees/ChoiceFeeController.sol";
+import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ILaunchpadCore} from "../src/interfaces/ILaunchpadCore.sol";
 import {InfinitySettler} from "../src/launchpad/InfinitySettler.sol";
 import {LaunchPoolGuardHook} from "../src/launchpad/LaunchPoolGuardHook.sol";
@@ -32,11 +36,21 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployLaunchpadSettler is BaseScript {
-    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.0.0");
-    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.0.0");
+    // 1.1.0 is plan A3: the PULL version of `collect` (credit + `claim`) and a `register`
+    // that binds the position to its pool. 1.0.0 predates `2cf25cc` and its `register` takes
+    // FOUR arguments, no `PoolKey` - see `_preflightLockerAbi` for why that has to be checked
+    // rather than assumed.
+    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.1.0");
+    // 1.1.0 is plan A0: the LP fee carries the WHOLE 1.00% tier (10000, not 6722) and `settle`
+    // calls `ChoiceFeeController.zeroLaunchPoolProtocolFee` so a graduate never pays Choice's
+    // protocol fee for even one block. The locker and the guard hook are UNCHANGED and keep
+    // their 1.0.0 addresses - which is why a re-deploy needs `setSettler` and `setInitializer`
+    // from the timelock, printed at the end of this script.
+    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.2.0");
     bytes32 internal constant GUARD_HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolGuardHook/1.0.0");
 
     Create3Factory internal factory;
+    uint256 internal outstanding;
 
     function run() public {
         factory = Create3Factory(readAddress("governance.create3Factory"));
@@ -89,10 +103,11 @@ contract DeployLaunchpadSettler is BaseScript {
 
         vm.stopBroadcast();
 
-        // Every link is set at construction, so this is an assertion rather than a step.
-        require(PositionLocker(payable(locker)).settler() == settler, "locker is not wired to the settler");
-        require(LaunchPoolGuardHook(guardHook).isInitializer(settler), "the guard hook does not allow the settler");
+        // The settler's own links are set at construction, so those two are assertions rather
+        // than steps. The other direction is NOT, on a re-deploy: the locker and the hook were
+        // constructed pointing at the PREVIOUS settler and each needs one owner call to follow.
         require(address(InfinitySettler(settler).LOCKER()) == locker, "settler is not wired to the locker");
+        _requireLockerSpeaksOurAbi(locker);
         require(address(InfinitySettler(settler).hooks()) == guardHook, "settler is not wired to the guard hook");
 
         writeAddress("choice.positionLocker", locker);
@@ -100,13 +115,134 @@ contract DeployLaunchpadSettler is BaseScript {
         writeAddress("choice.infinitySettler", settler);
 
         console.log("");
-        console.log("One step remains, and the key is not ours:");
+        console.log("What still has to happen. Nothing below is optional: a graduation touches");
+        console.log("every one of these and reverts if any is missing.");
+        console.log("");
+
+        _requireLockerSettler(locker, settler);
+        _requireHookAllowsSettler(guardHook, settler);
+        _requireLaunchPoolGate(guardHook);
+
+        console.log("");
         console.log("  LAUNCHPAD ADMIN on", padCore);
         console.log("     setSeederFactory(%s)", settler);
         console.log("     Only launches created AFTER that call graduate onto v2 - the pad");
         console.log("     snapshots the settler per launch, so in-flight ones keep the CW path.");
         console.log("");
-        console.log("  Ownership needs nothing: all three are timelock-owned from construction.");
+
+        if (outstanding == 0) {
+            console.log("  Everything on the Choice side is wired. Ownership needs nothing:");
+            console.log("  all three are timelock-owned from construction.");
+        } else {
+            console.log(string.concat("  ", vm.toString(outstanding), " timelock step(s) OUTSTANDING - see above."));
+            console.log("  Re-run this script after they land; it is idempotent and will confirm them.");
+        }
+    }
+
+    /// @dev `PositionLocker.settler` is the only address allowed to `register`, and it is
+    /// owner-settable precisely so a settler can be replaced. Positions the previous settler
+    /// registered are untouched.
+    function _requireLockerSettler(address locker, address settler) internal {
+        address current = PositionLocker(payable(locker)).settler();
+        if (current == settler) {
+            console.log("  [ok]   positionLocker.settler");
+            return;
+        }
+        outstanding++;
+        console.log("  [TODO] positionLocker still registers for", current);
+        _printTimelockPayloads(locker, abi.encodeCall(PositionLocker.setSettler, (settler)));
+    }
+
+    /// @dev Without this the settler cannot create the pool at all: the guard permissions
+    /// `beforeInitialize` to an allowlist, and a rejected initialize reverts the graduation.
+    /// The PREVIOUS settler is deliberately left on the allowlist - it is ours, it holds the
+    /// same guarantees, and leaving it there keeps a rollback one pad call rather than three.
+    function _requireHookAllowsSettler(address guardHook, address settler) internal {
+        if (LaunchPoolGuardHook(guardHook).isInitializer(settler)) {
+            console.log("  [ok]   launchPoolGuardHook.isInitializer");
+            return;
+        }
+        outstanding++;
+        console.log("  [TODO] the guard hook does not allow this settler");
+        _printTimelockPayloads(guardHook, abi.encodeCall(LaunchPoolGuardHook.setInitializer, (settler, true)));
+    }
+
+    /// @dev A0/D30. `settle` calls `ChoiceFeeController.zeroLaunchPoolProtocolFee` so a sprout
+    /// graduate never pays into Choice's global `protocolFeesAccrued` bucket, and that function
+    /// is gated on the pool key carrying this hook. The controller ships with the gate unset
+    /// (it is deployed in script 02, before this hook exists) and refuses to run while it is,
+    /// so until the timelock sets it EVERY graduation reverts.
+    ///
+    /// 🔴 Read the controller off the POOL MANAGER, not the address book: only the manager's
+    /// current `protocolFeeController` can set a protocol fee, so that is the contract the
+    /// settler will actually call.
+    function _requireLaunchPoolGate(address guardHook) internal {
+        address clPoolManager = readAddress("infinity.clPoolManager");
+        address controller = address(IProtocolFees(clPoolManager).protocolFeeController());
+        if (controller == address(0)) {
+            console.log("  [ok]   the pool manager has no fee controller, so graduates are born at zero");
+            return;
+        }
+        // 🔴 A staticcall, not an interface call. Mid-migration the manager still points at
+        // the PREVIOUS controller, which has no `launchPoolGuardHook` at all - and a plain
+        // call to a missing selector reverts, which would take this whole script down AFTER
+        // the settler is already on chain. A controller that cannot answer is exactly the
+        // "outstanding" case, so it has to be reported rather than thrown.
+        (bool answered, bytes memory data) = controller.staticcall(abi.encodeWithSignature("launchPoolGuardHook()"));
+        if (answered && data.length == 32 && abi.decode(data, (address)) == guardHook) {
+            console.log("  [ok]   clFeeController.launchPoolGuardHook");
+            return;
+        }
+        outstanding++;
+        if (!answered) {
+            console.log("  [TODO] the live fee controller has no launch-pool gate - it predates A0.");
+            console.log("           Point the pool manager at the 1.1.0 controller first (script 02).");
+        } else {
+            console.log("  [TODO] the fee controller's launch-pool gate is not set to this hook");
+        }
+        console.log("           controller", controller);
+        _printTimelockPayloads(
+            controller, abi.encodeCall(ChoiceFeeController.setLaunchPoolGuardHook, (IHooks(guardHook)))
+        );
+    }
+
+    /// @dev Both halves, because matching `execute`'s arguments to the `schedule` they came
+    /// from is the whole trick with a `TimelockController`.
+    function _printTimelockPayloads(address target, bytes memory payload) internal {
+        uint256 delay = readUint("governance.timelockMinDelay");
+        console.log(
+            string.concat(
+                "           1. Safe -> timelock.schedule: ",
+                vm.toString(
+                    abi.encodeWithSignature(
+                        "schedule(address,uint256,bytes,bytes32,bytes32,uint256)",
+                        target,
+                        uint256(0),
+                        payload,
+                        bytes32(0),
+                        bytes32(0),
+                        delay
+                    )
+                )
+            )
+        );
+        console.log(
+            string.concat(
+                "           2. after ",
+                vm.toString(delay),
+                "s, anyone -> timelock.execute: ",
+                vm.toString(
+                    abi.encodeWithSignature(
+                        "execute(address,uint256,bytes,bytes32,bytes32)",
+                        target,
+                        uint256(0),
+                        payload,
+                        bytes32(0),
+                        bytes32(0)
+                    )
+                )
+            )
+        );
     }
 
     /// @dev The settler decodes `creator` and `creatorFeeShareBps` straight out of the core's
@@ -132,6 +268,41 @@ contract DeployLaunchpadSettler is BaseScript {
         require(decodedToken == reportedToken, "core layout: token word does not match getLaunchToken");
 
         console.log("[preflight] core storage layout agrees with its getters on launch", launchId);
+    }
+
+    /// @dev 🔴 The settler and the locker must agree on `register`, and a mismatch is SILENT.
+    ///
+    /// `InfinitySettler.LOCKER` is immutable and the locker's `settler` is a setter, so the two
+    /// look independently upgradeable - and they are not. `2cf25cc` changed `register` from
+    /// four arguments to five (it now binds the position to its `PoolKey`), which changed the
+    /// SELECTOR. A settler built from `main` calling a locker deployed before that commit hits
+    /// no function at all, falls through to a contract with no `fallback`, and reverts with
+    /// EMPTY returndata - inside `settle`, inside `triggerGraduation`, with every gate and
+    /// every canary having passed. It cost a full graduation to find, on testnet, on 2026-09-06.
+    ///
+    /// Checked against the locker THIS RUN will wire the settler to, not the one in the address
+    /// book: `_deploy` reuses whatever already sits at `LOCKER_SALT`, so a stale salt is exactly
+    /// the case that has to fail here.
+    ///
+    /// 🔑 The check is a NAMED error. `register` is `onlyCore`-shaped: called from anywhere
+    /// else it reverts `NotSettler()`. So `NotSettler` coming back IS proof the selector
+    /// exists, and empty returndata IS proof it does not. A `code.length` check cannot tell
+    /// those apart, and neither can reading the address book.
+    function _requireLockerSpeaksOurAbi(address locker) internal view {
+        PoolKey memory probe;
+        (bool ok, bytes memory ret) =
+            locker.staticcall(abi.encodeCall(PositionLocker.register, (0, 0, address(0), 0, probe)));
+        require(!ok, "locker.register did not revert from a non-settler - is this a PositionLocker?");
+        require(
+            ret.length >= 4 && bytes4(ret) == PositionLocker.NotSettler.selector,
+            string.concat(
+                "locker at ",
+                vm.toString(locker),
+                " does not implement this repo's register(uint256,uint256,address,uint16,PoolKey)",
+                " - it predates contracts 2cf25cc. Bump LOCKER_SALT and deploy the pull version (plan A3)."
+            )
+        );
+        console.log("[check] the locker at LOCKER_SALT speaks this repo's register()");
     }
 
     /// @dev CREATE3 addresses depend only on the salt, so "already there" is a code check.
