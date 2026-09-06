@@ -25,6 +25,9 @@ DSINK=0xEAf8ED7b6c9e425b45199839be5e9D3F2a791215
 P2=0x000000000022D473030F116dDEE9F6B43aC78BA3
 WETH=0x0000000088827d2d103ee2d9A6b781773AE03FfB
 DEAD=0x000000000000000000000000000000000000dEaD
+UNSUP=0xCB7340356Df545a6DCc10998078F3E0089640E2d
+UR=0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7
+B32Z=0x0000000000000000000000000000000000000000000000000000000000000000
 CLQ=0xb7a4f84508c36255Bc29cc4dECaD6cBabd651a60
 BNQ=0x0e41128C6Eb88E1DDc97683d78Cf58035eeabD46
 DESC=0xd5817F090C8F9939e086861d6EEAB95004072956
@@ -47,10 +50,9 @@ DEPLOYER=0xAcA0d67c52B503ED15706df5fE29E19677338bc6
 # address | fork-dir | src path:Name | constructor args (hex, may be empty)
 #
 # ⚠️ This list is hand-maintained and has silently fallen behind twice — it never gained the
-# BuybackBurnSink after #11 deployed one, and `infinity.universalRouter`
-# (0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7) is verified on Blockscout but is STILL not here,
-# because its constructor takes a `RouterParameters` struct that nothing has encoded for this
-# script yet. So "verify-all passed" means "every contract IN THIS LIST is verified", never
+# BuybackBurnSink after #11 deployed one, and the UniversalRouter sat outside it for a whole
+# milestone because nothing had encoded its `RouterParameters` struct. Both are in now, but the
+# lesson stands: "verify-all passed" means "every contract IN THIS LIST is verified", never
 # "every contract we deployed is". Add the row in the same change that deploys the contract.
 MANIFEST=(
 "0x17BDb95424cA07c31C23ecA9925CBA10818CBF6e|infinity-core|src/Vault.sol:Vault|"
@@ -70,12 +72,22 @@ MANIFEST=(
 "$BNQ|infinity-periphery|src/pool-bin/lens/BinQuoter.sol:BinQuoter|$(CA address $BPM)"
 "0x95B0B855108CA5A8D5c43D9bc3A5994A479043e0|infinity-periphery|src/MixedQuoter.sol:MixedQuoter|$(CA address,address,address,address,address,address $DEAD $DEAD $DEAD $WETH $CLQ $BNQ)"
 "0x9D29c5BA79Ff9b173EADa6b8C0Fae10307cC9400|infinity-periphery|src/pool-cl/lens/TickLens.sol:TickLens|$(CA address $CLPM)"
-"0xCB7340356Df545a6DCc10998078F3E0089640E2d|infinity-universal-router|src/deploy/UnsupportedProtocol.sol:UnsupportedProtocol|"
+"$UNSUP|infinity-universal-router|src/deploy/UnsupportedProtocol.sol:UnsupportedProtocol|"
 "$LOCKER|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $PADT $TL $SETTLER)"
 "$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
 "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
 "$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $DEPLOYER 8000 8000)"
+# 🔴 ONE argument: a static `RouterParameters` struct, so it encodes as 12 flat words with NO
+# offset head — which is why the whole thing is a single parenthesised tuple here rather than a
+# list of scalars. Confirmed byte-identical (all 384) against the bytes actually deployed:
+# broadcast/forks/infinity-universal-router/DeployInjectiveTestnet.s.sol/1439/run-latest.json
+# carries the CREATE3 `deploy(...)` call, and these are the tail of its `creationCode` argument.
+# ⛔ The five UNSUPPORTED slots are NOT address(0). `DeployUniversalRouter.run()` maps every
+# address(0) through `mapUnsupported` to the UnsupportedProtocol it deploys in the same run, so
+# the struct that reached the constructor holds $UNSUP five times. Encoding the zeros the
+# deployParameters file literally says would fail as a bytecode mismatch.
+"$UR|infinity-universal-router|src/UniversalRouter.sol:UniversalRouter|$(CA '(address,address,address,address,address,bytes32,bytes32,address,address,address,address,address)' "($P2,$WETH,$UNSUP,$UNSUP,$UNSUP,$B32Z,$B32Z,$UNSUP,$UNSUP,$VAULT,$CLPM,$BPM)")"
 )
 
 for pass in $(seq 1 "$PASSES"); do
