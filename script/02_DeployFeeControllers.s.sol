@@ -6,11 +6,17 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Create3Factory} from "pancake-create3-factory/src/Create3Factory.sol";
 import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {IProtocolFeeController} from "infinity-core/src/interfaces/IProtocolFeeController.sol";
+import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
+import {IPoolManagerOwner} from "infinity-core/src/interfaces/IPoolManagerOwner.sol";
 import {ChoiceFeeController} from "../src/fees/ChoiceFeeController.sol";
 import {DirectTransferBurnSink} from "../src/fees/DirectTransferBurnSink.sol";
 import {ExchangeSubaccountBurnSink} from "../src/fees/ExchangeSubaccountBurnSink.sol";
 import {IBurnSink} from "../src/interfaces/IBurnSink.sol";
 import {BaseScript} from "./BaseScript.sol";
+
+interface IOwnable {
+    function owner() external view returns (address);
+}
 
 /**
  * M1 step 1, in place of upstream core scripts 04 and 05.
@@ -33,12 +39,17 @@ import {BaseScript} from "./BaseScript.sol";
 contract DeployFeeControllers is BaseScript {
     bytes32 internal constant DIRECT_SINK_SALT = keccak256("CHOICE-V2/DirectTransferBurnSink/1.0.0");
     bytes32 internal constant EXCHANGE_SINK_SALT = keccak256("CHOICE-V2/ExchangeSubaccountBurnSink/1.0.0");
-    bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.0.0");
-    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.0.0");
+    // 1.1.0 carries `zeroLaunchPoolProtocolFee` (plan A0, tokenomics D30/D31): a sprout
+    // graduate pays Choice no protocol fee, so `protocolFeesAccrued` holds only Choice's own
+    // revenue by construction. Bumped on BOTH controllers so a fresh deployment runs one
+    // version of this contract; only the CL one has launch pools to gate.
+    bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.1.0");
+    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.1.0");
 
     Create3Factory internal factory;
     address internal timelock;
     address internal treasury;
+    uint256 internal outstanding;
 
     function run() public {
         factory = Create3Factory(readAddress("governance.create3Factory"));
@@ -95,11 +106,12 @@ contract DeployFeeControllers is BaseScript {
         );
 
         // --- point the pool managers at them ----------------------------------------------
-        // Done here, while the DEPLOYER still owns the pool managers. After script 03 hands
-        // them to the PoolManagerOwner contracts this becomes a timelock operation, so doing
-        // it now saves a governance round trip on first deploy and changes nothing later.
-        _setController(clPoolManager, clFeeController);
-        _setController(binPoolManager, binFeeController);
+        // On a FIRST deploy this runs while the DEPLOYER still owns the pool managers, which
+        // saves a governance round trip. On a re-run after script 03 the managers sit behind
+        // their `PoolManagerOwner` contracts and this becomes a timelock operation, so the
+        // payload is printed instead of sent - see `_setController`.
+        _setController(clPoolManager, "infinity.clPoolManagerOwner", clFeeController);
+        _setController(binPoolManager, "infinity.binPoolManagerOwner", binFeeController);
 
         vm.stopBroadcast();
 
@@ -107,6 +119,43 @@ contract DeployFeeControllers is BaseScript {
         writeAddress("choice.exchangeSubaccountBurnSink", exchangeSink);
         writeAddress("choice.clFeeController", clFeeController);
         writeAddress("choice.binFeeController", binFeeController);
+
+        _reportLaunchPoolGate(clFeeController);
+        _reportOutstanding();
+    }
+
+    /// @dev A0/D30. `zeroLaunchPoolProtocolFee` is gated on the pool key carrying the launch
+    /// pool's guard hook, and that hook does not exist until script 05 - so the controller
+    /// ships with the gate UNSET and a timelock call turns it on. Until it is set, EVERY
+    /// graduation reverts: `InfinitySettler.settle` calls the controller and this contract
+    /// refuses rather than match a hookless key against `address(0)`.
+    ///
+    /// Deliberately loud. Failing closed is right - a graduate that quietly paid Choice's
+    /// protocol fee would put sprout's revenue into a global bucket nobody can ever unpick -
+    /// but it is only safe if the missing step is impossible to miss. `08_VerifyOwnership`
+    /// checks the same thing at the end of a deploy.
+    function _reportLaunchPoolGate(address clFeeController) internal {
+        address guardHook = readAddressOrZero("choice.launchPoolGuardHook");
+        if (guardHook == address(0)) {
+            console.log("");
+            console.log("  [note] the launch-pool gate is unset and the guard hook does not exist yet.");
+            console.log("         Run script 05, then come back and run THIS script again for the payload.");
+            return;
+        }
+        address current = address(ChoiceFeeController(payable(clFeeController)).launchPoolGuardHook());
+        if (current == guardHook) {
+            console.log("");
+            console.log("  [ok]   launch-pool gate is set:", guardHook);
+            return;
+        }
+
+        outstanding++;
+        console.log("");
+        console.log("  [TODO] the launch-pool gate is NOT set - every graduation will revert.");
+        console.log("         Safe -> timelock -> clFeeController.setLaunchPoolGuardHook(%s)", guardHook);
+        _printTimelockPayloads(
+            clFeeController, abi.encodeCall(ChoiceFeeController.setLaunchPoolGuardHook, (IHooks(guardHook)))
+        );
     }
 
     /// @dev CREATE3 addresses depend only on the salt, so the target address is known before
@@ -122,13 +171,81 @@ contract DeployFeeControllers is BaseScript {
         console.log("  deployed:", deployed);
     }
 
-    function _setController(address poolManager, address controller) internal {
+    /// @dev Send it if we still own the manager, print the governance payload if we do not.
+    ///
+    /// 🔴 The `owner()` check is the whole point. After script 03 the pool managers sit behind
+    /// their `PoolManagerOwner` contracts, so a plain `setProtocolFeeController` from the
+    /// deploy key reverts - and a re-run of this script (which is how a controller is
+    /// REPLACED) would die halfway, after the new controller is already on chain and before
+    /// anything points at it.
+    function _setController(address poolManager, string memory ownerKey, address controller) internal {
         address current = address(IProtocolFees(poolManager).protocolFeeController());
         if (current == controller) {
             console.log("  protocolFeeController already set on", poolManager);
             return;
         }
-        IProtocolFees(poolManager).setProtocolFeeController(IProtocolFeeController(controller));
-        console.log("  setProtocolFeeController on", poolManager, "->", controller);
+
+        address managerOwner = IOwnable(poolManager).owner();
+        if (managerOwner == vm.addr(deployerKey())) {
+            IProtocolFees(poolManager).setProtocolFeeController(IProtocolFeeController(controller));
+            console.log("  setProtocolFeeController on", poolManager, "->", controller);
+            return;
+        }
+
+        outstanding++;
+        console.log("");
+        console.log("  [TODO] the pool manager is behind", managerOwner);
+        console.log("         it still points at", current);
+        console.log("         Safe -> timelock -> %s.setProtocolFeeController(%s)", ownerKey, controller);
+        _printTimelockPayloads(
+            managerOwner,
+            abi.encodeCall(IPoolManagerOwner.setProtocolFeeController, (IProtocolFeeController(controller)))
+        );
+    }
+
+    /// @dev Both halves, because matching `execute`'s arguments to the `schedule` they came
+    /// from is the whole trick with a `TimelockController`. Same shape as script 08's.
+    function _printTimelockPayloads(address target, bytes memory payload) internal {
+        uint256 delay = readUint("governance.timelockMinDelay");
+        console.log(
+            string.concat(
+                "           1. Safe -> timelock.schedule: ",
+                vm.toString(
+                    abi.encodeWithSignature(
+                        "schedule(address,uint256,bytes,bytes32,bytes32,uint256)",
+                        target,
+                        uint256(0),
+                        payload,
+                        bytes32(0),
+                        bytes32(0),
+                        delay
+                    )
+                )
+            )
+        );
+        console.log(
+            string.concat(
+                "           2. after ",
+                vm.toString(delay),
+                "s, anyone -> timelock.execute: ",
+                vm.toString(
+                    abi.encodeWithSignature(
+                        "execute(address,uint256,bytes,bytes32,bytes32)",
+                        target,
+                        uint256(0),
+                        payload,
+                        bytes32(0),
+                        bytes32(0)
+                    )
+                )
+            )
+        );
+    }
+
+    function _reportOutstanding() internal view {
+        if (outstanding == 0) return;
+        console.log("");
+        console.log(string.concat(vm.toString(outstanding), " governance step(s) OUTSTANDING - see above."));
+        console.log("Re-run this script after they land; it is idempotent and will confirm them.");
     }
 }

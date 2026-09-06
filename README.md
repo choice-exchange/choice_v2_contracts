@@ -111,8 +111,8 @@ does not exist.
 
 Afterwards the seed position never moves. `PositionLocker.collect(launchId)` is permissionless
 and pulls only fees - the plan hard-codes a liquidity delta of zero - splitting them
-creator / launchpad treasury by the launch's own `creatorFeeShareBps`. Choice's own share of
-the same swaps arrives separately, through `ChoiceFeeController.harvest`.
+creator / launchpad treasury by the launch's own `creatorFeeShareBps`. That LP fee is the
+launch's ENTIRE post-graduation revenue: a graduate pays Choice no protocol fee at all.
 
 🔴 **Graduation costs 1,595,080 gas, measured on testnet — not the ~900k
 `test_graduationGasBudget` pins.** The test is not wrong about what it measures; it cannot
@@ -123,6 +123,58 @@ that, because `0x64` has no code to fork. Treat the unit budget as a floor on ou
 **size the sender off 1.6M**. Injective's `eth_estimateGas` under-reports too, so whatever
 sends `triggerGraduation` needs an explicit, generous limit rather than an estimate — the
 pad keeper's 5M is comfortable.
+
+### A graduate pays Choice nothing, and that is the separation
+
+sprout.fun and Choice are separate projects that share no money, and the obvious wiring for
+that - "harvest only the graduates' protocol fee" - **is not expressible**.
+`ProtocolFees.protocolFeesAccrued` is ONE global `mapping(Currency => uint256)` across every
+pool in the manager, swept in full by the single authorised controller, so a graduate's fee and
+a wINJ/USDC pool's fee are indistinguishable by the time anyone can harvest them.
+
+So the problem is dissolved rather than solved: **graduates carry protocol fee 0**, and the
+global bucket then holds only Choice's own revenue *by construction*. The separation becomes
+provable from the pool key instead of enforced by procedure (plan A0, tokenomics D30/D31).
+
+| | |
+| --- | --- |
+| LP fee | **10000** pips - the WHOLE 1.00% tier, not 6722 |
+| Protocol fee | **0**, set inside the graduation transaction |
+| Tick spacing | 200 |
+
+🔑 **The trader pays the same 1%.** 6722 is `getLPFeeFromTotalFee(10000)`: the LP leg sized to
+composite to 1% *alongside* a protocol fee. `calculateSwapFee(3299, 6722)` is 9,999 pips and
+`calculateSwapFee(0, 10000)` is 10,000 - one pip in a million, upward, to exactly the
+advertised tier. Only the split moves.
+
+🔴 **Zeroing it needs a contract change, which is why `ChoiceFeeController` carries
+`zeroLaunchPoolProtocolFee`.** `ProtocolFeeController.protocolFeeForPool` is `override`
+**without `virtual`**, so the formula cannot be subclassed, and the inherited `setProtocolFee`
+is `onlyOwner` - a timelock call per graduation is not viable when graduation is permissionless.
+The new function is **permissionless** and gated on `key.hooks == launchPoolGuardHook`, so it
+can only ever reach a pool an allowlisted settler created; the only choice a caller has is
+*when* a graduate stops paying Choice, and the only direction is down. `InfinitySettler.settle`
+calls it right after initialising the pool, so a graduate never charges the fee for even one
+block, and it stays open afterwards as the repair path for a pool initialised outside `settle`.
+
+⛔ **`ChoiceFeeController.setBurnSink` is never pointed at the SPROUT sink.** Sprout's revenue
+reaches its own sink only through pad-owned contracts (`LaunchpadCore.treasury`,
+`PositionLocker.launchpadTreasury`). That un-made call is the other half of the wall.
+
+🔴 **Four links, and a graduation walks all of them.** `08_VerifyOwnership` checks each and
+prints the Safe -> timelock payload for anything missing; run it at the end of every deploy.
+
+1. `clPoolManager.protocolFeeController` is Choice's controller,
+2. `clFeeController.launchPoolGuardHook` is the guard hook,
+3. `positionLocker.settler` is this settler,
+4. `launchPoolGuardHook.isInitializer(settler)`.
+
+2 is the one that is easy to miss: the fee controllers are deployed in script 02 and the guard
+hook does not exist until script 05, so the gate ships **unset** and a timelock call turns it
+on. While it is unset every graduation **reverts** - deliberately. Fail-closed is right here,
+because a graduate that quietly paid Choice's protocol fee would put sprout's revenue into a
+bucket nobody can unpick afterwards, and the reverted graduation leaves the launch in
+`CurveFilled` with every token still in the core.
 
 ### The pool is un-campable, and that needs a hook
 

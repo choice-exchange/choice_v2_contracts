@@ -11,6 +11,7 @@ import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol"
 import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {IPoolManager} from "infinity-core/src/interfaces/IPoolManager.sol";
+import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {PoolId} from "infinity-core/src/types/PoolId.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
@@ -23,6 +24,7 @@ import {Plan, Planner} from "infinity-periphery/src/libraries/Planner.sol";
 import {LiquidityAmounts} from "infinity-periphery/src/pool-cl/libraries/LiquidityAmounts.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
+import {IChoiceFeeController} from "../interfaces/IChoiceFeeController.sol";
 import {IGraduationSettler} from "../interfaces/IGraduationSettler.sol";
 import {ILaunchpadCore} from "../interfaces/ILaunchpadCore.sol";
 import {LaunchPoolGuardHook} from "./LaunchPoolGuardHook.sol";
@@ -91,11 +93,15 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
 
     /// @notice LP fee of the tier launches graduate onto, in pips.
     ///
-    /// @dev This is the LP leg, not the tier: 6722 is what the deployed `ChoiceFeeController`
-    /// returns from `getLPFeeFromTotalFee(10_000)`, i.e. the 1.00% tier of plan §4 once the
-    /// 33% protocol share is taken off the input first. Putting the tier number here instead
-    /// would silently overcharge every graduated pool.
-    uint24 public lpFee = 6722;
+    /// @dev The WHOLE 1.00% tier, because a graduate has no protocol leg to share it with
+    /// (tokenomics D31, plan A0). 6722 - `getLPFeeFromTotalFee(10_000)` on the deployed
+    /// `ChoiceFeeController` - was the LP leg sized to composite to 1% ALONGSIDE a 33%
+    /// protocol fee. `settle` zeroes that protocol fee, so leaving 6722 here would charge
+    /// the trader 0.67% instead of 1% and hand the difference to nobody.
+    ///
+    /// 🔑 The trader pays the same 1.00% either way; only the split moves. On a non-launch
+    /// pool 6722 is still the right number for this tier, and `04_SeedPool` still uses it.
+    uint24 public lpFee = 10_000;
 
     /// @notice Tick spacing of that tier.
     int24 public tickSpacing = 200;
@@ -212,6 +218,7 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         });
 
         uint160 sqrtPriceX96 = _initializePool(key, amount0, amount1);
+        _zeroProtocolFee(key);
 
         // Full range, aligned inward to the tier's spacing. Solidity's division truncates
         // toward zero, which moves both bounds *into* the representable range - the divide
@@ -268,6 +275,35 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
         // Mint against the pool's own price, not the target: liquidity computed at a price
         // the pool does not hold would leave one leg short and the other stranded.
         return existing;
+    }
+
+    /// @dev Take Choice's protocol fee off this pool, in the graduation transaction itself.
+    ///
+    /// **Why a graduate pays Choice nothing** (tokenomics D30/D31, plan A0). Sprout.fun and
+    /// Choice are separate projects that share no money, and `ProtocolFees.protocolFeesAccrued`
+    /// is ONE global bucket per currency across every pool in the manager - so a graduate's
+    /// protocol fee and a wINJ/USDC pool's are indistinguishable by the time anyone can
+    /// harvest, and "sweep only the graduates' share" is not expressible. Charging graduates
+    /// nothing dissolves that: the bucket then holds only Choice's own revenue by
+    /// construction, and the separation is provable from the pool key rather than promised.
+    ///
+    /// Here rather than in a keeper, because a keeper leaves a window in which a graduate
+    /// charges a fee that would then be unattributable for ever. The controller keeps
+    /// `zeroLaunchPoolProtocolFee` permissionless anyway as the repair path.
+    ///
+    /// 🔴 The controller is read from the POOL MANAGER, never stored here. Only the manager's
+    /// current `protocolFeeController` may call `setProtocolFee`, so reading it from anywhere
+    /// else could only ever produce a stale address whose call reverts. A manager with no
+    /// controller needs no call at all: `_fetchProtocolFee` returns 0 for those pools already.
+    ///
+    /// ⚠️ Anything else is a REVERT, which reverts the graduation - the same policy as the
+    /// rest of this contract. A controller that cannot express the separation is a
+    /// misconfiguration on Choice's side, and graduating under it would start a launch pool
+    /// paying a fee nobody can ever give back.
+    function _zeroProtocolFee(PoolKey memory key) internal {
+        address controller = address(IProtocolFees(address(CL_POOL_MANAGER)).protocolFeeController());
+        if (controller == address(0)) return;
+        IChoiceFeeController(controller).zeroLaunchPoolProtocolFee(key);
     }
 
     /// @dev `sqrt(amount1 / amount0) * 2**96`.
