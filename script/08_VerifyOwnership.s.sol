@@ -63,7 +63,10 @@ contract VerifyOwnership is BaseScript {
         console.log("");
 
         console.log("Behind the timelock directly");
-        string[11] memory timelockOwned = [
+        // ⛔ `choice.directTransferBurnSink` is absent on purpose: it carries no `Ownable` at
+        // all, by design - it holds nothing and forwards to a constructor-fixed address. The
+        // two sinks that DO have an owner are both here.
+        string[12] memory timelockOwned = [
             "choice.clFeeController",
             "choice.binFeeController",
             "choice.infinitySettler",
@@ -71,6 +74,7 @@ contract VerifyOwnership is BaseScript {
             "choice.launchPoolGuardHook",
             "choice.choiceRouter",
             "choice.exchangeSubaccountBurnSink",
+            "choice.buybackBurnSink",
             "infinity.vault",
             "infinity.universalRouter",
             "infinity.clPoolManagerOwner",

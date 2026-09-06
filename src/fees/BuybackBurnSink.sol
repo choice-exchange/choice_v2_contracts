@@ -51,6 +51,12 @@ import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 /// complete forever, and it was not. Four escapes were reachable, `maxImpactBps = 0` - the
 /// value a sink carries until `setGuards` is first called - among them.
 ///
+/// The SETTLE runs inside its own `try/catch` for the same reason and was the last frame that
+/// could still propagate: the swap being wrapped said nothing about `BURN_TOKEN.burn` or the
+/// transfer to `treasury`, both of which reach the bank precompile and neither of which this
+/// contract controls. See `_settleBurnToken` for why that wrapper is one atomic self-call and
+/// not a `try` around each leg.
+///
 /// The named guards below still exist, because failing inside `setGuards` / `setBuybackPool`
 /// says what is wrong while somebody is looking at it, where a park is silent.
 ///
@@ -151,6 +157,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     error RateLimitRequired();
     error NotVault();
     error LockNotOpen();
+    error NotSelf();
     error CannotSweepBuybackLeg(Currency currency);
 
     /// @param quoteSpent quote actually consumed; may be less than offered if the limit bound.
@@ -158,8 +165,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @param burnt destroyed via `BURN_TOKEN.burn`; `toTreasury` is the ops remainder.
     event Burnt(uint256 burnt, uint256 toTreasury);
     /// @param reason 0 = below `minBuybackAmount`, 1 = inside `minBuybackInterval`,
-    /// 2 = currency has no buyback route, 3 = the swap itself reverted. Funds stay here in
-    /// every case.
+    /// 2 = currency has no buyback route, 3 = the swap itself reverted, 4 = the burn/treasury
+    /// settle reverted. Funds stay here in every case.
     event Parked(Currency indexed currency, uint256 amount, uint8 reason);
     event BurnBpsUpdated(uint16 oldBps, uint16 newBps);
     event TreasuryUpdated(address oldTreasury, address newTreasury);
@@ -171,6 +178,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     uint8 private constant PARK_RATE_LIMITED = 1;
     uint8 private constant PARK_NO_ROUTE = 2;
     uint8 private constant PARK_SWAP_FAILED = 3;
+    uint8 private constant PARK_SETTLE_FAILED = 4;
 
     constructor(
         IBurnableERC20 _burnToken,
@@ -373,9 +381,49 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     // Burn
     // -------------------------------------------------------------------------------------
 
-    /// @dev The treasury gets the remainder rather than a second multiplication, so integer
-    /// division cannot strand dust here on every call.
+    /// @dev The last thing inside the never-revert perimeter, and the one gate that was outside
+    /// it. Both call sites - `burn` when the harvested currency IS the burn token, and
+    /// `_tryBuyback` after a swap that already succeeded - sit under
+    /// `ChoiceFeeController.harvest`, so a revert raised here bricks harvesting exactly as a
+    /// reverting swap would. The second site is the worse of the two: the buyback has landed and
+    /// `lastBuybackAt` is written by then, so propagating would unwind a good swap rather than
+    /// merely refusing a settle.
+    ///
+    /// Neither leg is unfailable. `BURN_TOKEN.burn` and the treasury transfer both route through
+    /// the bank precompile on a `MintBurnBankERC20`, and `treasury` is owner-settable to any
+    /// address - a module account among them.
+    ///
+    /// ⛔ Wrapping the two legs in SEPARATE `try/catch`es is the obvious fix and it is wrong. A
+    /// burn that succeeds beside a transfer that fails leaves only the treasury's share sitting
+    /// here, and the next call - which acts on the BALANCE, as everything in this contract does -
+    /// would apply `burnBps` to that remainder and burn 80% of the ops share. The split has to be
+    /// all-or-nothing, so the whole settle goes through ONE external self-call: either both legs
+    /// land or the balance is untouched and parks intact for a later attempt.
     function _settleBurnToken() private {
+        uint256 balance = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
+        if (balance == 0) return;
+
+        // Settled on the success path, where `Burnt` is emitted from inside the call.
+        try this.settleBurnTokenSelf() {}
+        catch {
+            emit Parked(Currency.wrap(address(BURN_TOKEN)), balance, PARK_SETTLE_FAILED);
+        }
+    }
+
+    /// @notice The burn/treasury split, as an external function so it can be caught.
+    /// @dev Solidity cannot `try` a revert raised in its own frame, so the atomicity argued for
+    /// above needs a real external call. Callable by this contract ONLY - it moves the burn
+    /// token and would otherwise be a permissionless way to force the split at a chosen moment.
+    ///
+    /// Deliberately NOT `nonReentrant`: it is reached from inside `burn`/`buyback`, both of
+    /// which hold the guard, so carrying the modifier here would make every settle revert into
+    /// the `catch` above and park the balance forever.
+    ///
+    /// The treasury gets the remainder rather than a second multiplication, so integer division
+    /// cannot strand dust here on every call.
+    function settleBurnTokenSelf() external {
+        if (msg.sender != address(this)) revert NotSelf();
+
         uint256 balance = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
         if (balance == 0) return;
 
