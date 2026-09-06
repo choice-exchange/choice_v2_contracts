@@ -37,15 +37,17 @@ PADT=0xBf08c09Fe227ada4A86d279e98E695344848d33D
 SETTLER=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 LOCKER=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
-# The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is the REPLACEMENT deployed
-# 2026-09-06 (#13); the sink it superseded, 0xe0248Ebc…, is intentionally absent — nothing points
-# at it and re-verifying a dead contract on every pass buys nothing.
+# The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is 1.1.0, the A4 sink deployed
+# 2026-09-06; the two it supersedes, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent —
+# nothing points at either and re-verifying a dead contract on every pass buys nothing.
+#
+# 🔴 Its constructor `_owner` is the TIMELOCK, unlike 1.0.0's, which took the deploy EOA and was
+# handed over afterwards. 1.1.0 is a CREATE3 deploy from script 09 and is born timelock-owned, so
+# there is no handover and no EOA in its arguments. Verification hashes the args as CONSTRUCTED,
+# so carrying 1.0.0's $DEPLOYER forward would fail with a bytecode mismatch that reads like a
+# compiler-settings problem.
 SPROUT=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
-BBSINK=0x498b0ABd90aAD26CD03323511235BD1503f8115b
-# ⛔ The sink's constructor `_owner` was the DEPLOY EOA, not the timelock: it was configured
-# EOA-owned and handed over afterwards. Verification hashes the args as CONSTRUCTED, so passing
-# $TL here would fail with a bytecode mismatch that reads like a compiler-settings problem.
-DEPLOYER=0xAcA0d67c52B503ED15706df5fE29E19677338bc6
+BBSINK=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
 
 # address | fork-dir | src path:Name | constructor args (hex, may be empty)
 #
@@ -77,7 +79,7 @@ MANIFEST=(
 "$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
 "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
-"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $DEPLOYER 8000 8000)"
+"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"
 # 🔴 ONE argument: a static `RouterParameters` struct, so it encodes as 12 flat words with NO
 # offset head — which is why the whole thing is a single parenthesised tuple here rather than a
 # list of scalars. Confirmed byte-identical (all 384) against the bytes actually deployed:
