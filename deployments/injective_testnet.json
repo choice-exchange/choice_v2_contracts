@@ -178,8 +178,6 @@
       "protocolFeePipsPerDirection": 0,
       "tickSpacing": 200,
       "parameters": "0x0000000000000000000000000000000000000000000000000000000000c80001",
-      "currency0": "0x7E6f4a01f2943d7d68C89999cFFC187A09f5D8A1",
-      "currency1": "0xb65491e4e19412E1E595294DEDC1d3E45d0DbA32",
       "seedSqrtPriceX96": "312639474967835801982198576140277",
       "seedTick": 165617,
       "seedLiquidity": "59190974215427714747687",
@@ -187,7 +185,8 @@
       "positionLocker": "choice.positionLocker",
       "compositeSwapFeePips": 10000,
       "compositeSwapFeeNote": "calculateSwapFee(0, 10000) = 10000, exactly the 1.00% tier. The pre-A0 split charged calculateSwapFee(3299, 6722) = 9,999 - one pip in a million less, so A0 is trader-neutral to within that pip.",
-      "permissionlessRepairProven": "zeroLaunchPoolProtocolFee on this key, called from 0x...dEaD, succeeds and changes nothing - the function is permissionless and idempotent"
+      "permissionlessRepairProven": "zeroLaunchPoolProtocolFee on this key, called from 0x...dEaD, succeeds and changes nothing - the function is permissionless and idempotent",
+      "currencyOrderNote": "currency0 is the QUOTE here and currency1 the launch token, because 0x7E6f < 0xb654 - the settler sorts by address, so which leg is currency0 differs per launch. Derivable from the two addresses above; not repeated as its own field, because a value that appears under two keys is exactly what the address book's duplicate check exists to catch."
     }
   }
 }
