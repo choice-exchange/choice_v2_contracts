@@ -10,9 +10,11 @@ import {Currency} from "infinity-core/src/types/Currency.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 
+import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
+
 import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
 import {IBurnableERC20} from "../src/interfaces/IBurnableERC20.sol";
-import {InfinitySettler} from "../src/launchpad/InfinitySettler.sol";
+import {ILaunchPositionLocker} from "../src/interfaces/ILaunchPositionLocker.sol";
 import {BaseScript} from "./BaseScript.sol";
 
 /**
@@ -33,16 +35,21 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployBuybackBurnSink is BaseScript {
-    /// 1.1.0 is plan A4: the normalise leg and the D32 hold allowlist. A launch token that is
-    /// not SPROUT used to park for ever - which under D30/D31 is roughly half of a graduate's
-    /// revenue, because a full-range position earns in both currencies.
+    /// 1.2.0 is plan A5: the sink ASKS a launch's locked position for its real pool key instead
+    /// of deriving one from a stored tier. `setConversionTier` is gone, and with it the straggler
+    /// case - a launch that graduated on an earlier fee tier stopped being derivable, silently,
+    /// and its revenue parked until somebody pointed the tier back.
     ///
-    /// 🔴 No OTHER salt moves with it, and that is a claim worth stating rather than assuming.
-    /// The rule that cost a graduation on 2026-09-06 is that a shared ABI needs both ends
-    /// redeployed together; the only ABI this contract shares is `IBurnSink.burn`, which is
-    /// byte-identical to 1.0.0's. Nothing calls `convert`, `setHold` or `setConversionTier`
-    /// except a human and a keeper.
-    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.1.0");
+    /// 🔴 **A salt DOES move with this one.** `LaunchFeeCranker` (script 10) calls
+    /// `convert(Currency,uint256)`, which exists only from 1.2.0, and it holds its sink as an
+    /// immutable - so a sink redeploy is always a cranker redeploy. That is the A3 rule applied
+    /// forwards for once rather than discovered afterwards: bump both, deploy both, and check
+    /// `cranker.SINK()` afterwards.
+    ///
+    /// ⚠️ It also needs the timelock to `setLockers` before any launch token can convert, and to
+    /// repoint `PositionLocker.launchpadTreasury` at the new address on EVERY live locker - the
+    /// old sink keeps whatever is parked in it until it is swept.
+    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.2.0");
 
     /// TEST values (§9.3). ⛔ Not mainnet's: the floor is immutable and one shot, and B2 puts it
     /// at 5000 with `burnBps` 7000. 8000/8000 is what the testnet sink it replaces carries, kept
@@ -59,16 +66,16 @@ contract DeployBuybackBurnSink is BaseScript {
         address vault = readAddress("infinity.vault");
         address quote = readAddress("external.wINJ");
         address sprout = readAddress("launchpad.sproutToken");
-        address settler = readAddress("choice.infinitySettler");
+        address positionManager = readAddress("infinity.clPositionManager");
 
         requireCode("timelock", timelock);
         requireCode("vault", vault);
         requireCode("wINJ", quote);
         requireCode("sproutToken", sprout);
-        requireCode("infinitySettler", settler);
+        requireCode("clPositionManager", positionManager);
 
         address sink = factory.computeAddress(SINK_SALT);
-        console.log("BuybackBurnSink 1.1.0 ->", sink);
+        console.log("BuybackBurnSink 1.2.0 ->", sink);
 
         if (sink.code.length == 0) {
             // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments
@@ -79,6 +86,7 @@ contract DeployBuybackBurnSink is BaseScript {
                     IBurnableERC20(sprout),
                     Currency.wrap(quote),
                     IVault(vault),
+                    ICLPositionManager(positionManager),
                     treasury,
                     timelock,
                     MIN_BURN_BPS,
@@ -105,7 +113,7 @@ contract DeployBuybackBurnSink is BaseScript {
         console.log("so none of it is optional and none of it can brick a harvest either.");
         console.log("");
 
-        _requireConversionTier(sink, settler);
+        _requireLockers(sink);
         _requireGuards(sink);
         _requireBuybackPool(sink);
 
@@ -118,36 +126,52 @@ contract DeployBuybackBurnSink is BaseScript {
         }
     }
 
-    /// @dev A4. The tier every graduation pool is keyed to, which is what lets the sink DERIVE a
-    /// launch's pool instead of being registered one per launch.
+    /// @dev A5. The position lockers a conversion may read a graduate's pool key out of.
     ///
-    /// 🔴 Read off the settler rather than typed here. `hooks`, `lpFee` and `poolParameters`
-    /// jointly ARE the non-currency half of a graduation pool key, and a tier that is one pip or
-    /// one tick-spacing away from the settler's derives a key for a pool that does not exist -
-    /// which parks silently, for ever, with nothing to look at.
-    function _requireConversionTier(address sink, address settler) internal {
-        address clPoolManager = readAddress("infinity.clPoolManager");
-        IHooks hooks = InfinitySettler(settler).hooks();
-        uint24 fee = InfinitySettler(settler).lpFee();
-        bytes32 parameters = InfinitySettler(settler).poolParameters();
+    /// 🔴 This replaces `_requireConversionTier`, and the replacement is the point of A5. That
+    /// one read `hooks()`, `lpFee()` and `poolParameters()` off the settler and asked the sink to
+    /// carry a copy - a FIFTH copy of "which settler is current", after the keeper's
+    /// `PHASE3_SETTLER`, the pad backend's `CHOICE_V2_SETTLERS`, the pad frontend's
+    /// `ADDRESSES.infinitySettlers` and this repo's own `verify-all.sh`. All four of the others
+    /// were found stale on the same day, two of them meaning no graduate was tradable in the pad
+    /// UI with nothing failing. The sink does not hold a copy any more; it asks a locker.
+    ///
+    /// ⚠️ The list is EVERY locker whose launches should stay convertible, not just the live one.
+    /// Testnet has two generations and the older one holds launches 13-17.
+    function _requireLockers(address sink) internal {
+        address[] memory wanted = _wantedLockers();
 
-        (IPoolManager currentManager, IHooks currentHooks, uint24 currentFee, bytes32 currentParameters) =
-            BuybackBurnSink(payable(sink)).conversionTier();
-        if (
-            address(currentManager) == clPoolManager && currentHooks == hooks && currentFee == fee
-                && currentParameters == parameters
-        ) {
-            console.log("  [ok]   buybackBurnSink.conversionTier matches the settler");
+        address[] memory installed = BuybackBurnSink(payable(sink)).lockers();
+        bool matches = installed.length == wanted.length;
+        for (uint256 i; matches && i < wanted.length; ++i) {
+            if (installed[i] != wanted[i]) matches = false;
+        }
+        if (matches) {
+            console.log("  [ok]   buybackBurnSink.setLockers");
             return;
         }
+
         outstanding++;
-        console.log("  [TODO] the conversion tier does not match the settler's graduation pool");
-        console.log("           hook", address(hooks));
-        console.log("           lpFee", fee);
-        _printTimelockPayloads(
-            sink,
-            abi.encodeCall(BuybackBurnSink.setConversionTier, (IPoolManager(clPoolManager), hooks, fee, parameters))
-        );
+        console.log("  [TODO] the locker set does not match the address book");
+        for (uint256 i; i < wanted.length; ++i) {
+            console.log("           want", wanted[i]);
+        }
+        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setLockers, (wanted)));
+    }
+
+    /// @dev The live locker, plus any superseded one still holding graduated positions.
+    /// `positionLockerLegacy` is optional: a fresh deployment has none.
+    function _wantedLockers() internal view returns (address[] memory wanted) {
+        address live = readAddress("choice.positionLocker");
+        address legacy = readAddressOrZero("choice.positionLockerLegacy");
+        requireCode("positionLocker", live);
+
+        wanted = new address[](legacy == address(0) ? 1 : 2);
+        wanted[0] = live;
+        if (legacy != address(0)) {
+            requireCode("positionLockerLegacy", legacy);
+            wanted[1] = legacy;
+        }
     }
 
     /// @dev Until `setGuards` is called `maxImpactBps` is 0, which truncates to a price limit the
@@ -163,9 +187,16 @@ contract DeployBuybackBurnSink is BaseScript {
         _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (1e15, 500, 60)));
     }
 
-    /// @dev The one pool the sink cannot derive: SPROUT's own graduation pool is where the
-    /// buyback spends, and SPROUT is a launch like any other, so the key is built the same way
-    /// and then checked against the chain.
+    /// @dev The one pool the sink cannot be told about by a caller: the buyback's own.
+    ///
+    /// SPROUT is a launch like any other, so its graduation pool key is read the same way every
+    /// other launch's is now - off SPROUT's own locked position, through `launchPool`. That is
+    /// strictly better than the tier derivation it replaces: it is the key the position is
+    /// actually in, so it cannot be one fee tier or one tick spacing away from a pool that does
+    /// not exist.
+    ///
+    /// ⚠️ Needs `launchpad.sproutLaunchId` in the address book, and the lockers installed first -
+    /// which is why this check runs last.
     function _requireBuybackPool(address sink) internal {
         BuybackBurnSink s = BuybackBurnSink(payable(sink));
         (,,, IPoolManager installed,,) = s.buybackPool();
@@ -174,20 +205,20 @@ contract DeployBuybackBurnSink is BaseScript {
             return;
         }
 
-        (PoolKey memory key,) = s.conversionPool(Currency.wrap(address(s.BURN_TOKEN())));
-        if (address(key.poolManager) == address(0)) {
-            console.log("  [--]   buybackPool: set the conversion tier first, it derives this key");
-            outstanding++;
+        outstanding++;
+        uint256 sproutLaunchId = readUint("launchpad.sproutLaunchId");
+        (PoolKey memory key, address locker) = s.launchPool(sproutLaunchId);
+        if (locker == address(0)) {
+            console.log("  [--]   buybackPool: install the lockers first, they answer this key");
             return;
         }
         (uint160 existing,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
         if (existing == 0) {
-            outstanding++;
             console.log("  [TODO] SPROUT's graduation pool does not exist yet - it has not graduated");
             return;
         }
-        outstanding++;
         console.log("  [TODO] the buyback pool is unset, so quote revenue parks");
+        console.log("           read off SPROUT's locked position, launch", sproutLaunchId);
         _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setBuybackPool, (key)));
     }
 

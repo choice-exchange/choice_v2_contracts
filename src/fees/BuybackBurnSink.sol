@@ -8,16 +8,16 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {IVault} from "infinity-core/src/interfaces/IVault.sol";
-import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {ILockCallback} from "infinity-core/src/interfaces/ILockCallback.sol";
-import {IPoolManager} from "infinity-core/src/interfaces/IPoolManager.sol";
 import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 import {FullMath} from "infinity-core/src/pool-cl/libraries/FullMath.sol";
+import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
 import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
+import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
 /// @title BuybackBurnSink
 /// @notice Burn sink C: turn protocol revenue into the launchpad token and destroy it.
@@ -81,7 +81,9 @@ import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 /// the same `maxImpactBps`. The proceeds fall straight into `_tryBuyback`, so one call converts,
 /// buys and burns. Every gate on the way parks exactly as before.
 ///
-/// **The sink DERIVES that pool rather than being told about it** - see `conversionTier`.
+/// **The sink ASKS FOR that pool rather than reconstructing one** (plan A5). A caller passes the
+/// launch id alongside the currency, and the sink reads the graduate's own locked position out of
+/// `PositionLocker` and takes the `PoolKey` the position manager holds for it. See `lockers`.
 ///
 /// ## D32 - the hold allowlist
 ///
@@ -96,11 +98,17 @@ import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 ///
 /// ## What the owner can and cannot do
 ///
-/// Thin, in the shape of `PositionLocker`'s: the pool to trade through, the tier launches
-/// graduate onto, the thresholds, the treasury, and which launch tokens are held rather than
-/// converted. The owner **cannot** lower `burnBps` past the floor, and **cannot** sweep the quote
-/// asset or the burn token, which is what stops "recover a stuck token" from becoming a way to
-/// take pending burn revenue.
+/// Thin, in the shape of `PositionLocker`'s: the pool to trade through, which position lockers
+/// a conversion may read a graduate's pool out of, the thresholds, the treasury, and which launch
+/// tokens are held rather than converted. The owner **cannot** lower `burnBps` past the floor, and
+/// **cannot** sweep the quote asset or the burn token, which is what stops "recover a stuck token"
+/// from becoming a way to take pending burn revenue.
+///
+/// 🔑 A5 made that list SHORTER by one entry that mattered. `setConversionTier` used to let the
+/// owner name a `(poolManager, hooks, fee, parameters)` triple, and a hook the owner controls is a
+/// pool the owner prices - so the tier was the widest lever here even with its zero-hook check.
+/// The locker set that replaces it is narrower: a locker can only answer with a pool a SETTLER
+/// registered a position into, and the currency check does the rest.
 ///
 /// 🔴 That sweep guard now covers LAUNCH TOKENS too, because they became burn revenue the moment
 /// they became convertible. `sweep` refuses any currency that is not on the hold allowlist, so
@@ -120,6 +128,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// swap through is a misconfiguration, not a policy, so it is refused where it is set.
     uint16 public constant MIN_IMPACT_BPS = 2;
 
+    /// @notice Ceiling on how many position lockers `setLockers` will hold.
+    /// @dev `_verifiedPool` walks them inside `convert`, so the list is a gas cost on the hot
+    /// path and an unbounded one would be a way for the owner to make conversions unaffordable.
+    /// Two is the most any deployment has ever needed - one live locker and one superseded one
+    /// still holding older launches.
+    uint256 public constant MAX_LOCKERS = 8;
+
     /// @notice The token bought and burnt. Immutable: a sink that could be repointed at another
     /// token is a sink whose burn is a promise again.
     IBurnableERC20 public immutable BURN_TOKEN;
@@ -131,6 +146,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice The vault holding the buyback pool. One deployment, so it is immutable and the
     /// lock callback needs no allowlist.
     IVault public immutable VAULT;
+
+    /// @notice The position manager every locked graduate position lives in, and the contract
+    /// this sink asks for a launch's real `PoolKey`.
+    /// @dev Immutable, and `setLockers` refuses a locker built against a different one - so the
+    /// chain from a launch id to a pool key is fixed at construction and the owner cannot bend
+    /// it by installing a locker that points somewhere else.
+    ICLPositionManager public immutable POSITION_MANAGER;
 
     /// @notice Floor under `burnBps`, fixed at construction. THE differentiator; see the notice.
     uint16 public immutable MIN_BURN_BPS;
@@ -177,51 +199,48 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice When the last buyback ran.
     uint64 public lastBuybackAt;
 
-    /// @notice The fee tier, hook and parameters every graduation pool is keyed to - everything
-    /// a launch's own pool key contains EXCEPT its two currencies.
+    /// @notice The `PositionLocker`s a conversion may read a graduate's pool key out of.
     ///
-    /// @dev This is how the sink knows where to convert a launch token, and it is deliberately
-    /// not a per-launch registration. Three options were on the table:
+    /// @dev **This is how the sink learns where to sell a launch token, and it asks rather than
+    /// reconstructs.** `PositionLocker` holds every graduate's seed position, registered by the
+    /// settler at graduation; `ICLPositionManager.getPoolAndPositionInfo(tokenId)` hands back the
+    /// `PoolKey` that position is actually in. That key was fixed at that launch's graduation and
+    /// no later configuration change can move it.
     ///
-    /// ⛔ **The timelock registers each launch's pool.** Graduation is permissionless and
-    /// continuous, so this is a governance transaction per graduate - and every launch nobody
-    /// got around to registering parks for ever, which is the exact defect this leg exists to
-    /// close. `ChoiceFeeController.zeroLaunchPoolProtocolFee` rejected the same shape for the
-    /// same reason.
+    /// ⛔ **What this replaces, and why.** A4 shipped `conversionTier`: a timelock-set
+    /// `(poolManager, hooks, fee, parameters)` triple that the sink combined with the two
+    /// currencies to DERIVE a key. It covered every launch in one setting, which is why it beat
+    /// both a per-launch registration and a push from `settle` - but it was a copy of mutable
+    /// settler config, and it had a failure mode that showed up the same day it shipped: a launch
+    /// that graduated under an EARLIER tier stops being derivable, silently, and its revenue
+    /// parks until somebody points the tier back. Testnet had exactly that - launch 14's pool is
+    /// 6722 and the installed tier was 10000 - and on the same day four other copies of "which
+    /// settler is current" were all found stale at once. A copy of that fact drifts; asking the
+    /// chain for it cannot.
     ///
-    /// ⛔ **`InfinitySettler` pushes the key at graduation.** It knows the key, so this reads
-    /// as the obvious answer, and it is worse than it looks. It registers nothing for the
-    /// launches that ALREADY graduated - the long tail this leg is about - and it puts another
-    /// cross-contract call inside `settle`, the one transaction in this system that must not
-    /// fail. On 2026-09-06 exactly that shape (settler -> locker, one changed selector) reverted
-    /// with EMPTY returndata after passing every gate and wedged a graduation. Wrapping the push
-    /// in `try/catch` to protect graduation only trades a loud failure for a silent one: the
-    /// registration quietly does not happen and the revenue parks with nothing to look at.
+    /// 🔑 **The caller passes the launch id and it needs no trust.** `convert` verifies that the
+    /// key it gets back trades exactly `{currency, QUOTE}` and refuses it otherwise, so a wrong
+    /// or hostile id cannot route a swap anywhere: at worst it names a launch whose pool holds
+    /// different currencies, and that is a named revert rather than a trade. The hint is a
+    /// LOOKUP KEY, not a permission.
     ///
-    /// ✅ **The sink derives the key.** A graduation pool's key is its two currencies plus this
-    /// triple, and the launch token is the currency `burn` was just handed - so one timelock
-    /// call covers every launch, past and future, and `settle` is untouched.
+    /// 🔴 **The locker set is the one thing the owner can aim, so it is the trust anchor.** A
+    /// locker answers only with pools a settler registered a position into, which is strictly
+    /// narrower than the tier it replaces - that one let the owner name any hook, and a hook the
+    /// owner controls is a pool the owner prices. `setLockers` still has to be treated as the
+    /// sensitive call it is.
     ///
-    /// 🔑 The derived pool is provably a graduate, for the same reason the fee controller's
-    /// permissionless zeroing is safe: `hooks` is part of a pool's identity and
-    /// `LaunchPoolGuardHook` permissions `beforeInitialize` to the settler alone, so a pool that
-    /// exists at this key is a pool the settler created. `setConversionTier` therefore refuses a
-    /// zero hook - a hookless tier is one anybody can open, and derivation would then follow a
-    /// pool an attacker priced.
-    ///
-    /// ⚠️ A launch that graduated under a DIFFERENT tier is not derivable while this one is
-    /// installed. Point the tier back at the old triple, convert the stragglers, and point it
-    /// forward again; or `setHold` them and sweep. There is deliberately no per-token override:
-    /// one would let the owner aim a conversion at a pool of their own choosing, which is the
-    /// value-extraction path the sweep guard below exists to close.
-    struct ConversionTier {
-        IPoolManager poolManager;
-        IHooks hooks;
-        uint24 fee;
-        bytes32 parameters;
-    }
+    /// ⚠️ **A set, not one address, because testnet has two locker generations and mainnet will
+    /// eventually have two as well.** Locker 1.0.0 holds launches 13-17 and 1.1.0 holds
+    /// everything from 19 on; both answer `getPosition` and `POSITION_MANAGER` identically, so
+    /// one sink serves both. Replacing a locker is then `setLockers` rather than a sink redeploy,
+    /// and the list only ever grows - adding one can never invalidate a launch already served by
+    /// another. A stale list fails LOUDLY (`LaunchDoesNotTrade` on a permissionless call) where a
+    /// stale tier parked silently, which is the whole difference.
+    address[] internal _lockers;
 
-    ConversionTier public conversionTier;
+    /// @notice Whether an address is one of `lockers()`. Set membership, for callers and tests.
+    mapping(address locker => bool allowed) public isLocker;
 
     /// @notice D32. A launch token designated to accumulate here instead of being converted.
     /// @dev Also the gate on `sweep`: what is not held is burn revenue and cannot be taken out.
@@ -256,7 +275,10 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     error CannotSweepBuybackLeg(Currency currency);
     error NotAConvertibleCurrency(Currency currency);
     error SweepRequiresHold(Currency currency);
-    error InvalidTier(uint24 fee);
+    error LaunchDoesNotTrade(uint256 launchId, Currency currency);
+    error TooManyLockers(uint256 given, uint256 max);
+    error DuplicateLocker(address locker);
+    error LockerHasAnotherPositionManager(address locker);
 
     /// @param quoteSpent quote actually consumed; may be less than offered if the limit bound.
     event BoughtBack(uint256 quoteOffered, uint256 quoteSpent, uint256 tokensReceived);
@@ -266,13 +288,15 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     event Converted(Currency indexed currency, uint256 offered, uint256 spent, uint256 quoteReceived);
     /// @param reason 0 = below the minimum, 1 = inside `minBuybackInterval`, 2 = currency has no
     /// route, 3 = the swap itself reverted, 4 = the burn/treasury settle reverted, 5 = held by
-    /// policy (D32). Funds stay here in every case.
+    /// policy (D32), 6 = a launch token reached `burn`, which carries no launch id to look its
+    /// pool up by - `convert(currency, launchId)` is what moves it. Funds stay here in every
+    /// case.
     event Parked(Currency indexed currency, uint256 amount, uint8 reason);
     event BurnBpsUpdated(uint16 oldBps, uint16 newBps);
     event TreasuryUpdated(address oldTreasury, address newTreasury);
     event BuybackPoolUpdated(PoolKey key, bool quoteIsCurrency0);
     event GuardsUpdated(uint256 minBuybackAmount, uint16 maxImpactBps, uint32 minBuybackInterval);
-    event ConversionTierUpdated(IPoolManager poolManager, IHooks hooks, uint24 fee, bytes32 parameters);
+    event LockersUpdated(address[] lockers);
     event HoldUpdated(Currency indexed currency, bool held);
     event MinConvertAmountUpdated(Currency indexed currency, uint256 amount);
     event TokenSwept(Currency indexed currency, address indexed to, uint256 amount);
@@ -283,11 +307,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     uint8 private constant PARK_SWAP_FAILED = 3;
     uint8 private constant PARK_SETTLE_FAILED = 4;
     uint8 private constant PARK_HELD = 5;
+    uint8 private constant PARK_NEEDS_HINT = 6;
 
     constructor(
         IBurnableERC20 _burnToken,
         Currency _quote,
         IVault _vault,
+        ICLPositionManager _positionManager,
         address _treasury,
         address _owner,
         uint16 _minBurnBps,
@@ -295,7 +321,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     ) Ownable(_owner) {
         if (
             address(_burnToken) == address(0) || Currency.unwrap(_quote) == address(0) || address(_vault) == address(0)
-                || _treasury == address(0) || _owner == address(0)
+                || address(_positionManager) == address(0) || _treasury == address(0) || _owner == address(0)
         ) {
             revert ZeroAddress();
         }
@@ -306,6 +332,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         BURN_TOKEN = _burnToken;
         QUOTE = _quote;
         VAULT = _vault;
+        POSITION_MANAGER = _positionManager;
         MIN_BURN_BPS = _minBurnBps;
         burnBps = _burnBps;
         treasury = _treasury;
@@ -328,12 +355,28 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             _settleBurnToken();
         } else if (currency == QUOTE) {
             _tryBuyback();
+        } else if (isHeld[currency]) {
+            // D32 first, so a held token reports the POLICY rather than the condition below it.
+            emit Parked(currency, currency.balanceOfSelf(), PARK_HELD);
         } else {
-            // A launch token. Converted to `QUOTE` against its own graduation pool and then
-            // bought back in the same call - or parked, if any gate says so. It is NEVER
+            // A launch token. It PARKS here, and that is a deliberate consequence of A5.
+            //
+            // `IBurnSink.burn` takes a currency and an amount, and a currency does not say which
+            // launch it came from - so this frame cannot look the launch's pool up. A4's answer
+            // was to DERIVE a key from a stored tier, which worked until a launch graduated on a
+            // different tier; the tier is gone and `convert(currency, launchId)` replaces it.
+            //
+            // 🔑 Nothing is lost operationally, because under D30 this arm was already the wrong
+            // door. No `ChoiceFeeController` points at this sink, so nothing calls `burn`
+            // automatically at all; a graduate's launch-token revenue arrives as a bare transfer
+            // from `PositionLocker.claim`, which never calls anything. `LaunchFeeCranker` is what
+            // turns that into a burn, and it passes the launch id.
+            //
+            // The park is reported with its own reason so a dashboard can tell "somebody has to
+            // pass a launch id" apart from "this currency has no pool anywhere". And it is NEVER
             // forwarded to the treasury: the ops wallet taking 100% of a currency the burn was
             // entitled to `burnBps` of would be a silent policy change.
-            _tryConvert(currency);
+            emit Parked(currency, currency.balanceOfSelf(), PARK_NEEDS_HINT);
         }
     }
 
@@ -344,22 +387,42 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     }
 
     /// @notice Convert a parked launch token to `QUOTE` now, and buy back with the proceeds.
-    /// @dev The counterpart to `buyback()` for the normalise leg: revenue that reached this
-    /// contract WITHOUT a `burn` call - `PositionLocker.claim` pays the launchpad's LP-fee share
-    /// straight here, it does not notify - would otherwise sit until the next harvest of that
-    /// same currency, which for a launch token may never come.
+    /// @param currency The launch token to sell. Neither leg of the buyback is accepted.
+    /// @param launchId The launch it came from, used to look up that launch's own graduation
+    /// pool. A HINT: it is verified, not trusted - see below.
     ///
-    /// Permissionless, like everything else that only chooses WHEN: the pool is derived, the
-    /// bound is `maxImpactBps`, and the proceeds can only become `QUOTE` in this contract.
+    /// @dev The counterpart to `buyback()` for the normalise leg, and the ONLY way a launch token
+    /// moves. Revenue reaches this contract WITHOUT a `burn` call - `PositionLocker.claim` pays
+    /// the launchpad's LP-fee share straight here and notifies nobody - so something has to come
+    /// and ask. `LaunchFeeCranker` is that something; a keeper or a human calling this directly
+    /// is the same thing by hand.
     ///
-    /// Unlike `burn`, this one is allowed to revert - it is not on the harvest path, and a named
-    /// error on the two currencies that have their own leg says what is wrong while somebody is
-    /// looking at it.
-    function convert(Currency currency) external nonReentrant {
+    /// Permissionless, like everything else in this contract that only chooses WHEN: the pool
+    /// comes off the chain, the bound is `maxImpactBps`, and the proceeds can only become `QUOTE`
+    /// in this contract and then SPROUT that is burnt.
+    ///
+    /// 🔑 **Why the launch id needs no trust.** It selects a locked position; the position selects
+    /// a `PoolKey`; and that key is then REQUIRED to trade exactly `{currency, QUOTE}`. A caller
+    /// who names the wrong launch names a pool holding other currencies and gets
+    /// `LaunchDoesNotTrade` - there is no id that routes this swap through a pool of the caller's
+    /// choosing, because the caller does not choose the pool, the settler did at graduation.
+    ///
+    /// ⚠️ A launch that graduated against a quote asset OTHER than `QUOTE` is refused here rather
+    /// than parked: its pool trades `{launchToken, thatAsset}` and this sink has no second leg to
+    /// get from `thatAsset` to `QUOTE`. That is D28's open edge, not a regression - the derived
+    /// tier could not reach those launches either, it just failed quietly instead.
+    ///
+    /// Unlike `burn`, this one is allowed to revert. It is not on the harvest path, and a named
+    /// error says what is wrong while somebody is looking at it.
+    function convert(Currency currency, uint256 launchId) external nonReentrant {
         if (Currency.unwrap(currency) == address(BURN_TOKEN) || currency == QUOTE) {
             revert NotAConvertibleCurrency(currency);
         }
-        _tryConvert(currency);
+        // Argument validation before state: a caller with a bad hint is told so even when the
+        // tranche would have parked for an unrelated reason.
+        (PoolKey memory key, bool zeroForOne, bool found) = _verifiedPool(currency, launchId);
+        if (!found) revert LaunchDoesNotTrade(launchId, currency);
+        _tryConvert(currency, key, zeroForOne);
     }
 
     // -------------------------------------------------------------------------------------
@@ -430,18 +493,20 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
     /// @dev Sell a launch token for `QUOTE` against its own graduation pool, then buy back.
     ///
-    /// Every branch below parks, for the same reason the buyback's do: `ChoiceFeeController`
-    /// calls `burn` from inside `harvest`, and a launch token whose conversion could revert would
-    /// be a trivially weaponisable way to brick harvesting for that currency.
+    /// Every branch below parks rather than reverting, and that survives A5 even though the only
+    /// caller is now allowed to revert: `convert` raises its named errors BEFORE this frame, on
+    /// the arguments, and everything from here on is a condition rather than a mistake. A held
+    /// token, a tranche under its minimum and a swap the pool refuses are all states a later call
+    /// picks up, so none of them should cost the caller their transaction.
     ///
-    /// 🔑 The pool this trades through is DERIVED, not registered - see `conversionTier` for why,
-    /// and for what happens to a launch that graduated under a different tier.
+    /// 🔑 The key is the launch's REAL one, read off its locked position - see `_lockers`. It is
+    /// passed in rather than looked up here so that `convert` can verify it first.
     ///
     /// 🔑 Infinity skips a pool's hooks when the hook itself is the caller, so a conversion
     /// through a pool with a fee hook on it would not be taxed by that hook - the sink is not the
     /// hook here, but the graduation pool's guard hook registers `beforeInitialize` and nothing
     /// else, so there is no swap-time hook on this path at all.
-    function _tryConvert(Currency currency) private {
+    function _tryConvert(Currency currency, PoolKey memory key, bool zeroForOne) private {
         uint256 amountIn = currency.balanceOfSelf();
 
         // D32 first, so a held token reports the POLICY rather than whichever guard it happens
@@ -464,18 +529,12 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             return;
         }
 
-        (PoolKey memory key, bool zeroForOne) = _conversionKey(currency);
-        // A tier that was never configured. Everything else about the pool - whether it exists,
-        // whether it holds liquidity, whether the manager is paused - is left to the `try/catch`
-        // below, deliberately: `getSlot0` on an address with no code answers with empty
-        // returndata, so a pre-flight existence check is itself a way to revert a harvest.
-        if (address(key.poolManager) == address(0)) {
-            emit Parked(currency, amountIn, PARK_NO_ROUTE);
-            return;
-        }
-
         uint256 quoteBefore = QUOTE.balanceOfSelf();
 
+        // Everything about the pool that is not its identity - whether it holds liquidity,
+        // whether the manager is paused, whether the price bound is crossable - is left to this
+        // `try/catch` deliberately. `getSlot0` on an address with no code answers with empty
+        // returndata, so a pre-flight existence check is itself a way to revert.
         bool swapped;
         _setLockOpen(true);
         try VAULT.lock(abi.encode(key, zeroForOne, amountIn)) returns (bytes memory) {
@@ -505,24 +564,38 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         _tryBuyback();
     }
 
-    /// @dev The pool key a launch token converts through: its two currencies, sorted, plus the
-    /// tier every graduation pool is keyed to.
-    /// @return key Zero `poolManager` when no tier is configured - the caller parks on that.
-    /// @return zeroForOne True when `currency` is the pool's `currency0`, i.e. selling 0 -> 1.
-    function _conversionKey(Currency currency) private view returns (PoolKey memory key, bool zeroForOne) {
-        ConversionTier memory tier = conversionTier;
-        if (address(tier.poolManager) == address(0)) return (key, false);
+    /// @dev The launch's own graduation pool, read off its locked position and then CHECKED.
+    ///
+    /// Two lookups and one assertion:
+    ///
+    /// 1. each locker in turn, until one has a position registered for `launchId`;
+    /// 2. the position manager, for the `PoolKey` that position is in - authoritative, because it
+    ///    is where the position actually sits and it was fixed at graduation;
+    /// 3. the key must trade exactly `{currency, QUOTE}`.
+    ///
+    /// Step 3 is what makes step 1's argument safe to accept from anybody. Without it a caller
+    /// could name a launch whose pool they had priced; with it, the only launch ids that route
+    /// are the ones whose pool holds the very currency being sold and the very currency this
+    /// sink buys back with.
+    ///
+    /// @return key The launch's real pool key; zero when nothing matched.
+    /// @return zeroForOne True when `currency` is that pool's `currency0`, i.e. selling 0 -> 1.
+    /// @return found False when no locker knows the launch, or when the pool it names does not
+    /// trade this pair. The caller decides whether that is a revert or a park.
+    function _verifiedPool(Currency currency, uint256 launchId)
+        private
+        view
+        returns (PoolKey memory key, bool zeroForOne, bool found)
+    {
+        address[] memory set = _lockers;
+        for (uint256 i; i < set.length; ++i) {
+            uint256 tokenId = ILaunchPositionLocker(set[i]).getPosition(launchId).tokenId;
+            if (tokenId == 0) continue;
 
-        zeroForOne = Currency.unwrap(currency) < Currency.unwrap(QUOTE);
-        (Currency currency0, Currency currency1) = zeroForOne ? (currency, QUOTE) : (QUOTE, currency);
-        key = PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            hooks: tier.hooks,
-            poolManager: tier.poolManager,
-            fee: tier.fee,
-            parameters: tier.parameters
-        });
+            (PoolKey memory held,) = POSITION_MANAGER.getPoolAndPositionInfo(tokenId);
+            if (held.currency0 == currency && held.currency1 == QUOTE) return (held, true, true);
+            if (held.currency1 == currency && held.currency0 == QUOTE) return (held, false, true);
+        }
     }
 
     // -------------------------------------------------------------------------------------
@@ -538,7 +611,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         if (!_lockOpen()) revert LockNotOpen();
 
         // The KEY travels with the call, because there are two legs now: the buyback trades
-        // `buybackPool` and a conversion trades a key derived from `conversionTier`. Everything
+        // `buybackPool` and a conversion trades the launch's own key. Everything
         // downstream is identical, so they share one callback rather than one each.
         (PoolKey memory key, bool zeroForOne, uint256 amountIn) = abi.decode(data, (PoolKey, bool, uint256));
         // Read inside the lock rather than passed in, so a `getSlot0` that reverts - an
@@ -690,25 +763,57 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             && address(buybackPool.poolManager) != address(0);
     }
 
-    /// @notice Whether a `convert(currency)` right now would actually trade.
-    /// @dev For keepers and dashboards. It answers false for a held currency, which is the
-    /// point: holding is meant to be visible from outside, not inferred from nothing happening.
-    function canConvert(Currency currency) external view returns (bool) {
+    /// @notice Whether a `convert(currency, launchId)` right now would actually trade.
+    /// @dev For keepers and dashboards deciding whether a call is worth its gas. It answers false
+    /// for a held currency, which is the point: holding is meant to be visible from outside, not
+    /// inferred from nothing happening. It also answers false for a hint that would revert, so a
+    /// caller can tell a bad launch id from an empty balance without spending a transaction.
+    function canConvert(Currency currency, uint256 launchId) external view returns (bool) {
         if (Currency.unwrap(currency) == address(BURN_TOKEN) || currency == QUOTE) return false;
         if (isHeld[currency]) return false;
+        (,, bool found) = _verifiedPool(currency, launchId);
+        if (!found) return false;
         uint256 amountIn = currency.balanceOfSelf();
         uint64 last = lastConvertAt[currency];
-        (PoolKey memory key,) = _conversionKey(currency);
         return amountIn > 0 && amountIn >= minConvertAmount[currency]
-            && (last == 0 || block.timestamp >= uint256(last) + minBuybackInterval)
-            && address(key.poolManager) != address(0);
+            && (last == 0 || block.timestamp >= uint256(last) + minBuybackInterval);
     }
 
     /// @notice The pool a launch token would convert through, and the direction it would sell.
-    /// @dev Public so a deploy or a dashboard can check the derivation against the settler's own
-    /// `poolParameters()` rather than trusting that the tier was entered correctly.
-    function conversionPool(Currency currency) external view returns (PoolKey memory key, bool zeroForOne) {
-        return _conversionKey(currency);
+    /// @dev The same lookup `convert` makes, exposed so a deploy or a dashboard can see the key
+    /// rather than infer it from a swap that did or did not happen. A zero `poolManager` means
+    /// the hint does not resolve - either no locker knows the launch, or its pool does not trade
+    /// this currency against `QUOTE`.
+    function conversionPool(Currency currency, uint256 launchId)
+        external
+        view
+        returns (PoolKey memory key, bool zeroForOne)
+    {
+        bool found;
+        (key, zeroForOne, found) = _verifiedPool(currency, launchId);
+        if (!found) return (key, false);
+    }
+
+    /// @notice A launch's real graduation pool key, whatever currencies it holds.
+    /// @dev Unfiltered, unlike `conversionPool`: this one answers for a launch paired against
+    /// something other than `QUOTE`, and for the burn token's own launch. That last case is the
+    /// point - `setBuybackPool` needs SPROUT's own graduation key, and reading it off SPROUT's
+    /// locked position is how a deploy script gets it without a human retyping a tier.
+    /// @return key Zero when no locker in the set knows this launch.
+    /// @return locker Which locker answered, or the zero address.
+    function launchPool(uint256 launchId) external view returns (PoolKey memory key, address locker) {
+        address[] memory set = _lockers;
+        for (uint256 i; i < set.length; ++i) {
+            uint256 tokenId = ILaunchPositionLocker(set[i]).getPosition(launchId).tokenId;
+            if (tokenId == 0) continue;
+            (key,) = POSITION_MANAGER.getPoolAndPositionInfo(tokenId);
+            return (key, set[i]);
+        }
+    }
+
+    /// @notice The position lockers a conversion may read a graduate's pool out of.
+    function lockers() external view returns (address[] memory) {
+        return _lockers;
     }
 
     // -------------------------------------------------------------------------------------
@@ -775,26 +880,49 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         emit GuardsUpdated(newMinBuybackAmount, newMaxImpactBps, newMinBuybackInterval);
     }
 
-    /// @notice Point the normalise leg at the tier launches graduate onto.
-    /// @dev Everything a graduation pool key holds except its currencies, which come from the
-    /// launch token being converted. Ask the settler for them: `lpFee()`, `poolParameters()` and
-    /// `hooks()` are exactly these three fields, and `conversionPool` lets a deploy check the
-    /// derived key against a pool that already exists.
+    /// @notice Set the position lockers a conversion may read a graduate's pool key out of.
     ///
-    /// 🔴 A zero hook is refused, and that check is load-bearing rather than hygiene. The whole
-    /// reason a derived key can be trusted is that `LaunchPoolGuardHook` permissions
-    /// `beforeInitialize` to the settler, so a pool at the derived key must be one the settler
-    /// created. A hookless tier is one anybody can open at a price of their choosing, and the
-    /// conversion would walk straight into it.
-    function setConversionTier(IPoolManager poolManager, IHooks hooks, uint24 fee, bytes32 parameters)
-        external
-        onlyOwner
-    {
-        if (address(poolManager) == address(0) || address(hooks) == address(0)) revert ZeroAddress();
-        // Upstream's own bound: an LP fee above 100% is unrepresentable.
-        if (fee > 1_000_000) revert InvalidTier(fee);
-        conversionTier = ConversionTier({poolManager: poolManager, hooks: hooks, fee: fee, parameters: parameters});
-        emit ConversionTierUpdated(poolManager, hooks, fee, parameters);
+    /// @dev The whole list every time, rather than add/remove: the timelock states the complete
+    /// intended set, one event carries it, and there is no index arithmetic to get wrong. It is
+    /// idempotent and the natural shape for a governance call somebody has to read before
+    /// signing.
+    ///
+    /// 🔴 **This is the sensitive setter on this contract.** A locker is what turns a caller's
+    /// launch id into a pool, so a hostile one could hand back a pool it had priced - the
+    /// currency check in `_verifiedPool` bounds WHICH pair, not whose pool. That is not a new
+    /// power: `setConversionTier`, which this replaces, let the owner name any hook, and a hook
+    /// the owner controls is the same thing with more steps. It is narrower, and it should still
+    /// be read as governance rather than housekeeping.
+    ///
+    /// Three checks, each of which has a failure it is there for:
+    ///
+    /// - **`POSITION_MANAGER()` must match.** It proves the candidate speaks the locker ABI at
+    ///   all - a contract without that function reverts here rather than silently answering
+    ///   `getPosition` with garbage later - and it pins the second half of the lookup chain, so
+    ///   an installed locker cannot redirect the key read to a manager of its own.
+    /// - **No duplicates**, or one locker would be walked twice on every miss.
+    /// - **A bounded length**, because `_verifiedPool` walks the list inside `convert`. The cap
+    ///   is far above the two generations any deployment has ever had.
+    function setLockers(address[] calldata newLockers) external onlyOwner {
+        if (newLockers.length > MAX_LOCKERS) revert TooManyLockers(newLockers.length, MAX_LOCKERS);
+
+        address[] memory previous = _lockers;
+        for (uint256 i; i < previous.length; ++i) {
+            isLocker[previous[i]] = false;
+        }
+
+        for (uint256 i; i < newLockers.length; ++i) {
+            address locker = newLockers[i];
+            if (locker == address(0)) revert ZeroAddress();
+            if (isLocker[locker]) revert DuplicateLocker(locker);
+            if (ILaunchPositionLocker(locker).POSITION_MANAGER() != POSITION_MANAGER) {
+                revert LockerHasAnotherPositionManager(locker);
+            }
+            isLocker[locker] = true;
+        }
+
+        _lockers = newLockers;
+        emit LockersUpdated(newLockers);
     }
 
     /// @notice D32. Designate a launch token to accumulate here instead of being converted.

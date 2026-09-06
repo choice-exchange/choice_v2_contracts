@@ -45,17 +45,29 @@ LOCKER=0x0f0Df7bDa12Bea99A5A514b11f7cF6314C038bF5
 # CONSTRUCTED - `setInitializer` since then does not change them.
 SETTLER_10=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
-# The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is 1.1.0, the A4 sink deployed
-# 2026-09-06; the two it supersedes, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent —
-# nothing points at either and re-verifying a dead contract on every pass buys nothing.
+# The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is 1.2.0, the A5 sink deployed
+# 2026-09-06; 1.1.0 is kept below because it is still deployed and still timelock-owned, while
+# the two IT superseded, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent — nothing points
+# at either and re-verifying a dead contract on every pass buys nothing.
 #
-# 🔴 Its constructor `_owner` is the TIMELOCK, unlike 1.0.0's, which took the deploy EOA and was
-# handed over afterwards. 1.1.0 is a CREATE3 deploy from script 09 and is born timelock-owned, so
+# 🔴 Its constructor `_owner` is the TIMELOCK, unlike sink 1.0.0's, which took the deploy EOA and
+# was handed over afterwards. Both are CREATE3 deploys from script 09 and born timelock-owned, so
 # there is no handover and no EOA in its arguments. Verification hashes the args as CONSTRUCTED,
 # so carrying 1.0.0's $DEPLOYER forward would fail with a bytecode mismatch that reads like a
 # compiler-settings problem.
 SPROUT=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
-BBSINK=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
+# 🔴 The LIVE sink is 1.2.0 (plan A5). 1.1.0 stays verified and in this list: it is still
+# deployed, still timelock-owned, and a superseded contract that reads as unverified is exactly
+# how a reader concludes the wrong one is current.
+BBSINK=0xd8aDFa9E13d9116914837A381392EE2EEf595d4B
+BBSINK_110=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
+CRANKER=0x4Ffcd7a35A041A4a776C38417cde2CAb80f9c15d
+# ⚠️ The 1.0.0 PUSH locker 0x9b28F31B… is NOT in the manifest and is deliberately left out even
+# though A5 made it load-bearing again (it holds launches 13-17 and is in the sink's locker set).
+# It is already verified on Blockscout, it was deployed before this manifest existed, and its
+# constructor `launchpadTreasury` was the twice-superseded sink 0xe0248Ebc rather than anything
+# the address book still names - so a row for it would have to hard-code an address nothing else
+# uses. Check it by hand if it ever reads as unverified.
 
 # address | fork-dir | src path:Name | constructor args (hex, may be empty)
 #
@@ -90,7 +102,13 @@ MANIFEST=(
 "$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER_10)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
 "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
-"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"
+# 🔴 The 1.2.0 constructor gained the CL position manager - the contract the sink asks for a
+# graduate's real pool key (plan A5). Seven arguments became eight, so 1.1.0's row below cannot
+# be reused for it; a stale copy would fail with a bytecode mismatch reading like a compiler
+# settings problem.
+"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
+"$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"
+"$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK)"
 # 🔴 ONE argument: a static `RouterParameters` struct, so it encodes as 12 flat words with NO
 # offset head — which is why the whole thing is a single parenthesised tuple here rather than a
 # list of scalars. Confirmed byte-identical (all 384) against the bytes actually deployed:

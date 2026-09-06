@@ -18,10 +18,14 @@ import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {CLPoolManagerRouter} from "infinity-core/test/pool-cl/helpers/CLPoolManagerRouter.sol";
 import {PoolId} from "infinity-core/src/types/PoolId.sol";
 
+import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
+
 import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
 import {LaunchPoolGuardHook} from "../src/launchpad/LaunchPoolGuardHook.sol";
 import {IBurnableERC20} from "../src/interfaces/IBurnableERC20.sol";
 import {MockBurnableERC20} from "./mocks/MockBurnableERC20.sol";
+import {MockPositionLocker} from "./mocks/MockPositionLocker.sol";
+import {MockPositionManager} from "./mocks/MockPositionManager.sol";
 
 /// A real `Vault` + `CLPoolManager` with a real seeded pool. The sink's whole job is to swap
 /// and burn, so neither the swap nor the burn is mocked: the pool is the upstream one and the
@@ -40,6 +44,17 @@ contract BuybackBurnSinkTest is Test {
     uint16 internal constant FLOOR = 8000;
     uint32 internal constant INTERVAL = 30 minutes;
 
+    /// The launch each fixture token graduated as. Arbitrary numbers: the sink treats a launch
+    /// id as a lookup key and never as a permission, which is what most of these tests are about.
+    uint256 internal constant MEME_LAUNCH = 20;
+    uint256 internal constant MEME2_LAUNCH = 21;
+    /// A launch that graduated on an EARLIER fee tier - testnet's launch 14, in miniature. Under
+    /// A4's derived tier this one was unreachable while the current tier was installed, and its
+    /// revenue parked; it is the regression this file exists to keep closed.
+    uint256 internal constant STRAGGLER_LAUNCH = 14;
+    /// The tier that launch graduated on, which is NOT the one anything graduates on today.
+    uint24 internal constant OLD_FEE = 6722;
+
     Vault internal vault;
     CLPoolManager internal manager;
     CLPoolManagerRouter internal seeder;
@@ -54,13 +69,25 @@ contract BuybackBurnSinkTest is Test {
     /// A second one, to show that one launch token's rate-limit window is its own.
     MockERC20 internal meme2;
 
-    /// The real guard hook, because the derived conversion key is only trustworthy insofar as
-    /// only a settler can open a pool at it. `address(this)` stands in for the settler.
+    /// A launch token whose pool sits on the fee tier launches graduated on BEFORE A0 - the
+    /// straggler the derived tier could not reach.
+    MockERC20 internal straggler;
+
+    /// The real guard hook. It no longer gates the conversion (a locked position does), but it
+    /// is still what a graduation pool is keyed to, so the fixture pools carry it.
     LaunchPoolGuardHook internal guardHook;
+
+    /// Where the sink looks a launch's real pool key up. Stand-ins here; the end-to-end proof
+    /// against a real `PositionLocker` and a real `CLPositionManager` is in
+    /// `LaunchFeeCranker.t.sol`.
+    MockPositionManager internal posm;
+    MockPositionLocker internal locker;
 
     BuybackBurnSink internal sink;
     PoolKey internal pool;
     PoolKey internal memePool;
+    PoolKey internal meme2Pool;
+    PoolKey internal stragglerPool;
 
     function setUp() public {
         vault = new Vault();
@@ -73,17 +100,13 @@ contract BuybackBurnSinkTest is Test {
         stray = new MockERC20("Stray", "STRAY", 18);
         meme = new MockERC20("Launch", "LAUNCH", 18);
         meme2 = new MockERC20("Launch Two", "LAUNCH2", 18);
+        straggler = new MockERC20("Old Launch", "OLD", 18);
         guardHook = new LaunchPoolGuardHook(address(this), address(this));
 
-        sink = new BuybackBurnSink(
-            IBurnableERC20(address(sprout)),
-            Currency.wrap(address(quote)),
-            IVault(address(vault)),
-            TREASURY,
-            TIMELOCK,
-            FLOOR,
-            FLOOR
-        );
+        posm = new MockPositionManager();
+        locker = new MockPositionLocker(ICLPositionManager(address(posm)), address(0xDADD));
+
+        sink = _freshSink();
 
         pool = _key(quote, sprout, FEE);
         _seed(pool, 1_000_000 ether);
@@ -91,12 +114,25 @@ contract BuybackBurnSinkTest is Test {
         // The graduation pool of a launch that is not SPROUT: same 1% tier, same spacing, keyed
         // to the guard hook. Deliberately thinner than the buyback pool - a graduate's seed is
         // whatever its curve filled, not a market-made book.
-        memePool = _graduationKey(meme);
+        memePool = _graduationKey(meme, FEE);
         _seed(memePool, 100_000 ether);
+        meme2Pool = _graduationKey(meme2, FEE);
+        _seed(meme2Pool, 100_000 ether);
+
+        // And one on the tier launches graduated on BEFORE A0. Same hook, same spacing, one fee
+        // field different - which is all it took to make A4's derived key miss it.
+        stragglerPool = _graduationKey(straggler, OLD_FEE);
+        _seed(stragglerPool, 100_000 ether);
+
+        // The chain a launch id walks: locker says which position, position manager says which
+        // pool. Registered here rather than derived, which is the whole of A5.
+        _lock(MEME_LAUNCH, 1, memePool);
+        _lock(MEME2_LAUNCH, 2, meme2Pool);
+        _lock(STRAGGLER_LAUNCH, 3, stragglerPool);
 
         vm.startPrank(TIMELOCK);
         sink.setBuybackPool(pool);
-        sink.setConversionTier(IPoolManager(address(manager)), IHooks(address(guardHook)), FEE, _graduationParameters());
+        sink.setLockers(_one(address(locker)));
         // 1 wINJ minimum, 500 bps of sqrt-price headroom, one window per half hour. The rate
         // limit is not optional any more - `setGuards` refuses zero - so the fixture carries a
         // production-shaped value and tests that want a second buyback warp past it.
@@ -133,7 +169,7 @@ contract BuybackBurnSinkTest is Test {
         uint256 supplyBefore = sprout.totalSupply();
         meme.mint(address(sink), 100 ether);
 
-        sink.burn(Currency.wrap(address(meme)), 100 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
 
         uint256 burnt = supplyBefore - sprout.totalSupply();
         uint256 toTreasury = sprout.balanceOf(TREASURY);
@@ -146,30 +182,43 @@ contract BuybackBurnSinkTest is Test {
     }
 
     /// `burn` is what `ChoiceFeeController.harvest` calls after transferring. If it can revert,
-    /// a launch token with no pool bricks harvesting for that currency - so it must not. The
-    /// derivation cannot find a pool for this one, because none was ever opened.
-    function test_burnDoesNotRevertOnACurrencyWithNoPool() public {
-        stray.mint(address(sink), 5 ether);
+    /// a launch token bricks harvesting for that currency - so it must not, whether or not a pool
+    /// for it exists anywhere.
+    ///
+    /// 🔴 A5 changed what this arm DOES, and the change is deliberate. `burn` takes a currency and
+    /// an amount and has nowhere to carry a launch id, so it can no longer look a launch's pool
+    /// up; it parks with reason 6 - "somebody has to pass a launch id" - which a dashboard can
+    /// tell apart from a currency that has no pool at all. Under D30 no fee controller points at
+    /// this sink, so nothing calls `burn` automatically: launch-token revenue arrives as a bare
+    /// transfer from `PositionLocker.claim` and `LaunchFeeCranker` is what moves it on.
+    function test_burnParksALaunchTokenBecauseItCarriesNoLaunchId() public {
+        meme.mint(address(sink), 100 ether);
 
         vm.expectEmit(true, false, false, true, address(sink));
-        emit BuybackBurnSink.Parked(Currency.wrap(address(stray)), 5 ether, 3);
-        sink.burn(Currency.wrap(address(stray)), 5 ether);
+        emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 100 ether, 6);
+        sink.burn(Currency.wrap(address(meme)), 100 ether);
 
-        assertEq(stray.balanceOf(address(sink)), 5 ether, "unroutable funds should be held, not moved");
-        assertEq(stray.balanceOf(TREASURY), 0, "ops must not receive what the burn was entitled to");
+        assertEq(meme.balanceOf(address(sink)), 100 ether, "the tranche should be held, not moved");
+        assertEq(meme.balanceOf(TREASURY), 0, "ops must not receive what the burn was entitled to");
+
+        // And it is not stranded: the hinted call picks up exactly what `burn` parked.
+        uint256 supplyBefore = sprout.totalSupply();
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
+        assertEq(meme.balanceOf(address(sink)), 0, "the parked tranche was not picked up");
+        assertLt(sprout.totalSupply(), supplyBefore, "the parked tranche did not reach the burn");
     }
 
-    /// And a sink whose tier was never set has no route at all - it must park rather than
-    /// revert, or wiring it in the wrong order would brick harvests until somebody noticed.
-    function test_burnDoesNotRevertBeforeAConversionTierIsConfigured() public {
+    /// And a sink with no lockers installed yet cannot resolve any hint - it must park rather
+    /// than revert, or wiring it in the wrong order would brick harvests until somebody noticed.
+    function test_burnDoesNotRevertBeforeAnyLockerIsConfigured() public {
         BuybackBurnSink fresh = _freshSink();
         meme.mint(address(fresh), 100 ether);
 
         vm.expectEmit(true, false, false, true, address(fresh));
-        emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 100 ether, 2);
+        emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 100 ether, 6);
         fresh.burn(Currency.wrap(address(meme)), 100 ether);
 
-        assertEq(meme.balanceOf(address(fresh)), 100 ether, "funds should be held until a tier exists");
+        assertEq(meme.balanceOf(address(fresh)), 100 ether, "funds should be held until a locker exists");
     }
 
     /// An unconfigured sink must also park rather than revert, or wiring it in the wrong order
@@ -249,13 +298,107 @@ contract BuybackBurnSinkTest is Test {
     /// The sink is never TOLD a launch's pool: it derives the key from the tier every graduation
     /// is keyed to, which is what makes one timelock call cover every launch, past and future.
     /// The derivation is checked here against the pool that actually exists, by its id.
-    function test_theConversionPoolIsDerivedRatherThanRegistered() public view {
-        (PoolKey memory derived, bool zeroForOne) = sink.conversionPool(Currency.wrap(address(meme)));
+     /// A5. The sink no longer reconstructs a graduation key from a stored tier - it reads the
+    /// launch's LOCKED POSITION and takes the key that position is actually in. Checked here
+    /// against the pool that exists, by its id.
+    function test_theConversionPoolIsReadOffTheLockedPosition() public view {
+        (PoolKey memory found, bool zeroForOne) = sink.conversionPool(Currency.wrap(address(meme)), MEME_LAUNCH);
 
-        assertEq(
-            PoolId.unwrap(derived.toId()), PoolId.unwrap(memePool.toId()), "the derived key is not the graduated pool"
+        assertEq(PoolId.unwrap(found.toId()), PoolId.unwrap(memePool.toId()), "that is not the graduated pool");
+        assertEq(zeroForOne, address(meme) < address(quote), "the sell direction is wrong");
+    }
+
+    /// 🔴 **The regression A5 exists for.** A launch that graduated on an earlier fee tier used
+    /// to be unreachable: the sink derived a key on the CURRENT tier, no pool existed there, and
+    /// the tranche parked with nothing to look at until somebody pointed the tier back. On
+    /// testnet that was launch 14 - a 6722 pool while 10000 was installed - and its revenue sat.
+    ///
+    /// Nothing is installed here at all. The launch's own position names its own pool, whatever
+    /// tier it happens to be on, so the tranche converts.
+    function test_aLaunchThatGraduatedOnAnotherTierStillConverts() public {
+        assertTrue(stragglerPool.fee != memePool.fee, "the fixture is not testing two tiers");
+
+        uint256 supplyBefore = sprout.totalSupply();
+        straggler.mint(address(sink), 100 ether);
+
+        (PoolKey memory found,) = sink.conversionPool(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
+        assertEq(found.fee, OLD_FEE, "the sink did not follow the launch onto its own tier");
+
+        sink.convert(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
+
+        assertEq(straggler.balanceOf(address(sink)), 0, "the straggler did not convert");
+        assertLt(sprout.totalSupply(), supplyBefore, "the straggler's revenue never reached the burn");
+    }
+
+    /// 🔑 **Why a launch id can be taken from anybody.** It selects a pool; the pool is then
+    /// required to trade exactly the currency being sold against `QUOTE`. Naming somebody else's
+    /// launch names a pool that holds other currencies, so there is no id that routes this swap
+    /// somewhere the caller chose.
+    function test_aLaunchIdThatNamesAnotherLaunchesPoolIsRefused() public {
+        meme.mint(address(sink), 100 ether);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BuybackBurnSink.LaunchDoesNotTrade.selector, MEME2_LAUNCH, Currency.wrap(address(meme))
+            )
         );
-        assertEq(zeroForOne, address(meme) < address(quote), "the sell direction was derived wrongly");
+        sink.convert(Currency.wrap(address(meme)), MEME2_LAUNCH);
+
+        assertEq(meme.balanceOf(address(sink)), 100 ether, "a refused hint must not move anything");
+    }
+
+    /// And an id nobody has registered resolves to no position at all.
+    function test_anUnregisteredLaunchIdIsRefused() public {
+        meme.mint(address(sink), 100 ether);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(999), Currency.wrap(address(meme)))
+        );
+        sink.convert(Currency.wrap(address(meme)), 999);
+    }
+
+    /// 🔴 The locker set is the trust anchor, so a locker that is not in it answers nothing -
+    /// even when it holds a position for the launch and even when that position's pool would
+    /// have passed the currency check. This is the check that stops "point at any contract that
+    /// implements two views" from being a way to aim a conversion.
+    function test_aPositionInALockerOutsideTheSetIsIgnored() public {
+        MockPositionLocker rogue = new MockPositionLocker(ICLPositionManager(address(posm)), address(0xBAD));
+        rogue.register(777, 1); // tokenId 1 IS meme's real graduation pool
+
+        meme.mint(address(sink), 100 ether);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(777), Currency.wrap(address(meme)))
+        );
+        sink.convert(Currency.wrap(address(meme)), 777);
+
+        // Installed, the same call goes through - so what changed was the designation, not the
+        // position, and the designation is the timelock's.
+        address[] memory both = new address[](2);
+        both[0] = address(locker);
+        both[1] = address(rogue);
+        vm.prank(TIMELOCK);
+        sink.setLockers(both);
+
+        sink.convert(Currency.wrap(address(meme)), 777);
+        assertEq(meme.balanceOf(address(sink)), 0, "installing the locker did not open the route");
+    }
+
+    /// ⚠️ D28's open edge, stated as a test so nobody rediscovers it as a bug. A launch paired
+    /// against something that is not this sink's `QUOTE` has a pool the sink cannot use: it would
+    /// come out holding a third currency with no second leg to wINJ. It is REFUSED, loudly,
+    /// rather than routed or silently parked.
+    function test_aLaunchPairedAgainstAnotherQuoteAssetIsRefused() public {
+        MockERC20 otherQuote = new MockERC20("Sai", "SAI", 18);
+        MockERC20 token = new MockERC20("Other", "OTHER", 18);
+        PoolKey memory otherPool = _pairKey(token, otherQuote, FEE);
+        _seed(otherPool, 100_000 ether);
+        _lock(30, 9, otherPool);
+
+        token.mint(address(sink), 100 ether);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(30), Currency.wrap(address(token)))
+        );
+        sink.convert(Currency.wrap(address(token)), 30);
     }
 
     /// D32. Convert is the default so the burn rate holds; a designated token accumulates
@@ -269,15 +412,20 @@ contract BuybackBurnSinkTest is Test {
 
         vm.expectEmit(true, false, false, true, address(sink));
         emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 100 ether, 5);
-        sink.burn(Currency.wrap(address(meme)), 100 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
 
         assertEq(meme.balanceOf(address(sink)), 100 ether, "a held token should accumulate");
         assertEq(sprout.totalSupply(), supplyBefore, "a held token must not reach the burn");
 
+        // A held token reports the POLICY through `burn` too, rather than the missing hint.
+        vm.expectEmit(true, false, false, true, address(sink));
+        emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 100 ether, 5);
+        sink.burn(Currency.wrap(address(meme)), 100 ether);
+
         // And it is a policy, not a one-way door: lifting the designation converts it.
         vm.prank(TIMELOCK);
         sink.setHold(Currency.wrap(address(meme)), false);
-        sink.convert(Currency.wrap(address(meme)));
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertLt(sprout.totalSupply(), supplyBefore, "lifting the hold did not release the conversion");
     }
 
@@ -289,7 +437,7 @@ contract BuybackBurnSinkTest is Test {
         sink.setGuards(1 ether, 50, INTERVAL); // 50 bps of sqrt price: very tight
 
         meme.mint(address(sink), 500_000 ether);
-        sink.burn(Currency.wrap(address(meme)), 500_000 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
 
         uint256 leftover = meme.balanceOf(address(sink));
         assertGt(leftover, 0, "the bound did not bind - the whole tranche converted");
@@ -306,7 +454,7 @@ contract BuybackBurnSinkTest is Test {
 
         vm.expectEmit(true, false, false, true, address(sink));
         emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 100 ether, 3);
-        sink.burn(Currency.wrap(address(meme)), 100 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
 
         assertEq(meme.balanceOf(address(sink)), 100 ether, "the tranche should have parked here");
     }
@@ -316,7 +464,7 @@ contract BuybackBurnSinkTest is Test {
     function test_aFailedConversionSpendsNoWindowAndLeavesNoOpenLock() public {
         manager.pause();
         meme.mint(address(sink), 100 ether);
-        sink.burn(Currency.wrap(address(meme)), 100 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(sink.lastConvertAt(Currency.wrap(address(meme))), 0, "a failed conversion moved the clock");
 
         vm.prank(address(vault));
@@ -324,7 +472,7 @@ contract BuybackBurnSinkTest is Test {
         sink.lockAcquired(abi.encode(uint256(1)));
 
         manager.unpause();
-        sink.convert(Currency.wrap(address(meme)));
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertGt(sink.lastConvertAt(Currency.wrap(address(meme))), 0, "the retry was rate-limited by a failure");
         assertEq(meme.balanceOf(address(sink)), 0, "the parked tranche was not picked up");
     }
@@ -332,27 +480,24 @@ contract BuybackBurnSinkTest is Test {
     /// D20 again: a conversion is a price-sensitive trade a permissionless caller times, so it
     /// is rate-limited. Per currency, or one launch token would gate every other one.
     function test_aConversionsWindowIsItsOwnCurrencysAlone() public {
-        PoolKey memory meme2Pool = _graduationKey(meme2);
-        _seed(meme2Pool, 100_000 ether);
-
         meme.mint(address(sink), 10 ether);
-        sink.convert(Currency.wrap(address(meme)));
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(meme.balanceOf(address(sink)), 0, "the first conversion did not run");
 
         // Same currency, same window: parks.
         meme.mint(address(sink), 10 ether);
         vm.expectEmit(true, false, false, true, address(sink));
         emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 10 ether, 1);
-        sink.convert(Currency.wrap(address(meme)));
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(meme.balanceOf(address(sink)), 10 ether, "a second conversion in the window traded");
 
         // A different currency is untouched by it.
         meme2.mint(address(sink), 10 ether);
-        sink.convert(Currency.wrap(address(meme2)));
+        sink.convert(Currency.wrap(address(meme2)), MEME2_LAUNCH);
         assertEq(meme2.balanceOf(address(sink)), 0, "one launch token's window blocked another's");
 
         vm.warp(block.timestamp + INTERVAL);
-        sink.convert(Currency.wrap(address(meme)));
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(meme.balanceOf(address(sink)), 0, "the window reopened and it still did not convert");
     }
 
@@ -363,34 +508,39 @@ contract BuybackBurnSinkTest is Test {
         meme.mint(address(sink), 1 ether);
         vm.expectEmit(true, false, false, true, address(sink));
         emit BuybackBurnSink.Parked(Currency.wrap(address(meme)), 1 ether, 0);
-        sink.burn(Currency.wrap(address(meme)), 1 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(meme.balanceOf(address(sink)), 1 ether, "dust should accumulate");
 
         meme.mint(address(sink), 4 ether);
-        sink.burn(Currency.wrap(address(meme)), 4 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(meme.balanceOf(address(sink)), 0, "reaching the minimum did not release it");
     }
 
-    function test_canConvertTracksTheGuards() public {
+    function test_canConvertTracksTheGuardsAndTheHint() public {
         Currency memeCurrency = Currency.wrap(address(meme));
 
-        assertFalse(sink.canConvert(memeCurrency), "an empty sink should not claim it can convert");
+        assertFalse(sink.canConvert(memeCurrency, MEME_LAUNCH), "an empty sink should not claim it can convert");
         meme.mint(address(sink), 10 ether);
-        assertTrue(sink.canConvert(memeCurrency), "funded and unrestricted, it should be able to convert");
+        assertTrue(sink.canConvert(memeCurrency, MEME_LAUNCH), "funded and unrestricted, it should convert");
 
         vm.prank(TIMELOCK);
         sink.setHold(memeCurrency, true);
-        assertFalse(sink.canConvert(memeCurrency), "a held currency should report false");
+        assertFalse(sink.canConvert(memeCurrency, MEME_LAUNCH), "a held currency should report false");
         vm.prank(TIMELOCK);
         sink.setHold(memeCurrency, false);
 
-        sink.convert(memeCurrency);
+        sink.convert(memeCurrency, MEME_LAUNCH);
         meme.mint(address(sink), 10 ether);
-        assertFalse(sink.canConvert(memeCurrency), "inside the interval it should report false");
+        assertFalse(sink.canConvert(memeCurrency, MEME_LAUNCH), "inside the interval it should report false");
 
-        assertFalse(sink.canConvert(Currency.wrap(address(quote))), "the quote leg is not convertible");
-        assertFalse(sink.canConvert(Currency.wrap(address(sprout))), "the burn token is not convertible");
-        assertFalse(sink.canConvert(Currency.wrap(address(stray))), "a currency with no pool is not convertible");
+        // A hint that would REVERT reads false rather than throwing, so a keeper can tell a bad
+        // launch id from an empty balance without spending a transaction to find out.
+        assertFalse(sink.canConvert(memeCurrency, MEME2_LAUNCH), "a mismatched hint should report false");
+        assertFalse(sink.canConvert(memeCurrency, 999), "an unregistered launch should report false");
+
+        assertFalse(sink.canConvert(Currency.wrap(address(quote)), MEME_LAUNCH), "the quote leg is not convertible");
+        assertFalse(sink.canConvert(Currency.wrap(address(sprout)), MEME_LAUNCH), "the burn token is not convertible");
+        assertFalse(sink.canConvert(Currency.wrap(address(stray)), MEME_LAUNCH), "a currency with no pool is not");
     }
 
     /// `convert` is off the harvest path, so unlike `burn` it is allowed to say what is wrong.
@@ -398,25 +548,81 @@ contract BuybackBurnSinkTest is Test {
         vm.expectRevert(
             abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(quote)))
         );
-        sink.convert(Currency.wrap(address(quote)));
+        sink.convert(Currency.wrap(address(quote)), MEME_LAUNCH);
 
         vm.expectRevert(
             abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(sprout)))
         );
-        sink.convert(Currency.wrap(address(sprout)));
+        sink.convert(Currency.wrap(address(sprout)), MEME_LAUNCH);
     }
 
-    /// 🔴 The load-bearing check. A derived key is only trustworthy because a pool at it must
-    /// have been opened by the settler, and that is true only while the tier carries the guard
-    /// hook. A hookless tier is one anybody can open at a price of their choosing.
-    function test_aHooklessConversionTierIsRefused() public {
-        // Read outside the expectation: an argument that makes its own call would be the call
-        // the cheatcode watches.
-        bytes32 parameters = _graduationParameters();
+    /// 🔴 The load-bearing check on the one setter that can aim a conversion. A locker built
+    /// against a DIFFERENT position manager would resolve a launch id through a manager this
+    /// sink never agreed to read - so it is refused where the error names the cause, rather than
+    /// installed and then silently answering with somebody else's pools.
+    ///
+    /// It doubles as an ABI proof: a contract with no `POSITION_MANAGER()` cannot be installed at
+    /// all, which is the `_requireLockerSpeaksOurAbi` lesson from A3 in the place it applies here.
+    function test_setLockersRefusesALockerOnAnotherPositionManager() public {
+        MockPositionManager otherPosm = new MockPositionManager();
+        MockPositionLocker foreign = new MockPositionLocker(ICLPositionManager(address(otherPosm)), TREASURY);
 
         vm.prank(TIMELOCK);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnSink.LockerHasAnotherPositionManager.selector, address(foreign))
+        );
+        sink.setLockers(_one(address(foreign)));
+    }
+
+    /// A contract that is not a locker at all reverts inside the same check.
+    function test_setLockersRefusesSomethingThatIsNotALocker() public {
+        vm.prank(TIMELOCK);
+        vm.expectRevert();
+        sink.setLockers(_one(address(quote)));
+    }
+
+    function test_setLockersRefusesZeroDuplicatesAndOverLongLists() public {
+        vm.startPrank(TIMELOCK);
+
         vm.expectRevert(BuybackBurnSink.ZeroAddress.selector);
-        sink.setConversionTier(IPoolManager(address(manager)), IHooks(address(0)), FEE, parameters);
+        sink.setLockers(_one(address(0)));
+
+        address[] memory twice = new address[](2);
+        twice[0] = address(locker);
+        twice[1] = address(locker);
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.DuplicateLocker.selector, address(locker)));
+        sink.setLockers(twice);
+
+        uint256 cap = sink.MAX_LOCKERS();
+        address[] memory tooMany = new address[](cap + 1);
+        for (uint256 i; i < tooMany.length; ++i) {
+            tooMany[i] = address(new MockPositionLocker(ICLPositionManager(address(posm)), TREASURY));
+        }
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.TooManyLockers.selector, cap + 1, cap));
+        sink.setLockers(tooMany);
+
+        vm.stopPrank();
+    }
+
+    /// The whole list every time, so removing one is stating the set without it - and the
+    /// membership flag has to come back off, or a removed locker would still read as installed.
+    function test_setLockersReplacesTheWholeSet() public {
+        MockPositionLocker second = new MockPositionLocker(ICLPositionManager(address(posm)), TREASURY);
+
+        address[] memory both = new address[](2);
+        both[0] = address(locker);
+        both[1] = address(second);
+        vm.prank(TIMELOCK);
+        sink.setLockers(both);
+        assertTrue(sink.isLocker(address(locker)), "first locker is not installed");
+        assertTrue(sink.isLocker(address(second)), "second locker is not installed");
+        assertEq(sink.lockers().length, 2, "the set is the wrong size");
+
+        vm.prank(TIMELOCK);
+        sink.setLockers(_one(address(second)));
+        assertFalse(sink.isLocker(address(locker)), "a dropped locker still reads as installed");
+        assertTrue(sink.isLocker(address(second)), "the kept locker was dropped");
+        assertEq(sink.lockers().length, 1, "the set was not replaced");
     }
 
     /// Neither leg of the buyback can be held, or `sweep`'s exclusion would be negotiable.
@@ -434,26 +640,26 @@ contract BuybackBurnSinkTest is Test {
         vm.stopPrank();
     }
 
-    /// The contract's one invariant, restated over the leg A4 added: whatever the configuration
-    /// and whatever the pool is doing, `burn` RETURNS. Fuzzed over the state rather than over the
-    /// currency, because `ChoiceFeeController.harvest` can only ever hand this a currency it has
-    /// just transferred - a token, always, never an arbitrary address.
-    function testFuzz_burnNeverRevertsWhateverTheState(uint96 amount, bool held, bool paused, bool tierSet, uint8 leg)
-        public
-    {
-        // A launch token with a pool, a second one, and a currency that has no pool anywhere.
-        MockERC20 token = leg % 3 == 0 ? meme : (leg % 3 == 1 ? meme2 : stray);
+    /// The contract's one invariant, restated over the leg A4 added and A5 narrowed: whatever the
+    /// configuration and whatever the pool is doing, `burn` RETURNS. Fuzzed over the state rather
+    /// than over the currency, because `ChoiceFeeController.harvest` can only ever hand this a
+    /// currency it has just transferred - a token, always, never an arbitrary address.
+    function testFuzz_burnNeverRevertsWhateverTheState(
+        uint96 amount,
+        bool held,
+        bool paused,
+        bool lockersSet,
+        uint8 leg
+    ) public {
+        // A launch token with a pool, one on an older tier, and a currency with no pool anywhere.
+        MockERC20 token = leg % 3 == 0 ? meme : (leg % 3 == 1 ? straggler : stray);
         Currency currency = Currency.wrap(address(token));
 
         BuybackBurnSink target = _freshSink();
         vm.startPrank(TIMELOCK);
         target.setBuybackPool(pool);
         target.setGuards(1 ether, 500, INTERVAL);
-        if (tierSet) {
-            target.setConversionTier(
-                IPoolManager(address(manager)), IHooks(address(guardHook)), FEE, _graduationParameters()
-            );
-        }
+        if (lockersSet) target.setLockers(_one(address(locker)));
         if (held) target.setHold(currency, true);
         vm.stopPrank();
 
@@ -466,6 +672,31 @@ contract BuybackBurnSinkTest is Test {
         if (paused) manager.unpause();
         // And nothing walked off with it - whatever happened, the funds are here or they are
         // wINJ/SPROUT that this contract went on to burn and split.
+        assertEq(token.balanceOf(TREASURY), 0, "ops received a currency the burn was entitled to");
+    }
+
+    /// A5's counterpart. `convert` IS allowed to revert - on its arguments - so the invariant
+    /// worth fuzzing is the narrower one: given a hint that resolves, it never reverts either,
+    /// whatever the guards and the pool are doing. Anything else would make a keeper's batch
+    /// fail on a launch that simply has nothing to do.
+    function testFuzz_convertNeverRevertsOnAResolvableHint(uint96 amount, bool held, bool paused, bool straggle)
+        public
+    {
+        MockERC20 token = straggle ? straggler : meme;
+        uint256 launchId = straggle ? STRAGGLER_LAUNCH : MEME_LAUNCH;
+        Currency currency = Currency.wrap(address(token));
+
+        if (held) {
+            vm.prank(TIMELOCK);
+            sink.setHold(currency, true);
+        }
+        token.mint(address(sink), amount);
+        if (paused) manager.pause();
+
+        // No `expectRevert`, no `try`: the assertion is that this line returns at all.
+        sink.convert(currency, launchId);
+
+        if (paused) manager.unpause();
         assertEq(token.balanceOf(TREASURY), 0, "ops received a currency the burn was entitled to");
     }
 
@@ -663,6 +894,7 @@ contract BuybackBurnSinkTest is Test {
             IBurnableERC20(address(sprout)),
             Currency.wrap(address(quote)),
             IVault(address(vault)),
+            ICLPositionManager(address(posm)),
             TREASURY,
             TIMELOCK,
             FLOOR,
@@ -736,7 +968,7 @@ contract BuybackBurnSinkTest is Test {
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
         sink.setTreasury(STRANGER);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
-        sink.setConversionTier(IPoolManager(address(manager)), IHooks(address(guardHook)), FEE, bytes32(0));
+        sink.setLockers(_one(address(locker)));
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
         sink.setHold(Currency.wrap(address(meme)), true);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
@@ -796,11 +1028,24 @@ contract BuybackBurnSinkTest is Test {
             IBurnableERC20(address(sprout)),
             Currency.wrap(address(quote)),
             IVault(address(vault)),
+            ICLPositionManager(address(posm)),
             TREASURY,
             TIMELOCK,
             FLOOR,
             FLOOR
         );
+    }
+
+    /// Register a launch the way graduation does: the locker knows the position, the position
+    /// manager knows its pool. Two lookups is all the sink ever makes.
+    function _lock(uint256 launchId, uint256 tokenId, PoolKey memory key) internal {
+        posm.setPool(tokenId, key);
+        locker.register(launchId, tokenId);
+    }
+
+    function _one(address a) internal pure returns (address[] memory list) {
+        list = new address[](1);
+        list[0] = a;
     }
 
     /// The `parameters` word a graduation pool carries: the hook's registration bitmap in the
@@ -811,15 +1056,20 @@ contract BuybackBurnSinkTest is Test {
 
     /// The key `InfinitySettler` would graduate `token` onto, built the way the settler builds
     /// it: currencies sorted, the tier's fee and spacing, keyed to the guard hook.
-    function _graduationKey(MockERC20 token) internal view returns (PoolKey memory) {
+    function _graduationKey(MockERC20 token, uint24 fee) internal view returns (PoolKey memory) {
+        return _pairKey(token, quote, fee);
+    }
+
+    /// The same, for a launch paired against something that is NOT this sink's quote asset.
+    function _pairKey(MockERC20 token, MockERC20 pair, uint24 fee) internal view returns (PoolKey memory) {
         (address c0, address c1) =
-            address(token) < address(quote) ? (address(token), address(quote)) : (address(quote), address(token));
+            address(token) < address(pair) ? (address(token), address(pair)) : (address(pair), address(token));
         return PoolKey({
             currency0: Currency.wrap(c0),
             currency1: Currency.wrap(c1),
             hooks: IHooks(address(guardHook)),
             poolManager: IPoolManager(address(manager)),
-            fee: FEE,
+            fee: fee,
             parameters: _graduationParameters()
         });
     }
