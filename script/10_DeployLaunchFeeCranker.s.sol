@@ -95,9 +95,7 @@ contract DeployLaunchFeeCranker is BaseScript {
         } else {
             console.log("  [TODO] positionLocker.launchpadTreasury is NOT the sink (plan B6)");
             console.log("           a crank will collect and pay, and nothing will burn");
-            _printTimelockPayloads(
-                locker, abi.encodeWithSignature("setLaunchpadTreasury(address)", sink)
-            );
+            _printTimelockPayloads(locker, abi.encodeWithSignature("setLaunchpadTreasury(address)", sink));
         }
         console.log("");
         console.log("  Nothing else to configure. crank(launchId) is permissionless;");

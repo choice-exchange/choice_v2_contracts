@@ -298,7 +298,7 @@ contract BuybackBurnSinkTest is Test {
     /// The sink is never TOLD a launch's pool: it derives the key from the tier every graduation
     /// is keyed to, which is what makes one timelock call cover every launch, past and future.
     /// The derivation is checked here against the pool that actually exists, by its id.
-     /// A5. The sink no longer reconstructs a graduation key from a stored tier - it reads the
+    /// A5. The sink no longer reconstructs a graduation key from a stored tier - it reads the
     /// launch's LOCKED POSITION and takes the key that position is actually in. Checked here
     /// against the pool that exists, by its id.
     function test_theConversionPoolIsReadOffTheLockedPosition() public view {
@@ -352,7 +352,9 @@ contract BuybackBurnSinkTest is Test {
         meme.mint(address(sink), 100 ether);
 
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(999), Currency.wrap(address(meme)))
+            abi.encodeWithSelector(
+                BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(999), Currency.wrap(address(meme))
+            )
         );
         sink.convert(Currency.wrap(address(meme)), 999);
     }
@@ -367,7 +369,9 @@ contract BuybackBurnSinkTest is Test {
 
         meme.mint(address(sink), 100 ether);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(777), Currency.wrap(address(meme)))
+            abi.encodeWithSelector(
+                BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(777), Currency.wrap(address(meme))
+            )
         );
         sink.convert(Currency.wrap(address(meme)), 777);
 
@@ -396,7 +400,9 @@ contract BuybackBurnSinkTest is Test {
 
         token.mint(address(sink), 100 ether);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(30), Currency.wrap(address(token)))
+            abi.encodeWithSelector(
+                BuybackBurnSink.LaunchDoesNotTrade.selector, uint256(30), Currency.wrap(address(token))
+            )
         );
         sink.convert(Currency.wrap(address(token)), 30);
     }

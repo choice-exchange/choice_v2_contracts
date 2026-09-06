@@ -389,8 +389,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     function test_theSinkFindsTheRealPoolOfARealGraduate() public {
         _graduate();
 
-        (PoolKey memory found, bool zeroForOne) =
-            sink.conversionPool(Currency.wrap(address(launchToken)), LAUNCH_ID);
+        (PoolKey memory found, bool zeroForOne) = sink.conversionPool(Currency.wrap(address(launchToken)), LAUNCH_ID);
         assertEq(PoolId.unwrap(found.toId()), PoolId.unwrap(_launchKey().toId()), "that is not the graduated pool");
         assertEq(zeroForOne, address(launchToken) < address(quote), "the sell direction is wrong");
 
@@ -424,7 +423,9 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         (uint256 amount0, uint256 amount1) = viaInterface.collect(LAUNCH_ID);
         assertGt(amount0 + amount1, 0, "collect through the interface returned nothing");
 
-        Currency credited = Currency.wrap(amount0 > 0 ? Currency.unwrap(_launchKey().currency0) : Currency.unwrap(_launchKey().currency1));
+        Currency credited = Currency.wrap(
+            amount0 > 0 ? Currency.unwrap(_launchKey().currency0) : Currency.unwrap(_launchKey().currency1)
+        );
         uint256 paid = viaInterface.claim(credited, address(sink));
         assertGt(paid, 0, "claim through the interface paid nothing");
     }
@@ -469,13 +470,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
     function _graduateAgainst(MockERC20 pair) internal {
         core.seedLaunch(
-            LAUNCH_ID,
-            CREATOR,
-            address(launchToken),
-            IERC20(address(pair)),
-            address(settler),
-            SEED_PAIR,
-            CREATOR_BPS
+            LAUNCH_ID, CREATOR, address(launchToken), IERC20(address(pair)), address(settler), SEED_PAIR, CREATOR_BPS
         );
         launchToken.mint(address(core), SEED_TOKEN);
         pair.mint(address(core), SEED_PAIR);
@@ -523,10 +518,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         swapRouter.modifyPosition(
             key,
             ICLPoolManager.ModifyLiquidityParams({
-                tickLower: -887200,
-                tickUpper: 887200,
-                liquidityDelta: int256(amount / 2),
-                salt: bytes32(0)
+                tickLower: -887200, tickUpper: 887200, liquidityDelta: int256(amount / 2), salt: bytes32(0)
             }),
             ""
         );
