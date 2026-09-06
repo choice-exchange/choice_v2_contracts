@@ -34,8 +34,16 @@ DESC=0xd5817F090C8F9939e086861d6EEAB95004072956
 POSM=0x823F6dBB3e92f15FdA79A6b0e11e47dB1f3FEd54
 CORE=0xb03fb1c05f7853601ae05ba7e3700a59dc14a71d
 PADT=0xBf08c09Fe227ada4A86d279e98E695344848d33D
-SETTLER=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
-LOCKER=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
+# 🔴 The LIVE settler and locker, A0/A3's replacements. This list named the 1.0.0 pair until
+# 2026-09-06, so for a whole day it verified two dead contracts and left the two the pad
+# actually uses unverified - which is how three CREATE3 contracts sat unverified without
+# anything reporting a failure. That is the drift the header below warns about, caught.
+SETTLER=0xe06aFC826Aa2d7C86b6C1f17ef4C8A8173756182
+LOCKER=0x0f0Df7bDa12Bea99A5A514b11f7cF6314C038bF5
+# ⛔ The guard hook was constructed with the 1.0.0 SETTLER as its `_initializer` and is not
+# redeployed, so its arguments must keep that address. Verification hashes the arguments as
+# CONSTRUCTED - `setInitializer` since then does not change them.
+SETTLER_10=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
 # The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is 1.1.0, the A4 sink deployed
 # 2026-09-06; the two it supersedes, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent —
@@ -62,7 +70,7 @@ MANIFEST=(
 "$BPM|infinity-core|src/pool-bin/BinPoolManager.sol:BinPoolManager|$(CA address $VAULT)"
 "0xC46e1388834077F64600f039DbD942Db0ad550D7|infinity-core|src/pool-cl/CLPoolManagerOwner.sol:CLPoolManagerOwner|$(CA address $CLPM)"
 "0xB1d448ec21A2845980BfFCA92370ba25Da573995|infinity-core|src/pool-bin/BinPoolManagerOwner.sol:BinPoolManagerOwner|$(CA address $BPM)"
-"0x36ab137ac1647c16646CA851c2715FBb60f4FD3C|contracts|src/fees/ChoiceFeeController.sol:ChoiceFeeController|$(CA address,address,address $CLPM $SAFE $DSINK)"
+"0xBC9943B5826F8543F42234bb05d3CDA36C6240Fe|contracts|src/fees/ChoiceFeeController.sol:ChoiceFeeController|$(CA address,address,address $CLPM $SAFE $DSINK)"
 "0x1aceba7d060Af651553fE850C17938e2F0580066|contracts|src/fees/ChoiceFeeController.sol:ChoiceFeeController|$(CA address,address,address $BPM $SAFE $DSINK)"
 "$DSINK|contracts|src/fees/DirectTransferBurnSink.sol:DirectTransferBurnSink|"
 "0xefe613636921D9d683CDe6d91FD0485D9DD2987f|contracts|src/fees/ExchangeSubaccountBurnSink.sol:ExchangeSubaccountBurnSink|$(CA address $TL)"
@@ -75,8 +83,11 @@ MANIFEST=(
 "0x95B0B855108CA5A8D5c43D9bc3A5994A479043e0|infinity-periphery|src/MixedQuoter.sol:MixedQuoter|$(CA address,address,address,address,address,address $DEAD $DEAD $DEAD $WETH $CLQ $BNQ)"
 "0x9D29c5BA79Ff9b173EADa6b8C0Fae10307cC9400|infinity-periphery|src/pool-cl/lens/TickLens.sol:TickLens|$(CA address $CLPM)"
 "$UNSUP|infinity-universal-router|src/deploy/UnsupportedProtocol.sol:UnsupportedProtocol|"
+# 🔴 `$PADT`, not the sink. `launchpadTreasury` is owner-settable and was repointed at the
+# buyback sink on 2026-09-06 (plan B6); the constructor took the pad treasury, and that is what
+# verification hashes.
 "$LOCKER|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $PADT $TL $SETTLER)"
-"$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER)"
+"$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER_10)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
 "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
 "$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"

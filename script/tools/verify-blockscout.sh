@@ -32,6 +32,17 @@ case "$dir" in
   *)         root="$CHOICE_V2/forks/$dir" ;;
 esac
 
+name="${target##*:}"
+
+# Idempotent, and not merely as a courtesy. The compat endpoint answers a CREATE3 contract that
+# is ALREADY verified with "Fail - Unable to verify" - it wants a creation-bytecode match and
+# there is no creation transaction to match against - so without this check a fully verified
+# deployment reports every one of those contracts as a failure, every pass, for ever.
+if [ "$(curl -s -m 20 "$API/api/v2/smart-contracts/$addr" | jq -r '.is_verified // false')" = "true" ]; then
+  printf "%-28s %s  Already verified\n" "$name" "$addr"
+  exit 0
+fi
+
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
 # infinity-periphery declares an extra compilation profile (`clPosm`, 9000 runs, applied only
@@ -60,9 +71,39 @@ resp="$(curl -s -m 120 -X POST "$API/api" \
   --data-urlencode "constructorArguements=$ctor" \
   --data-urlencode "sourceCode@$tmp/input.json")"
 
+# The v2 route: it asks the verifier microservice for a RUNTIME match, so it needs neither a
+# creation transaction nor constructor arguments. That is what makes it work on a CREATE3
+# deploy, where the contract is born inside a proxy child and the compat endpoint can find
+# nothing to match. Measured 2026-09-06: it verified a sink the compat endpoint had refused 16
+# times over 32 minutes, then the settler, locker and fee controller A0 deployed - all CREATE3,
+# all unverified for a day - in about a minute.
+#
+# ⚠️ It reports `constructor_args: null` on what it verifies, because a runtime match cannot
+# recover them. The bytecode match is the same; only the argument display is missing.
+verify_via_v2() {
+  local v2 ok
+  v2="$(curl -s -m 180 -X POST "$API/api/v2/smart-contracts/$addr/verification/via/standard-input" \
+    -F "compiler_version=$SOLC" \
+    -F "contract_name=$target" \
+    -F "autodetect_constructor_args=true" \
+    -F "license_type=${LICENSE_TYPE:-gnu_gpl_v2}" \
+    -F "files[0]=@$tmp/input.json;filename=input.json;type=application/json")"
+  case "$v2" in
+    *"verification started"*|*"already verified"*) ;;
+    *) printf "%-28s %s  V2 SUBMIT FAILED: %s\n" "$name" "$addr" "$(echo "$v2" | head -c 160)"; return 1 ;;
+  esac
+  for _ in $(seq 1 20); do
+    ok="$(curl -s -m 15 "$API/api/v2/smart-contracts/$addr" | jq -r '.is_verified // false')"
+    [ "$ok" = "true" ] && { printf "%-28s %s  Pass - Verified (v2)\n" "$name" "$addr"; return 0; }
+    sleep 6
+  done
+  printf "%-28s %s  V2 SUBMITTED BUT NOT VERIFIED\n" "$name" "$addr"
+  return 1
+}
+
 guid="$(echo "$resp" | jq -r '.result // empty')"
-name="${target##*:}"
 if [ -z "$guid" ] || [ "$(echo "$resp" | jq -r .status)" != "1" ]; then
+  verify_via_v2 && exit 0
   printf "%-28s %s  SUBMIT FAILED: %s\n" "$name" "$addr" "$(echo "$resp" | head -c 160)"
   exit 1
 fi
@@ -71,4 +112,9 @@ for _ in $(seq 1 20); do
   st="$(curl -s -m 15 "$API/api?module=contract&action=checkverifystatus&guid=$guid" | jq -r .result)"
   case "$st" in *Pending*) sleep 6 ;; *) break ;; esac
 done
-printf "%-28s %s  %s\n" "$name" "$addr" "$st"
+case "$st" in
+  *Pass*) printf "%-28s %s  %s\n" "$name" "$addr" "$st" ;;
+  # A CREATE3 contract lands here rather than at the submit check: the compat endpoint takes the
+  # submission, hands back a guid, and only then says it cannot match.
+  *) verify_via_v2 || printf "%-28s %s  %s\n" "$name" "$addr" "$st" ;;
+esac
