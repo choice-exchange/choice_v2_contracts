@@ -53,12 +53,18 @@ contract SeedQuoteRoutePool is BaseScript {
     uint24 internal constant LP_FEE = 335;
     int24 internal constant TICK_SPACING = 10;
 
-    /// @notice Where the wINJ sits: from here up. The pool opens AT this tick, so the position is
-    /// entirely `currency0` and the first sale of the asset fills against it immediately with no
-    /// empty gap to cross - a gap would eat the sink's whole `maxImpactBps` allowance and park
-    /// the tranche instead of trading it.
-    int24 internal constant SEED_PRICE_TICK = 23030; // ~10.003 asset per wINJ
-    int24 internal constant SEED_UPPER_TICK = 46050; // ~100 asset per wINJ
+    /// @notice Where the wINJ sits: from `ROUTE_TICK_LOWER` up. The pool opens AT that tick, so
+    /// the position is entirely `currency0` and the first sale of the asset fills against it
+    /// immediately with no empty gap to cross - a gap would eat the sink's whole `maxImpactBps`
+    /// allowance and park the tranche instead of trading it.
+    ///
+    /// 🔴 **The tick depends on the two tokens' DECIMALS as much as on the price**, because a
+    /// pool's price is a ratio of RAW units. Ten of an 18-decimal asset per wINJ is tick
+    /// **+23030**; ten of a 6-decimal one is **-253300**. Same price, opposite sign - so this is
+    /// a per-asset input and never a constant. Compute it as
+    /// `ln(assetRawPerWinjRaw) / ln(1.0001)`, aligned down to the tier's spacing.
+    int24 internal constant DEFAULT_TICK_LOWER = 23030; // ~10 of an 18-decimal asset per wINJ
+    int24 internal constant DEFAULT_TICK_UPPER = 46050; // ~100 of one
 
     function run() public view {
         address winj = readAddress("external.wINJ");
@@ -66,6 +72,9 @@ contract SeedQuoteRoutePool is BaseScript {
         address clPoolManager = readAddress("infinity.clPoolManager");
         address sink = readAddress("choice.buybackBurnSink");
         uint256 amount0 = vm.envOr("ROUTE_WINJ_WEI", uint256(0.1 ether));
+        int24 tickLower = int24(vm.envOr("ROUTE_TICK_LOWER", int256(DEFAULT_TICK_LOWER)));
+        int24 tickUpper = int24(vm.envOr("ROUTE_TICK_UPPER", int256(DEFAULT_TICK_UPPER)));
+        require(tickUpper > tickLower, "ROUTE_TICK_UPPER must be above ROUTE_TICK_LOWER");
 
         // 🔴 wINJ must sort BELOW the asset, or the whole one-sided argument inverts: the
         // liquidity would have to go BELOW spot and be denominated in the asset, which is the
@@ -81,8 +90,8 @@ contract SeedQuoteRoutePool is BaseScript {
             parameters: bytes32(0).setTickSpacing(TICK_SPACING)
         });
 
-        int24 lower = (SEED_PRICE_TICK / TICK_SPACING) * TICK_SPACING;
-        int24 upper = (SEED_UPPER_TICK / TICK_SPACING) * TICK_SPACING;
+        int24 lower = (tickLower / TICK_SPACING) * TICK_SPACING;
+        int24 upper = (tickUpper / TICK_SPACING) * TICK_SPACING;
         uint160 sqrtPriceX96 = TickMath.getSqrtRatioAtTick(lower);
 
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
@@ -95,9 +104,20 @@ contract SeedQuoteRoutePool is BaseScript {
             Actions.CL_MINT_POSITION,
             abi.encode(key, lower, upper, uint256(liquidity), uint128(amount0), uint128(0), msg.sender, bytes(""))
         );
-        // Only `currency0` is owed, so a single-currency settle is all the plan needs; a
-        // SETTLE_PAIR would ask for the asset the whole point is not holding.
-        plan = plan.add(Actions.SETTLE, abi.encode(key.currency0, amount0, true));
+        // 🔴 `CLOSE_CURRENCY`, not a fixed-amount `SETTLE`, and not `SETTLE_PAIR`.
+        //
+        // `SETTLE_PAIR` would ask for the asset the whole point is not holding. A fixed-amount
+        // `SETTLE(currency0, amount0)` looks right and is wrong: the minted liquidity rounds, so
+        // the position consumes slightly LESS than `amount0` and settling the full figure leaves
+        // a CREDIT - which is an unsettled delta just as much as a debt is, and the lock closes
+        // with `CurrencyNotSettled()`. It cost a reverted mint to find, and only because the
+        // rounding happened to land clean on the first (18-decimal) route pool.
+        //
+        // `CLOSE_CURRENCY` settles a debt or takes a credit, whichever the delta turns out to
+        // be. Applied to BOTH currencies: the position should be pure `currency0` when the pool
+        // opens at `tickLower`, but "should be" is exactly the assumption that just failed.
+        plan = plan.add(Actions.CLOSE_CURRENCY, abi.encode(key.currency0));
+        plan = plan.add(Actions.CLOSE_CURRENCY, abi.encode(key.currency1));
 
         console.log("SEED_POOL_MANAGER=%s", vm.toString(clPoolManager));
         console.log("SEED_POSITION_MANAGER=%s", vm.toString(readAddress("infinity.clPositionManager")));
