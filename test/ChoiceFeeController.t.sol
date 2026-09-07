@@ -57,6 +57,13 @@ contract ChoiceFeeControllerTest is Test {
     uint24 internal constant LAUNCH_LP_FEE = 10_000;
     int24 internal constant LAUNCH_TICK_SPACING = 200;
 
+    /// @dev Upstream's own fee policy, which every test in this file runs under and which is
+    /// what testnet deploys. They are constructor arguments now rather than contract defaults,
+    /// so each construction has to state the policy it is testing under. Mainnet passes 0/0;
+    /// `ProtocolFeesDisabled.t.sol` is where that configuration is exercised.
+    uint256 internal constant SPLIT_RATIO = 33 * 1e4;
+    uint24 internal constant DYNAMIC_DEFAULT = 300;
+
     address internal constant TREASURY = address(0x7EA);
     address internal constant TIMELOCK = address(0x71E);
     address internal constant RANDOM = address(0xBEEF);
@@ -67,7 +74,7 @@ contract ChoiceFeeControllerTest is Test {
         vault.registerApp(address(poolManager));
 
         sink = new RecordingBurnSink();
-        controller = new ChoiceFeeController(address(poolManager), TREASURY, sink);
+        controller = new ChoiceFeeController(address(poolManager), TREASURY, sink, SPLIT_RATIO, DYNAMIC_DEFAULT);
         // collectProtocolFees reverts with InvalidCaller for anyone but the registered
         // controller, so this wiring is part of what the tests exercise.
         poolManager.setProtocolFeeController(controller);
@@ -172,7 +179,9 @@ contract ChoiceFeeControllerTest is Test {
     function test_parkedByDefaultSendsEverythingToTreasuryWithoutASink() public {
         assertEq(controller.treasuryBps(), 10_000, "must ship parked");
 
-        ChoiceFeeController parked = new ChoiceFeeController(address(poolManager), TREASURY, IBurnSink(address(0)));
+        ChoiceFeeController parked = new ChoiceFeeController(
+            address(poolManager), TREASURY, IBurnSink(address(0)), SPLIT_RATIO, DYNAMIC_DEFAULT
+        );
         poolManager.setProtocolFeeController(parked);
 
         Currency currency = _accrueProtocolFee(1_000);
@@ -186,7 +195,9 @@ contract ChoiceFeeControllerTest is Test {
     /// @dev Unparking without wiring a sink must fail loudly rather than leave the burn share
     /// sitting in the controller looking like revenue nobody is watching.
     function test_unparkingWithoutASinkReverts() public {
-        ChoiceFeeController parked = new ChoiceFeeController(address(poolManager), TREASURY, IBurnSink(address(0)));
+        ChoiceFeeController parked = new ChoiceFeeController(
+            address(poolManager), TREASURY, IBurnSink(address(0)), SPLIT_RATIO, DYNAMIC_DEFAULT
+        );
         poolManager.setProtocolFeeController(parked);
         parked.setTreasuryBps(5_000);
 

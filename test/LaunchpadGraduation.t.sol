@@ -148,7 +148,14 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
 
         // The real revenue path: graduated pools are initialised by the settler, so the
         // protocol fee they carry is whatever this controller hands the pool manager.
-        feeController = new ChoiceFeeController(address(clPoolManager), CHOICE_TREASURY, IBurnSink(address(0)));
+        feeController = new ChoiceFeeController(
+            // Upstream's fee policy, which is what testnet runs; mainnet passes 0/0.
+            address(clPoolManager),
+            CHOICE_TREASURY,
+            IBurnSink(address(0)),
+            33 * 1e4,
+            300
+        );
         clPoolManager.setProtocolFeeController(feeController);
 
         permit2 = IAllowanceTransfer(deployPermit2());
