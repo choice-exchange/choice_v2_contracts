@@ -1,0 +1,112 @@
+{
+  "$schema": "./schema.json",
+  "network": "injective_mainnet",
+  "chainId": 1776,
+  "rpc": "https://sentry.evm-rpc.injective.network",
+  "rpcNote": "SENTRY, deliberately. Broadcast through this endpoint and never through polkachu, which accepts a transaction and then serves no receipt for it - which reads as a failure on a tx that landed, and invites a re-send. Verified 2026-09-07: eth_chainId answers 0x6f0.",
+  "explorer": "https://blockscout.injective.network",
+  "external": {
+    "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+    "wINJ": "0x0000000088827d2d103ee2d9A6b781773AE03FfB",
+    "arachnidCreate2": "0x4e59b44847b379578588920cA78FbF26c0B4956C",
+    "usdt": "0x88f7F2b685F9692caf8c478f5BADF09eE9B1Cc13",
+    "usdc": "0xa00C59fF5a080D2b954d0c75e46E22a0c371235a",
+    "bankPrecompile": "0x0000000000000000000000000000000000000064",
+    "exchangePrecompile": "0x0000000000000000000000000000000000000065",
+    "safeProxyFactory": "0x4e1DCf7AD4e460CfD30791CCC4F9c8a4f820ec67",
+    "safeSingletonL2": "0x29fcB43b46531BcA003ddC8FCB67FFE91900C762",
+    "safeFallbackHandler": "0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99",
+    "sai": "0x8Dc3ECb97E6E5f08cd490bA3089DA0BB9D59ccB4",
+    "externalNote": "Every address in this group was read off chain 1776 on 2026-09-07, not copied from the testnet book. eth_getCode sizes: permit2 9,152 / wINJ 5,954 / Arachnid CREATE2 69 / Safe proxy factory 3,054 / Safe singleton L2 24,421 / Safe fallback handler 5,637 - identical to the testnet deployment's, which is the point: the whole Safe stack and Permit2 are canonical on both nets at the same addresses, so nothing here has to be deployed. The two precompiles answer eth_getCode with 0x on Injective and always will; that is expected and is not evidence of absence.",
+    "tokenNote": "usdt / usdc / sai were each proved by calling them: symbol() and decimals() answered USDT/6, USDC/6, SAI/18 on 1776. 🔴 THE TESTNET BOOK'S TWO-USDC TRAP DOES NOT EXIST HERE. On 1439 the launchpad quotes its own tokenfactory USDC (external.padUsdc) while external.usdc is the Circle FiatToken, and both answer symbol() == 'USDC'. On mainnet the pad quotes EVM-native USDC 0xa00C59fF..., which IS this entry - shroom_launchpad/contracts/deployments/injective_mainnet.json quoteAssets.USDC.pairAsset - so there is one USDC and no padUsdc key. Do not add one.",
+    "usdtNote": "Mainnet USDT is the peggy USDT ERC20-module pair, 6 decimals. It is recorded because wINJ/USDT is the deepest INJ pair on the chain and is the obvious first seeded pool, NOT because anything is committed to it. No pool exists yet; see `pools`."
+  },
+  "governance": {
+    "safe": null,
+    "safeSigners": [],
+    "safeThreshold": 3,
+    "safeSaltNonce": 0,
+    "timelock": null,
+    "timelockMinDelay": 86400,
+    "create3Factory": null,
+    "create3DeployerEOA": null,
+    "deployerEOA": null,
+    "governanceNote": "⛔ PHASE 1 CANNOT RUN UNTIL THE THREE NULLS ABOVE ARE FILLED, and that is deliberate - BaseScript.readAddress reverts on a null entry, so a missing signer set stops the run rather than deploying a Safe nobody controls. safeThreshold 3 and timelockMinDelay 86400 are DECIDED (CHOICE_V2_MAINNET_OPS.md §8, 2026-09-07): 3-of-5 on hardware wallets, and a 24-hour delay. Still needed: the five safeSigners, and the two EOAs.",
+    "timelockMinDelayNote": "86400 = 24 hours. 🔴 This is ALSO THE UNPAUSE LATENCY, not just the change-control delay. pausePoolManager is role-or-owner so a monitoring key can stop swaps in seconds, but unpausePoolManager is onlyOwner and the owner is this timelock - so a pause costs up to a day of swaps, and a compromised pause-role key can hold the DEX down one delay period at a time. ✅ What makes that survivable: a pause blocks swap and donate ONLY. modifyLiquidity is not paused, so users can always withdraw liquidity while paused.",
+    "safeSignersNote": "FIVE hardware wallet addresses, threshold 3. Five distinct devices must exist and be held separately before script 01 runs; two compromised keys are not enough to move anything, and one lost key does not halt operations. ⚠️ Do NOT reuse the testnet signers 0x8BDa0790... / 0xF48390Bb... / 0xF7Ca1E12... - those are local keystores on a development machine, which is the correct shape for 1439 and the wrong shape for a Safe that owns the timelock that owns the whole DEX.",
+    "create3DeployerEOANote": "🔴 A DEDICATED EOA WHOSE FIRST-EVER MAINNET TRANSACTION IS THE Create3Factory DEPLOY. Plan D2, corrected: Create3Factory's constructor does `Ownable(msg.sender)` and `isUserWhitelisted[msg.sender] = true`, so deploying it THROUGH the Arachnid CREATE2 deployer makes the owner and sole whitelisted user 0x4e59b448..., a stub that can call nothing - the factory is bricked permanently. Reproduced on anvil 2026-09-04. Deploy it by plain CREATE from nonce 0 instead; upstream's own 01_DeployCreate3Factory.s.sol asserts nonce == 0 for the same reason. The factory address is then a pure function of this EOA, since CREATE(eoa, 0) depends on nothing else.",
+    "create3OwnerWarning": "🔴 THE FACTORY OWNER IS A STANDING PRIVILEGED KEY ON MAINNET, and it is easy to read as a one-shot deploy key. Create3Factory.deploy is gated only by isUserWhitelisted and setWhitelistUser is onlyOwner, and Create3.addressOf(salt) is NOT namespaced by msg.sender - so whoever holds this key can deploy ARBITRARY CODE at ANY unclaimed CHOICE-V2 salt, including CHOICE-V2/TimelockController/1.0.0. Script 01 would then take it: its idempotency check is `if (timelock.code.length > 0) skip`, with no code-hash or role check, and it writes that address into this book. ⇒ Custody this key like a signer, and after Phase 3 transfer the factory's ownership to the timelock (it is Ownable2Step) and de-whitelist the ordinary deployerEOA.",
+    "deployerEOANote": "The ordinary deploy key: hot, funded with INJ, whitelisted on the Create3Factory by the owner EOA. It holds no privilege after the deploy - every contract it deploys is born owned by the timelock - so it is the one key here that may be a plain keystore.",
+    "addressParityNote": "☑ DECIDED 2026-09-07: a FRESH, MAINNET-ONLY EOA, custodied like a signer. Cross-net address parity is deliberately given up - the mainnet Create3Factory and TimelockController will NOT land on the testnet addresses. This is recorded rather than left silent because the parity WAS available and someone will otherwise assume it was missed: verified 2026-09-07, both testnet EOAs (create3DeployerEOA 0x15248340974929CeF4194a9Be763960d8A807fbc, deployerEOA 0xAcA0d67c52B503ED15706df5fE29E19677338bc6) were at NONCE 0 with ZERO balance on 1776, and 0x2Be6e98818A7CbBd1c7fD8e06A3B0449715790CD (the factory) and 0xfE9811111Cffd823aA2c1c8F31A77009BFaeDE42 (the timelock, CREATE3 off the same salt) were both EMPTY there - so reusing one would have landed both on the same addresses as testnet, which is exactly what plan D2 was designed to buy. 🔑 The reason not to is create3OwnerWarning above: the factory owner is a STANDING privileged key that can place arbitrary code at any unclaimed CHOICE-V2 salt, and the testnet key is a keystore that has lived on a development machine. Address parity is cosmetic; that is not. ⚠️ The EOA does not exist yet - this field stays null until it is generated, and Phase 1 cannot run while it is."
+  },
+  "infinity": {
+    "vault": null,
+    "clPoolManager": null,
+    "binPoolManager": null,
+    "clPoolManagerOwner": null,
+    "binPoolManagerOwner": null,
+    "clPositionDescriptor": null,
+    "clPositionManager": null,
+    "binPositionManager": null,
+    "clQuoter": null,
+    "binQuoter": null,
+    "mixedQuoter": null,
+    "clTickLens": null,
+    "universalRouter": null,
+    "unsupportedProtocol": null
+  },
+  "choice": {
+    "clFeeController": null,
+    "binFeeController": null,
+    "infinitySettler": null,
+    "positionLocker": null,
+    "launchPoolGuardHook": null,
+    "choiceRouter": null,
+    "treasury": null,
+    "directTransferBurnSink": null,
+    "exchangeSubaccountBurnSink": null,
+    "buybackBurnSink": null,
+    "launchFeeCranker": null,
+    "quoteRouteAssetKeys": [],
+    "choiceNote": "Nothing here is deployed. 🔑 There is NO positionLockerLegacy and NO launchFeeCrankerLegacy key, and there should never be: those exist on testnet only because a locker generation was superseded after launches had already registered into it. A fresh deployment starts with one locker generation and one cranker.",
+    "treasuryBpsNote": "🔴 SHIP BOTH FEE CONTROLLERS AT treasuryBps = 10000 (everything to treasury, the burn sink never called). It is the default; keeping it is a DECISION, not inertia - see MAINNET_READINESS C3. Before it is ever lowered, confirm every fee currency is on Injective's governance-set auction-transfer denom list: a currency that is not on it accumulates at 0x1111...1111, the real ExchangeAuctionFeesAddress, where nobody holds a key. At 10000 the sink is never called and that risk cannot arise.",
+    "choiceRouterNote": "🔴 SHIPS INERT. Script 07 allowlists this network's vault and nothing else, so every Pumex stage reverts VaultNotAllowed. Its production cross-vault configuration has never run on any chain (MAINNET_READINESS C2); enabling Pumex is its own change, behind the timelock, with its own small-size live route as the proof.",
+    "quoteRouteAssetKeysNote": "Empty on purpose. This lists BOOK KEYS, never addresses, so an asset's address lives in exactly one place - and it is only populated once a launch graduates against a quote that is not the sink's QUOTE, AND a real market exists to route through. 🔴 The testnet SAI and padUSDC routes were seeded at an ASSUMED price because no pool existed; on mainnet a route must come from a real market, or the quote asset should not be accepted at all."
+  },
+  "launchpad": {
+    "core": null,
+    "views": null,
+    "treasury": null,
+    "sproutToken": null,
+    "sproutLaunchId": null,
+    "launchpadNote": "⛔ BLOCKED ON AN UNSETTLED DECISION, and it is not this deploy's to make. MAINNET_READINESS Part 2 opens on it: is sprout.fun mainnet a NEW core, or the live shroom core 0xd948740da926E8908A08414879490d0D8F96D463? The plan's own logic points at a new core (option A) - it is the only way the A2/C3/B7 quote gates ship, the pad has done exactly this cutover once already with a written runbook, and the 177 live shroom launches stay where they are rather than being stranded. Until it is settled in writing in SPROUT_TOKENOMICS, these stay null. 🔑 NOTHING IN CHOICE V2 PHASE 1 READS THIS GROUP - scripts 01, 02, 03, 07 and 08 are the whole DEX deploy and none of them touch the launchpad. Only 05 (settler), 09 (sink) and 10 (cranker) do, and those are sprout's phases. So this being unsettled does not block the AMM."
+  },
+  "pools": [],
+  "meta": {
+    "forkPins": {
+      "infinity-core": "c53aef3adbaaccd7a68086a18cbf201bed3a6fe9",
+      "infinity-periphery": "0a2aee811cb15ca7995865580b2f6c2111e76ee3",
+      "infinity-universal-router": "7e80d5146560f55ad174ef631e6b4d843f7d3c10"
+    },
+    "forkPinsNote": "✅ Unlike the testnet book, source and chain are NOT out of step here, and cannot be: nothing is deployed yet, so whatever is built will be built from these pins. 🔴 AND THAT SENTENCE IS ONLY TRUE IF YOU KNOW WHICH REPO EACH CONTRACT IS BUILT FROM. These three pins govern anything built from `contracts`. The UniversalRouter is NOT built from `contracts` - its deploy script lives in infinity-universal-router/script/deployParameters/ and that repo's remappings resolve `infinity-periphery/` to ITS OWN nested submodule. That copy was 19 months stale (481650d, 2025-02-05) and predated the Hexens audit response, so a testnet redeploy 'from the fixed pin' on 2026-09-07 came out BYTE-IDENTICAL to the buggy router it replaced. It is now pinned to the same 0a2aee8 named here (infinity-universal-router PR #4, carried by the router pin below), so the whole stack has ONE periphery. ⛔ Before the mainnet deploy, re-check it: `git -C lib/infinity-universal-router submodule status`. See CHOICE_V2_MAINNET_OPS.md §4a.\n\ninfinity-periphery 0a2aee8 carries upstream 9b026be ('Fix: exact output partial fills', PR #96), taken on 2026-09-07 BEFORE the first mainnet deploy precisely so this book never has to record a known-buggy router. CI checks these three against the submodules on every push, so THEY cannot drift silently - but CI does not check the nested copies, which is the gap above.",
+    "upstreamPins": {
+      "infinity-core": "61cd1311737fab6b1f31e7a5a136dabdcd5f4921",
+      "infinity-periphery": "9b026be4cf850cb2db37cffa5f86f500ebe3602d",
+      "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
+    },
+    "lastUpdated": "2026-09-07",
+    "blockscoutApi": "https://blockscout-api.injective.network",
+    "blockscoutVerified": "0/0 - nothing deployed",
+    "addressAliases": {},
+    "status": "PRE-DEPLOY. This file exists so that the Choice v2 mainnet deploy is scriptable, dry-runnable and reviewable - MAINNET_READINESS C10 named its absence the practical blocker, because every script resolves NETWORK to it and `make sync` reported 0/56. Every non-null value in it was read off chain 1776 on 2026-09-07. Every null is a thing that does not exist yet or a decision not yet taken, and BaseScript.readAddress reverting on null is what keeps the difference honest.",
+    "readingOrder": "CHOICE_V2_MAINNET_OPS.md is the runbook (§5 the phases, §2 the three tiers, §6 standing ops, §8 the decisions). MAINNET_READINESS.md §Part 1B is the security review this deploy is conditioned on (verdict: GO on four conditions). Neither is duplicated here; the notes in this file only cover what a reader of THIS FILE would otherwise get wrong.",
+    "buildProfileWarning": "🔴 BUILD PERIPHERY WITH THE PERIPHERY'S OWN OPTIMIZER PROFILE, never the contracts/ workspace profile. `forge build --sizes` from this workspace reports CLPositionManager at 24,769 B - 193 B OVER EIP-170 - while the contract deployed on testnet is 24,004 B. Nothing is broken today; it becomes a failed deploy the day somebody builds it from here (MAINNET_READINESS C6).",
+    "broadcastDiscipline": [
+      "⛔ Never --slow: forge waits for a receipt and strands a multi-tx script after tx 1.",
+      "⛔ Never --resume: Injective answers eth_getTransactionReceipt with null for a tx it has already mined, so a broadcast routinely reports failure after the work landed. Confirm with eth_getCode and re-run the script from the top - every script is idempotent for exactly this reason.",
+      "🔴 eth_estimateGas UNDER-REPORTS on Injective. Pass an explicit, generous --gas-limit on every write.",
+      "🔴 A forge script cannot touch wINJ or any bank ERC20: precompile 0x64 has no code in REVM, so simulation dies and --skip-simulation does not save it. Make the script a calldata printer and send with cast send.",
+      "✅ But `cast call --from <admin>` DOES execute on the node, so every admin step can be dry-run for free. Do it."
+    ]
+  }
+}
