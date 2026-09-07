@@ -170,12 +170,13 @@
   "meta": {
     "forkPins": {
       "infinity-core": "c53aef3adbaaccd7a68086a18cbf201bed3a6fe9",
-      "infinity-periphery": "9be2647d3ea6758b32306956a9438d21e8873655",
+      "infinity-periphery": "0a2aee811cb15ca7995865580b2f6c2111e76ee3",
       "infinity-universal-router": "4d9d81af0081292e591ad26bc6a116e4ee7aee91"
     },
+    "forkPinsNote": "\u26a0\ufe0f infinity-periphery's pin is DELIBERATELY AHEAD OF THIS NETWORK'S DEPLOYED BYTECODE, and it is the only entry here that is. It moved to 0a2aee8 (upstream 9b026be, 'Fix: exact output partial fills', PR #96) on 2026-09-07, before the first mainnet deploy, because CLRouterBase is reached by every ordinary user swap - UniversalRouter -> Dispatcher -> InfinitySwapRouter -> InfinityRouter -> CLRouterBase - and before that fix an exactOutput swap never checked the pool delivered what was asked: a CL pool that ran out of liquidity before the price limit filled PARTIALLY and the only guard, amountIn > amountInMaximum, passed precisely because less was delivered. Partial fills on exact output need thin liquidity, which is what a newly deployed DEX has. \ud83d\udd34 CONSEQUENCE: infinity.universalRouter 0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7 on THIS network was built from the previous pin 9be2647 and STILL CARRIES THE BUG. Source and chain are out of step here on purpose, and the CI check that forkPins equals the submodule is what forced recording it this way. It is closed by redeploying the testnet UniversalRouter from this pin and repointing the frontend, or it stays a known testnet-only gap - mainnet has no deployment yet and will be built from this pin, which is the whole reason for taking it now.",
     "upstreamPins": {
       "infinity-core": "61cd1311737fab6b1f31e7a5a136dabdcd5f4921",
-      "infinity-periphery": "8261f8d93a23c9ba8a73060823251ba8b5ac46de",
+      "infinity-periphery": "9b026be4cf850cb2db37cffa5f86f500ebe3602d",
       "infinity-universal-router": "33dbf5a4bc65f43ecc6caaa1a88d2f6f2f020180"
     },
     "lastUpdated": "2026-09-07",
