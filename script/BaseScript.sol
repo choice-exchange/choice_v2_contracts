@@ -53,6 +53,17 @@ abstract contract BaseScript is Script {
         return vm.parseJsonAddressArray(book(), string.concat(".", key));
     }
 
+    /// @notice Like `readAddressArray`, but an empty list for a key that is absent.
+    /// @dev For a book entry a deployment MAY carry rather than must - the quote-route asset
+    /// list, whose absence means "no launch is paired against anything but QUOTE here" rather
+    /// than a misconfiguration.
+    function readAddressArrayOrEmpty(string memory key) internal view returns (address[] memory) {
+        string memory json = book();
+        string memory path = string.concat(".", key);
+        if (!vm.keyExistsJson(json, path)) return new address[](0);
+        return vm.parseJsonAddressArray(json, path);
+    }
+
     /// @dev Writes straight back into the book so the next script in the sequence can read it.
     function writeAddress(string memory key, address value) internal {
         vm.writeJson(vm.toString(value), bookPath, string.concat(".", key));

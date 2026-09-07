@@ -364,6 +364,41 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertEq(sprout.totalSupply(), supplyBefore, "something burnt through a pool that cannot exist");
     }
 
+    /// 🔫 **The same launch, after the second leg exists — the whole of A2, end to end.**
+    ///
+    /// Nothing about the launch changes: the same SAI-paired graduate, the same real settler,
+    /// the same real `PositionLocker` and the same real `CLPositionManager`. One owner call
+    /// registers the pool SAI reaches wINJ through, and the identical crank now takes BOTH
+    /// halves of the fee — the launch token through two legs, and the SAI half through one —
+    /// all the way to destroyed SPROUT.
+    function test_aLaunchPairedAgainstAnotherAssetBurnsOnceTheSecondLegIsRegistered() public {
+        MockERC20 otherQuote = new MockERC20("Sai", "SAI", 18);
+        launchToken = _tokenOrderedAgainst(otherQuote, true);
+        _graduateAgainst(otherQuote);
+        _swap(_launchKeyAgainst(otherQuote), true, 50_000e18);
+        _swap(_launchKeyAgainst(otherQuote), false, 10e18);
+
+        // 🔴 An ORDINARY pool with no hook — which is exactly why it has to be registered. A
+        // graduation pool's key is un-createable by anyone but an allowlisted settler, so A5
+        // could derive one safely; anybody can open this one, at any price they choose.
+        PoolKey memory hop = _plainKey(otherQuote, quote);
+        _seed(hop, 500_000 ether);
+        vm.prank(OWNER);
+        sink.setQuoteRoute(Currency.wrap(address(otherQuote)), hop);
+
+        uint256 supplyBefore = sprout.totalSupply();
+
+        vm.prank(STRANGER);
+        LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
+
+        assertGt(result.collected0 + result.collected1, 0, "nothing was collected");
+        assertGt(result.claimed0 + result.claimed1, 0, "nothing was claimed");
+        assertTrue(result.drove0 && result.drove1, "a leg was still refused after the route existed");
+        assertLt(supplyBefore - sprout.totalSupply(), supplyBefore, "sanity");
+        assertGt(supplyBefore - sprout.totalSupply(), 0, "a SAI-paired graduate still burnt nothing");
+        assertGt(sprout.balanceOf(OPS), 0, "the ops share never reached the treasury");
+    }
+
     /// The launchpad's own token is a launch like any other, and its LP fees are burn revenue
     /// with no swap in the way: the sink's `BURN_TOKEN` arm splits and destroys the balance.
     function test_aSproutPairedLaunchBurnsItsOwnLegDirectly() public {
@@ -389,9 +424,10 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     function test_theSinkFindsTheRealPoolOfARealGraduate() public {
         _graduate();
 
-        (PoolKey memory found, bool zeroForOne) = sink.conversionPool(Currency.wrap(address(launchToken)), LAUNCH_ID);
-        assertEq(PoolId.unwrap(found.toId()), PoolId.unwrap(_launchKey().toId()), "that is not the graduated pool");
-        assertEq(zeroForOne, address(launchToken) < address(quote), "the sell direction is wrong");
+        BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(launchToken)), LAUNCH_ID);
+        assertEq(route.legs, 1, "a wINJ-paired graduate needs exactly one leg");
+        assertEq(PoolId.unwrap(route.first.toId()), PoolId.unwrap(_launchKey().toId()), "that is not the graduated pool");
+        assertEq(route.firstZeroForOne, address(launchToken) < address(quote), "the sell direction is wrong");
 
         (PoolKey memory unfiltered, address answering) = sink.launchPool(LAUNCH_ID);
         assertEq(PoolId.unwrap(unfiltered.toId()), PoolId.unwrap(_launchKey().toId()), "launchPool disagrees");
