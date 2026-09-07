@@ -981,11 +981,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @return key The pool; zero when nothing is registered.
     /// @return assetIsCurrency0 True when `asset` is that pool's `currency0`.
     /// @return found Whether a route exists at all.
-    function quoteRoute(Currency asset)
-        external
-        view
-        returns (PoolKey memory key, bool assetIsCurrency0, bool found)
-    {
+    function quoteRoute(Currency asset) external view returns (PoolKey memory key, bool assetIsCurrency0, bool found) {
         key = _quoteRoutes[asset];
         found = address(key.poolManager) != address(0);
         assetIsCurrency0 = found && key.currency0 == asset;

@@ -170,12 +170,16 @@ contract DeployBuybackBurnSink is BaseScript {
     /// ⚠️ It REPORTS rather than requiring, deliberately. A route names an ordinary pool that
     /// nobody's settler opened, so there is nothing on chain for this script to derive it from
     /// and nothing safe to guess - which is the whole reason the route is registered in the first
-    /// place. `choice.quoteRouteAssets` in the address book is the operator's list of assets that
-    /// SHOULD have one; the key itself is supplied when the timelock call is made.
+    /// place. `choice.quoteRouteAssetKeys` in the address book is the operator's list of assets
+    /// that SHOULD have one; the pool key itself is supplied when the timelock call is made.
+    ///
+    /// 🔑 It holds BOOK KEYS (`"external.sai"`), not addresses. CI refuses a book in which one
+    /// address appears under two keys, and rightly: an address written twice is an address that
+    /// can be updated once.
     function _reportQuoteRoutes(address sink) internal view {
-        address[] memory assets = readAddressArrayOrEmpty("choice.quoteRouteAssets");
+        address[] memory assets = readAddressesByKeyList("choice.quoteRouteAssetKeys");
         if (assets.length == 0) {
-            console.log("  [note] no quoteRouteAssets in the address book.");
+            console.log("  [note] no quoteRouteAssetKeys in the address book.");
             console.log("           A launch paired against anything but QUOTE will park both halves");
             console.log("           of its LP fee until setQuoteRoute names a pool. See plan A2/D28.");
             return;

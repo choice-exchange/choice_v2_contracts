@@ -874,9 +874,7 @@ contract BuybackBurnSinkTest is Test {
 
         // BEFORE. A named revert, not a silent park - the caller is told what is missing.
         assertEq(sink.conversionRoute(pre2eCurrency, SAI_LAUNCH).legs, 0, "there should be no route yet");
-        vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, SAI_LAUNCH, pre2eCurrency)
-        );
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, SAI_LAUNCH, pre2eCurrency));
         sink.convert(pre2eCurrency, SAI_LAUNCH);
 
         // AFTER. One owner call, naming a venue rather than a destination.

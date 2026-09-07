@@ -53,15 +53,26 @@ abstract contract BaseScript is Script {
         return vm.parseJsonAddressArray(book(), string.concat(".", key));
     }
 
-    /// @notice Like `readAddressArray`, but an empty list for a key that is absent.
-    /// @dev For a book entry a deployment MAY carry rather than must - the quote-route asset
-    /// list, whose absence means "no launch is paired against anything but QUOTE here" rather
-    /// than a misconfiguration.
-    function readAddressArrayOrEmpty(string memory key) internal view returns (address[] memory) {
+    /// @notice A list of BOOK KEYS resolved to the addresses they name; empty if absent.
+    ///
+    /// @dev Indirection on purpose. CI refuses a book in which one address appears under more
+    /// than one key, and it is right to: an address written twice is an address that can be
+    /// updated once. So a list like `quoteRouteAssetKeys` holds `"external.sai"` rather than
+    /// `0x7E6f…`, and the address itself lives in exactly one place.
+    ///
+    /// Absent means "this deployment has none", which for the quote routes is the truthful
+    /// reading - no launch here is paired against anything but `QUOTE` - rather than a
+    /// misconfiguration to fail on.
+    function readAddressesByKeyList(string memory listKey) internal view returns (address[] memory out) {
         string memory json = book();
-        string memory path = string.concat(".", key);
+        string memory path = string.concat(".", listKey);
         if (!vm.keyExistsJson(json, path)) return new address[](0);
-        return vm.parseJsonAddressArray(json, path);
+
+        string[] memory keys = vm.parseJsonStringArray(json, path);
+        out = new address[](keys.length);
+        for (uint256 i; i < keys.length; ++i) {
+            out[i] = readAddress(keys[i]);
+        }
     }
 
     /// @dev Writes straight back into the book so the next script in the sequence can read it.

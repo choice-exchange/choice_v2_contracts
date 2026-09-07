@@ -426,7 +426,9 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
         BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(launchToken)), LAUNCH_ID);
         assertEq(route.legs, 1, "a wINJ-paired graduate needs exactly one leg");
-        assertEq(PoolId.unwrap(route.first.toId()), PoolId.unwrap(_launchKey().toId()), "that is not the graduated pool");
+        assertEq(
+            PoolId.unwrap(route.first.toId()), PoolId.unwrap(_launchKey().toId()), "that is not the graduated pool"
+        );
         assertEq(route.firstZeroForOne, address(launchToken) < address(quote), "the sell direction is wrong");
 
         (PoolKey memory unfiltered, address answering) = sink.launchPool(LAUNCH_ID);
