@@ -170,7 +170,7 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
             new InfinitySettler(ILaunchpadCore(address(core)), clPoolManager, posm, permit2, locker, guardHook, OWNER);
         assertEq(address(settler), predictedSettler, "settler address prediction is wrong");
 
-        // A0/D30: what tells the controller which pools are sprout graduates. On chain this is
+        // A0/D30: what tells the controller which pools are burnToken graduates. On chain this is
         // a timelock call after script 05, because the hook does not exist when the fee
         // controllers are deployed. Without it every graduation reverts - deliberately, see
         // `test_graduationRevertsWhileTheControllerHasNoLaunchPoolGate`.
@@ -494,7 +494,7 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     }
 
     // =====================================================================================
-    // A0 / D30 / D31 - Choice's revenue and sprout's never mix
+    // A0 / D30 / D31 - Choice's revenue and burnToken's never mix
     // =====================================================================================
 
     /// @dev The A0 "done when", read off the pool the way anyone auditing it would: the
@@ -504,7 +504,7 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
 
         (,, uint24 protocolFee, uint24 poolLpFee) = clPoolManager.getSlot0(_key().toId());
-        assertEq(protocolFee, 0, "a sprout graduate is charging Choice's protocol fee");
+        assertEq(protocolFee, 0, "a burnToken graduate is charging Choice's protocol fee");
         assertEq(poolLpFee, LP_FEE, "the LP leg is not the whole tier");
         assertEq(settler.lpFee(), LP_FEE, "the settler's configured LP fee drifted from the pool's");
     }

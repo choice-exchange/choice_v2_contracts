@@ -39,7 +39,7 @@ interface IOwnable {
 contract DeployFeeControllers is BaseScript {
     bytes32 internal constant DIRECT_SINK_SALT = keccak256("CHOICE-V2/DirectTransferBurnSink/1.0.0");
     bytes32 internal constant EXCHANGE_SINK_SALT = keccak256("CHOICE-V2/ExchangeSubaccountBurnSink/1.0.0");
-    // 1.1.0 carries `zeroLaunchPoolProtocolFee` (plan A0, tokenomics D30/D31): a sprout
+    // 1.1.0 carries `zeroLaunchPoolProtocolFee` (plan A0, tokenomics D30/D31): a launchpad
     // graduate pays Choice no protocol fee, so `protocolFeesAccrued` holds only Choice's own
     // revenue by construction.
     //
@@ -136,7 +136,7 @@ contract DeployFeeControllers is BaseScript {
     /// refuses rather than match a hookless key against `address(0)`.
     ///
     /// Deliberately loud. Failing closed is right - a graduate that quietly paid Choice's
-    /// protocol fee would put sprout's revenue into a global bucket nobody can ever unpick -
+    /// protocol fee would put the launchpad's revenue into a global bucket nobody can ever unpick -
     /// but it is only safe if the missing step is impossible to miss. `08_VerifyOwnership`
     /// checks the same thing at the end of a deploy.
     function _reportLaunchPoolGate(address clFeeController) internal {

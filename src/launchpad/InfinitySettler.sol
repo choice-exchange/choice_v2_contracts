@@ -31,7 +31,7 @@ import {LaunchPoolGuardHook} from "./LaunchPoolGuardHook.sol";
 import {PositionLocker} from "./PositionLocker.sol";
 
 /// @title InfinitySettler
-/// @notice Graduates a SHROOM launchpad launch onto a Choice v2 concentrated-liquidity pool,
+/// @notice Graduates a launchpad launch onto a Choice v2 concentrated-liquidity pool,
 /// in the same transaction that fills the curve (plan M4 / D14).
 ///
 /// `LaunchpadCore.triggerGraduation` moves both legs here and calls `settle`. This contract
@@ -279,7 +279,7 @@ contract InfinitySettler is IGraduationSettler, Ownable2Step {
 
     /// @dev Take Choice's protocol fee off this pool, in the graduation transaction itself.
     ///
-    /// **Why a graduate pays Choice nothing** (tokenomics D30/D31, plan A0). Sprout.fun and
+    /// **Why a graduate pays Choice nothing** (tokenomics D30/D31, plan A0). The launchpad and
     /// Choice are separate projects that share no money, and `ProtocolFees.protocolFeesAccrued`
     /// is ONE global bucket per currency across every pool in the manager - so a graduate's
     /// protocol fee and a wINJ/USDC pool's are indistinguishable by the time anyone can

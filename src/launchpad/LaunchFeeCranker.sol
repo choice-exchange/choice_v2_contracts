@@ -13,13 +13,13 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
 /// @title LaunchFeeCranker
 /// @notice One permissionless call that takes a graduated launch's accrued LP fees all the way
-/// to destroyed SPROUT.
+/// to a destroyed burn token.
 ///
 /// ## The problem this exists for
 ///
 /// **Trading a graduated pool does not burn anything by itself.** The LP fee accrues inside the
-/// locked full-range position automatically, and then it sits there. Turning it into burnt
-/// SPROUT is three separate permissionless calls:
+/// locked full-range position automatically, and then it sits there. Turning it into a burnt
+/// token is three separate permissionless calls:
 ///
 /// 1. `PositionLocker.collect(launchId)` - pull the fees out of the position and credit the
 ///    creator / launchpad split;
@@ -66,8 +66,8 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 /// - **It cost real money to keep, twice.** Sink 1.2.0 -> 1.3.0 forced cranker 1.0.0 -> 1.1.0
 ///   for no reason but this field. And because `LOCKER` is immutable too, one instance reaches
 ///   exactly one locker generation - so plan A9 had to deploy a *second cranker* rather than
-///   change a setting, and until it did, **SPROUT's own launch 15 had nothing scheduled to move
-///   its fees** while the keeper reported a healthy pass every fifteen minutes. Nothing was
+///   change a setting, and until it did, **the burn token's own launch had nothing scheduled to
+///   move its fees** while the keeper reported a healthy pass every fifteen minutes. Nothing was
 ///   broken and nothing said anything. That is the failure mode immutability produced.
 /// - **The comparison case is in the same repo.** `BuybackBurnSink.setLockers` is the identical
 ///   problem decided the other way, and it is why ONE sink serves both locker generations.
@@ -229,7 +229,7 @@ contract LaunchFeeCranker is Ownable2Step {
     ///
     /// @dev This is the setter that ends *"one instance reaches exactly one locker generation"*.
     /// Plan A9 had to deploy a second cranker because of it, and for as long as only one existed,
-    /// **SPROUT's own launch 15 had nothing scheduled to move its fees** while the keeper
+    /// **the burn token's own launch had nothing scheduled to move its fees** while the keeper
     /// reported a healthy pass every fifteen minutes.
     ///
     /// ⚠️ It moves this instance from one generation to the other; it does not serve both. The

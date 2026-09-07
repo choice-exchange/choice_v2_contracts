@@ -12,7 +12,7 @@ import {ILaunchpadCore} from "../../src/interfaces/ILaunchpadCore.sol";
 /// `extsload` and fixed word offsets, because the deployed core exposes no getter for either.
 /// A mock that stored those two fields in its own convenient layout would test nothing. So
 /// `Launch`, `LaunchGate` and `PoolKind` below are copied VERBATIM (field order and types)
-/// from `shroom_launchpad/contracts/src/LaunchpadCore.sol`, and twelve words of padding put
+/// from the launchpad repo's `contracts/src/LaunchpadCore.sol`, and twelve words of padding put
 /// the mapping at slot 12 exactly as in the real core. The compiler derives the packing, so
 /// if the settler's offsets are wrong these tests fail rather than agreeing with themselves.
 ///

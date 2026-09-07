@@ -14,8 +14,8 @@ import {BaseScript} from "./BaseScript.sol";
  * deployed once per LOCKER GENERATION (plan A9).
  *
  * Trading a graduated pool accrues fees inside a locked position and nothing else happens.
- * Turning them into destroyed SPROUT was three calls - `collect`, `claim` per currency, then the
- * sink's own leg - all permissionless by design, and named to nobody. This deploys the helper
+ * Turning them into a destroyed burn token was three calls - `collect`, `claim` per currency, then
+ * the sink's own leg - all permissionless by design, and named to nobody. This deploys the helper
  * that does all of it for a launch in one transaction.
  *
  * It takes no arguments a human has to get right: the locker and the sink come out of the
@@ -34,7 +34,7 @@ import {BaseScript} from "./BaseScript.sol";
  *
  * The cranker's `LOCKER` is immutable, so an instance reaches exactly one generation's launches
  * and the other's are invisible to it. That is not theoretical: the 1.0.0 locker holds launches
- * 13-17, **SPROUT's own launch 15 among them**, and for as long as one cranker existed those
+ * 13-17, **the burn token's own launch among them**, and for as long as one cranker existed those
  * fees had nothing scheduled to move them while the keeper's auto-crank ran every fifteen
  * minutes against the 1.1.0 locker and reported a healthy pass every time. Nothing was broken
  * and nothing said anything.

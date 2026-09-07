@@ -200,7 +200,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
     /// @notice Share of bought tokens destroyed; the remainder funds infrastructure. Free to
     /// move, but never below `MIN_BURN_BPS`.
-    /// @dev A floor, deliberately, and not a one-way ratchet. `SPROUT_TOKENOMICS.md` §11 argues
+    /// @dev A floor, deliberately, and not a one-way ratchet. The launchpad's own tokenomics argue
     /// that revenue is reflexive and that the burn share is what should flex when it falls, so
     /// the guarantee worth making is the floor rather than monotonicity.
     uint16 public burnBps;
@@ -500,7 +500,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     ///
     /// Permissionless, like everything else in this contract that only chooses WHEN: the pool
     /// comes off the chain, the bound is `maxImpactBps`, and the proceeds can only become `QUOTE`
-    /// in this contract and then SPROUT that is burnt.
+    /// in this contract and then `BURN_TOKEN` that is destroyed.
     ///
     /// 🔑 **Why the launch id needs no trust.** It selects a locked position; the position selects
     /// a `PoolKey`; and that key is then REQUIRED to trade exactly `{currency, QUOTE}`. A caller
@@ -882,7 +882,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// One setting serves every path, and `lockAcquired` divides it by the number of legs before
     /// calling this - so `bps` here is this leg's SHARE of the conversion's total allowance, not
     /// `maxImpactBps` itself. A conversion sells into a graduate's own pool, which is thinner
-    /// than SPROUT/wINJ rather than deeper, so a setting sized for the buyback is if anything
+    /// than the buyback pool rather than deeper, so a setting sized for the buyback is if anything
     /// conservative there - and a leg that hits its bound fills PARTIALLY and leaves the rest
     /// for the next window, exactly as an oversized buyback does.
     function _priceLimit(PoolKey memory key, bool zeroForOne, uint16 bps) private view returns (uint160) {
@@ -1009,8 +1009,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice A launch's real graduation pool key, whatever currencies it holds.
     /// @dev Unfiltered, unlike `conversionPool`: this one answers for a launch paired against
     /// something other than `QUOTE`, and for the burn token's own launch. That last case is the
-    /// point - `setBuybackPool` needs SPROUT's own graduation key, and reading it off SPROUT's
-    /// locked position is how a deploy script gets it without a human retyping a tier.
+    /// point - `setBuybackPool` needs the burn token's own graduation key, and reading it off that
+    /// token's locked position is how a deploy script gets it without a human retyping a tier.
     /// @return key Zero when no locker in the set knows this launch.
     /// @return locker Which locker answered, or the zero address.
     function launchPool(uint256 launchId) external view returns (PoolKey memory key, address locker) {

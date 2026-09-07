@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-/// @notice The subset of `shroom_launchpad`'s `LaunchpadCore` that Choice v2 calls, mirrored
+/// @notice The subset of the launchpad's `LaunchpadCore` that Choice v2 calls, mirrored
 /// from that repo's MIT-licensed `ILaunchpadCore` plus the `extsload` primitive the core
 /// exposes for its `LaunchpadViews` satellite.
 ///

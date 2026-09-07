@@ -167,7 +167,7 @@ contract DeployLaunchpadSettler is BaseScript {
         _printTimelockPayloads(guardHook, abi.encodeCall(LaunchPoolGuardHook.setInitializer, (settler, true)));
     }
 
-    /// @dev A0/D30. `settle` calls `ChoiceFeeController.zeroLaunchPoolProtocolFee` so a sprout
+    /// @dev A0/D30. `settle` calls `ChoiceFeeController.zeroLaunchPoolProtocolFee` so a launchpad
     /// graduate never pays into Choice's global `protocolFeesAccrued` bucket, and that function
     /// is gated on the pool key carrying this hook. The controller ships with the gate unset
     /// (it is deployed in script 02, before this hook exists) and refuses to run while it is,

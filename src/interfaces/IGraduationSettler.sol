@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-/// @notice The launchpad's graduation seam, mirrored from
-/// `shroom_launchpad/contracts/src/interfaces/IGraduationSettler.sol` (MIT, hence the
+/// @notice The launchpad's graduation seam, mirrored from that repo's
+/// `contracts/src/interfaces/IGraduationSettler.sol` (MIT, hence the
 /// identifier above rather than this repo's GPL). Copied rather than imported: the two repos
 /// are not submodules of one another and this is the entire surface between them.
 ///
