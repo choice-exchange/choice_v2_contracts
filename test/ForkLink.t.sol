@@ -60,15 +60,44 @@ contract ForkLinkTest is Test {
         }
     }
 
-    /// @dev Guards the one Injective-specific constant every consumer hardcodes.
-    function test_addressBookMatchesChainConstants() public view {
-        string memory book = vm.readFile("deployments/injective_testnet.json");
-        assertEq(vm.parseJsonUint(book, ".chainId"), 1439);
+    /// @dev Guards the constants every consumer hardcodes, on EVERY book rather than on
+    /// testnet's alone. This test used to read `injective_testnet.json` by name, which meant
+    /// it silently stopped covering the deployment the moment a second book existed
+    /// (MAINNET_READINESS C5) - the one moment its coverage mattered most. Both books are
+    /// named here, and each is checked against the chain id its own filename claims.
+    ///
+    /// Permit2, wINJ and the Arachnid CREATE2 deployer are canonical at the SAME address on
+    /// 1439 and 1776 - all three were read off both chains - so a book that disagrees has a
+    /// typo, not a different deployment.
+    function test_everyAddressBookMatchesChainConstants() public view {
+        _assertBookConstants("injective_testnet", 1439);
+        _assertBookConstants("injective_mainnet", 1776);
+    }
+
+    function _assertBookConstants(string memory network, uint256 chainId) internal view {
+        string memory book = vm.readFile(string.concat("deployments/", network, ".json"));
+
+        assertEq(vm.parseJsonUint(book, ".chainId"), chainId, string.concat(network, ": wrong chainId"));
+        assertEq(
+            vm.parseJsonString(book, ".network"), network, string.concat(network, ": name disagrees with filename")
+        );
         assertEq(
             vm.parseJsonAddress(book, ".external.permit2"),
             0x000000000022D473030F116dDEE9F6B43aC78BA3,
             "permit2 is canonical on Injective; nothing to deploy"
         );
         assertEq(vm.parseJsonAddress(book, ".external.wINJ"), 0x0000000088827d2d103ee2d9A6b781773AE03FfB);
+        assertEq(vm.parseJsonAddress(book, ".external.arachnidCreate2"), 0x4e59b44847b379578588920cA78FbF26c0B4956C);
+    }
+
+    /// @dev The two numbers that are decisions rather than facts, asserted so that changing
+    /// either is a visible diff in a test rather than a quiet edit to a JSON file.
+    /// CHOICE_V2_MAINNET_OPS.md §8, settled 2026-09-07: 3-of-5 on hardware wallets, 24 hours.
+    /// 🔴 The delay is also the UNPAUSE latency - unpausePoolManager is onlyOwner and the
+    /// timelock is the owner - so lowering it is a security decision in both directions.
+    function test_mainnetGovernanceNumbersAreTheDecidedOnes() public view {
+        string memory book = vm.readFile("deployments/injective_mainnet.json");
+        assertEq(vm.parseJsonUint(book, ".governance.timelockMinDelay"), 86_400, "mainnet timelock delay is 24h");
+        assertEq(vm.parseJsonUint(book, ".governance.safeThreshold"), 3, "mainnet Safe is 3-of-5");
     }
 }
