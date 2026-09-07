@@ -85,6 +85,41 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 /// launch id alongside the currency, and the sink reads the graduate's own locked position out of
 /// `PositionLocker` and takes the `PoolKey` the position manager holds for it. See `lockers`.
 ///
+/// ## The second leg - a launch paired against something other than `QUOTE` (D28/A2)
+///
+/// One swap only reaches `QUOTE` when the graduate's pool holds `QUOTE`. A launch paired against
+/// another quote asset - testnet's launch 19 is SAI-paired - has a pool that trades
+/// `{launchToken, SAI}`, and until now the sink refused it by name and both halves of its LP fee
+/// sat in the locker for ever. A full-range position earns in BOTH currencies, so that is not
+/// half the problem: the SAI half is not a launch token at all, and no launch id could resolve
+/// it.
+///
+/// So a conversion may now be TWO legs: the launch's own graduation pool to the pair asset, then
+/// a REGISTERED pool from that asset to `QUOTE`. Both happen inside one vault lock, so nothing
+/// lingers in between, and the second leg is registered per QUOTE ASSET rather than per launch -
+/// a handful of entries, ever.
+///
+/// 🔑 **Why the second leg is named by the owner, when A5's whole lesson was to stop naming
+/// things.** A5 derives a graduation pool safely because `LaunchPoolGuardHook` makes such a key
+/// UN-CREATEABLE by anyone but an allowlisted settler: derive the key, and the only pool that can
+/// exist at it is one a settler opened. An ordinary SAI/wINJ pool has no hook. Anybody may open a
+/// hookless pool at any key, at any price - so a DERIVED second leg would name a pool an attacker
+/// can create and price, and `maxImpactBps` could not save it, because the bound is measured
+/// against that pool's own spot. Letting the permissionless caller pass a key is the same hole
+/// with fewer steps. Deriving here is not merely unavailable; it is worse than useless.
+///
+/// And what a registered route IS, is `buybackPool` - the owner-named venue this contract has
+/// always had, for the same reason (liquidity moves; the sink should follow without a redeploy).
+/// It is NOT `conversionTier` coming back: that was a COPY of the settler's mutable config,
+/// describing a class of pools, and it went stale the moment a launch graduated on another tier.
+/// Nothing else in this system decides which pool trades SAI against wINJ.
+///
+/// ⚠️ **One composite impact bound, not one per leg.** `maxImpactBps` bounds the whole
+/// conversion, so a two-leg route gets half the allowance per leg. Giving each leg the full
+/// setting would silently let a two-leg conversion move prices twice as far at the same number,
+/// and an operator setting one guard is entitled to have it mean one thing. `MIN_IMPACT_BPS` rose
+/// from 2 to 4 for the same reason.
+///
 /// ## D32 - the hold allowlist
 ///
 /// Converting is the default, because the burn rate is what the floor above promises. But the
@@ -126,7 +161,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// pool's current sqrt price - which `CLPool.swap` rejects with `InvalidSqrtPriceLimit`.
     /// The `try/catch` makes that park rather than revert, but a guard that can never let a
     /// swap through is a misconfiguration, not a policy, so it is refused where it is set.
-    uint16 public constant MIN_IMPACT_BPS = 2;
+    ///
+    /// 🔴 **4, not 2, since conversions became two-legged.** `maxImpactBps` is a bound on the
+    /// WHOLE conversion, so a two-leg route splits it in half before `_priceLimit` halves it
+    /// again - and a setting of 2 or 3 would give the second leg a limit equal to its pool's
+    /// own price, which no swap can cross. Doubling the floor keeps "the smallest number that
+    /// is still a bound" true for the longest route this contract can build.
+    uint16 public constant MIN_IMPACT_BPS = 4;
 
     /// @notice Ceiling on how many position lockers `setLockers` will hold.
     /// @dev `_verifiedPool` walks them inside `convert`, so the list is a gas cost on the hot
@@ -242,6 +283,39 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice Whether an address is one of `lockers()`. Set membership, for callers and tests.
     mapping(address locker => bool allowed) public isLocker;
 
+    /// @notice How a quote asset that is not `QUOTE` reaches `QUOTE`. The second leg.
+    ///
+    /// @dev **This is the D28 edge closed, and it is a REGISTERED route rather than a derived
+    /// one. That is deliberate, and it is not A4's mistake repeating.**
+    ///
+    /// A5's lesson was that a pool key must be PROVEN rather than guessed, and it applies to a
+    /// graduation pool because `LaunchPoolGuardHook` makes those keys un-createable by anyone but
+    /// an allowlisted settler: derive a key, and the only pool that can exist at it is one a
+    /// settler opened. **An ordinary SAI/wINJ pool has no such hook.** Anyone may initialise a
+    /// hookless pool at any key, at any price they like - so a DERIVED second leg would name a
+    /// pool an attacker can create and price, and `maxImpactBps` would not save it, because the
+    /// bound is measured against that pool's own spot. Deriving is not merely unavailable here;
+    /// it is strictly worse than useless.
+    ///
+    /// Letting the CALLER pass the key fails the same way and more directly: `convert` is
+    /// permissionless, so a caller-chosen pool is a caller-chosen price, and the sink would sell
+    /// its SAI into a pool the caller had made. That is theft with extra steps.
+    ///
+    /// 🔑 **So the second leg is named by the owner - and the thing it is is `buybackPool`, not
+    /// `conversionTier`.** This contract already has exactly one owner-named venue: the pool the
+    /// buyback trades through, settable because "a deeper pool on another fee tier is the
+    /// expected upgrade path". A quote route is the same object for the same reason. What
+    /// `conversionTier` was, and what got it deleted, is a different thing: a COPY of the
+    /// settler's mutable config, describing a CLASS of pools, which drifted the moment a launch
+    /// graduated on another tier. A route cannot drift that way - no settler, locker or core
+    /// redeploy changes which pool trades SAI against wINJ. Only liquidity moving does, which is
+    /// the same maintenance `buybackPool` already carries.
+    ///
+    /// ⚠️ It is still config the owner can aim, and it should be read as governance. The bound
+    /// on it is the currency check in `setQuoteRoute`: a route may only ever trade the asset it
+    /// is registered for against `QUOTE`, so the owner chooses a VENUE, never a destination.
+    mapping(Currency asset => PoolKey key) internal _quoteRoutes;
+
     /// @notice D32. A launch token designated to accumulate here instead of being converted.
     /// @dev Also the gate on `sweep`: what is not held is burn revenue and cannot be taken out.
     mapping(Currency currency => bool held) public isHeld;
@@ -279,6 +353,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     error TooManyLockers(uint256 given, uint256 max);
     error DuplicateLocker(address locker);
     error LockerHasAnotherPositionManager(address locker);
+    error RouteMissingLeg(Currency asset);
 
     /// @param quoteSpent quote actually consumed; may be less than offered if the limit bound.
     event BoughtBack(uint256 quoteOffered, uint256 quoteSpent, uint256 tokensReceived);
@@ -297,9 +372,23 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     event BuybackPoolUpdated(PoolKey key, bool quoteIsCurrency0);
     event GuardsUpdated(uint256 minBuybackAmount, uint16 maxImpactBps, uint32 minBuybackInterval);
     event LockersUpdated(address[] lockers);
+    /// @param key the pool the asset reaches `QUOTE` through; a zero `poolManager` clears it.
+    event QuoteRouteUpdated(Currency indexed asset, PoolKey key, bool assetIsCurrency0);
     event HoldUpdated(Currency indexed currency, bool held);
     event MinConvertAmountUpdated(Currency indexed currency, uint256 amount);
     event TokenSwept(Currency indexed currency, address indexed to, uint256 amount);
+
+    /// @notice A resolved conversion path: one or two exact-input swaps ending in `QUOTE`.
+    /// @dev Fixed-size rather than an array, because this contract builds at most two legs and a
+    /// bounded shape is one less thing a lock callback can be handed too much of.
+    struct Route {
+        PoolKey first;
+        bool firstZeroForOne;
+        PoolKey second;
+        bool secondZeroForOne;
+        /// @dev 0 = no route, 1 = straight to `QUOTE`, 2 = through a registered quote route.
+        uint8 legs;
+    }
 
     uint8 private constant PARK_BELOW_MINIMUM = 0;
     uint8 private constant PARK_RATE_LIMITED = 1;
@@ -358,6 +447,18 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         } else if (isHeld[currency]) {
             // D32 first, so a held token reports the POLICY rather than the condition below it.
             emit Parked(currency, currency.balanceOfSelf(), PARK_HELD);
+        } else if (address(_quoteRoutes[currency].poolManager) != address(0)) {
+            // 🔑 A REGISTERED QUOTE ASSET needs no hint, because the route IS the lookup.
+            //
+            // This arm exists because a graduate's fees arrive in BOTH of its pool's currencies:
+            // a SAI-paired launch pays the launchpad part launch-token and part SAI, and the SAI
+            // half is not a launch token at all - no launch id would resolve it, and before the
+            // routes it parked here for ever with reason 6. Now it is one swap to `QUOTE` and on
+            // into the buyback, on a permissionless call with nothing passed in.
+            Route memory r;
+            (r.first, r.firstZeroForOne) = _routeFor(currency);
+            r.legs = 1;
+            _tryConvert(currency, r);
         } else {
             // A launch token. It PARKS here, and that is a deliberate consequence of A5.
             //
@@ -420,9 +521,9 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         }
         // Argument validation before state: a caller with a bad hint is told so even when the
         // tranche would have parked for an unrelated reason.
-        (PoolKey memory key, bool zeroForOne, bool found) = _verifiedPool(currency, launchId);
-        if (!found) revert LaunchDoesNotTrade(launchId, currency);
-        _tryConvert(currency, key, zeroForOne);
+        Route memory route = _resolveRoute(currency, launchId);
+        if (route.legs == 0) revert LaunchDoesNotTrade(launchId, currency);
+        _tryConvert(currency, route);
     }
 
     // -------------------------------------------------------------------------------------
@@ -458,7 +559,11 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // else's - reverts the sub-call and lands here instead of unwinding the harvest.
         bool swapped;
         _setLockOpen(true);
-        try VAULT.lock(abi.encode(buybackPool, quoteIsCurrency0, amountIn)) returns (bytes memory) {
+        Route memory route;
+        route.first = buybackPool;
+        route.firstZeroForOne = quoteIsCurrency0;
+        route.legs = 1;
+        try VAULT.lock(abi.encode(route, amountIn)) returns (bytes memory) {
             swapped = true;
         } catch {
             swapped = false;
@@ -506,7 +611,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// through a pool with a fee hook on it would not be taxed by that hook - the sink is not the
     /// hook here, but the graduation pool's guard hook registers `beforeInitialize` and nothing
     /// else, so there is no swap-time hook on this path at all.
-    function _tryConvert(Currency currency, PoolKey memory key, bool zeroForOne) private {
+    function _tryConvert(Currency currency, Route memory route) private {
         uint256 amountIn = currency.balanceOfSelf();
 
         // D32 first, so a held token reports the POLICY rather than whichever guard it happens
@@ -537,7 +642,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // returndata, so a pre-flight existence check is itself a way to revert.
         bool swapped;
         _setLockOpen(true);
-        try VAULT.lock(abi.encode(key, zeroForOne, amountIn)) returns (bytes memory) {
+        try VAULT.lock(abi.encode(route, amountIn)) returns (bytes memory) {
             swapped = true;
         } catch {
             swapped = false;
@@ -564,6 +669,56 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         _tryBuyback();
     }
 
+    /// @dev The whole path from `currency` to `QUOTE`, or `legs == 0` if there is none.
+    ///
+    /// Three answers, tried in this order, and the ORDER is the safety property:
+    ///
+    /// 1. **The launch's own graduation pool trades `{currency, QUOTE}`** - one leg, exactly as
+    ///    before A2. The anchored case: the pool was chosen by the settler at graduation and the
+    ///    locker remembers it, so nobody chose it here.
+    /// 2. **The launch's pool trades `{currency, X}` and `X` has a registered route to `QUOTE`**
+    ///    - two legs. The first is still the anchored graduation pool; only the LAST hop is
+    ///    owner-named, and it is named per quote asset rather than per launch.
+    /// 3. **`currency` itself has a registered route** - one leg. This is the SAI half of a
+    ///    SAI-paired launch's fee, which is not a launch token and which no hint can resolve.
+    ///
+    /// 🔑 Trying the launch's own pool FIRST means a registered route can never displace the
+    /// anchored path for a currency that has one. And it is why a launch's PAIR asset does not
+    /// accidentally get sold into the launch's own pool: `currency == SAI` matches the pool at
+    /// step 1, but the other side is the launch token, which is not `QUOTE` and has no route -
+    /// so step 1 declines, and step 3 sells it through the route the owner registered instead.
+    function _resolveRoute(Currency currency, uint256 launchId) internal view returns (Route memory route) {
+        (PoolKey memory launchKey, bool zeroForOne, bool found) = _launchPoolFor(currency, launchId);
+        if (found) {
+            Currency other = zeroForOne ? launchKey.currency1 : launchKey.currency0;
+            if (other == QUOTE) {
+                route.first = launchKey;
+                route.firstZeroForOne = zeroForOne;
+                route.legs = 1;
+                return route;
+            }
+            PoolKey memory hop = _quoteRoutes[other];
+            if (address(hop.poolManager) != address(0)) {
+                route.first = launchKey;
+                route.firstZeroForOne = zeroForOne;
+                (route.second, route.secondZeroForOne) = _routeFor(other);
+                route.legs = 2;
+                return route;
+            }
+        }
+
+        if (address(_quoteRoutes[currency].poolManager) != address(0)) {
+            (route.first, route.firstZeroForOne) = _routeFor(currency);
+            route.legs = 1;
+        }
+    }
+
+    /// @dev The registered hop for `asset`, and which way round it sells. Assumes it exists.
+    function _routeFor(Currency asset) private view returns (PoolKey memory key, bool zeroForOne) {
+        key = _quoteRoutes[asset];
+        zeroForOne = key.currency0 == asset;
+    }
+
     /// @dev The launch's own graduation pool, read off its locked position and then CHECKED.
     ///
     /// Two lookups and one assertion:
@@ -571,18 +726,24 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// 1. each locker in turn, until one has a position registered for `launchId`;
     /// 2. the position manager, for the `PoolKey` that position is in - authoritative, because it
     ///    is where the position actually sits and it was fixed at graduation;
-    /// 3. the key must trade exactly `{currency, QUOTE}`.
+    /// 3. the key must hold `currency` on one of its two sides.
     ///
-    /// Step 3 is what makes step 1's argument safe to accept from anybody. Without it a caller
-    /// could name a launch whose pool they had priced; with it, the only launch ids that route
-    /// are the ones whose pool holds the very currency being sold and the very currency this
-    /// sink buys back with.
+    /// Step 3 is what makes step 1's argument safe to accept from anybody. A caller who names the
+    /// wrong launch names a pool that does not hold the currency being sold, and gets nothing.
+    /// **No launch id routes a swap through a pool the caller chose**, because the caller does
+    /// not choose the pool - the settler did, at graduation, and the locker remembers.
+    ///
+    /// ⚠️ It used to require the OTHER side to be `QUOTE` as well. That check moved up into
+    /// `_resolveRoute`, which now decides between "this pool finishes the job" and "this pool is
+    /// the first of two legs". The safety property is unchanged: what bounded a caller's power
+    /// was always the currency being SOLD matching, and the destination is bounded separately -
+    /// by `QUOTE` being immutable, and by `setQuoteRoute` refusing a hop that does not end there.
     ///
     /// @return key The launch's real pool key; zero when nothing matched.
     /// @return zeroForOne True when `currency` is that pool's `currency0`, i.e. selling 0 -> 1.
     /// @return found False when no locker knows the launch, or when the pool it names does not
-    /// trade this pair. The caller decides whether that is a revert or a park.
-    function _verifiedPool(Currency currency, uint256 launchId)
+    /// hold this currency at all.
+    function _launchPoolFor(Currency currency, uint256 launchId)
         private
         view
         returns (PoolKey memory key, bool zeroForOne, bool found)
@@ -593,8 +754,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             if (tokenId == 0) continue;
 
             (PoolKey memory held,) = POSITION_MANAGER.getPoolAndPositionInfo(tokenId);
-            if (held.currency0 == currency && held.currency1 == QUOTE) return (held, true, true);
-            if (held.currency1 == currency && held.currency0 == QUOTE) return (held, false, true);
+            if (held.currency0 == currency) return (held, true, true);
+            if (held.currency1 == currency) return (held, false, true);
         }
     }
 
@@ -610,35 +771,81 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         if (msg.sender != address(VAULT)) revert NotVault();
         if (!_lockOpen()) revert LockNotOpen();
 
-        // The KEY travels with the call, because there are two legs now: the buyback trades
-        // `buybackPool` and a conversion trades the launch's own key. Everything
-        // downstream is identical, so they share one callback rather than one each.
-        (PoolKey memory key, bool zeroForOne, uint256 amountIn) = abi.decode(data, (PoolKey, bool, uint256));
-        // Read inside the lock rather than passed in, so a `getSlot0` that reverts - an
-        // uninitialised pool reached despite `setBuybackPool`'s check, or a conversion pool that
-        // was never opened at all - is caught by the caller's `try/catch` along with everything
-        // else, instead of escaping it.
-        uint160 limit = _priceLimit(key, zeroForOne);
+        // The ROUTE travels with the call. Every path this contract opens - a buyback, a
+        // one-leg conversion, a two-leg conversion through a registered quote route - is the
+        // same shape, so they share one callback rather than one each.
+        (Route memory route, uint256 amountIn) = abi.decode(data, (Route, uint256));
 
-        ICLPoolManager(address(key.poolManager))
-            .swap(
-                key,
-                ICLPoolManager.SwapParams({
-                    zeroForOne: zeroForOne,
-                    // Negative is exact-input. The pool consumes up to this much and stops at
-                    // `limit`, so a partial fill is the expected outcome, not an error.
-                    amountSpecified: -amountIn.toInt256(),
-                    sqrtPriceLimitX96: limit
-                }),
-                ""
-            );
+        // 🔑 ONE COMPOSITE BOUND, split across the legs, rather than one bound per leg.
+        //
+        // `maxImpactBps` is the operator's answer to "how far may a conversion push prices",
+        // and that number has to keep ONE meaning however long the route is. Giving each leg
+        // the full setting would silently let a two-leg conversion move twice as far as a
+        // one-leg one at the same setting - "a per-leg bound on a two-leg route is not the same
+        // protection". So the allowance is divided: a one-leg route is bounded exactly as it
+        // was before routes existed, and a two-leg route's two bounds sum to the same total.
+        //
+        // ⚠️ It is a bound on IMPACT, not on realised price: the swap fee sits on top of it on
+        // every leg, so a two-leg conversion pays two pools' fees. That is a cost of the route,
+        // not something a price limit can express, and `minConvertAmount` is the lever for it.
+        uint16 perLeg = maxImpactBps / route.legs;
+
+        uint256 amount = amountIn;
+        for (uint8 i; i < route.legs; ++i) {
+            PoolKey memory key = i == 0 ? route.first : route.second;
+            bool zeroForOne = i == 0 ? route.firstZeroForOne : route.secondZeroForOne;
+
+            // Read inside the lock rather than passed in, so a `getSlot0` that reverts - an
+            // uninitialised pool reached despite `setBuybackPool`'s check, or a route pool that
+            // has since been closed - is caught by the caller's `try/catch` along with
+            // everything else, instead of escaping it.
+            ICLPoolManager(address(key.poolManager))
+                .swap(
+                    key,
+                    ICLPoolManager.SwapParams({
+                        zeroForOne: zeroForOne,
+                        // Negative is exact-input. The pool consumes up to this much and stops
+                        // at the limit, so a partial fill is the expected outcome, not an error.
+                        amountSpecified: -amount.toInt256(),
+                        sqrtPriceLimitX96: _priceLimit(key, zeroForOne, perLeg)
+                    }),
+                    ""
+                );
+
+            if (i + 1 == route.legs) break;
+
+            // What the first leg produced, read off the vault's own ledger rather than the
+            // swap's return value: the delta is what the second leg can actually spend, and it
+            // absorbs anything a hook adjusted on the way. A leg that filled nothing leaves
+            // zero here and the route stops - the input stays owed and is settled below, so a
+            // dead second pool costs the tranche nothing but the gas.
+            Currency out = zeroForOne ? key.currency1 : key.currency0;
+            int256 credit = VAULT.currencyDelta(address(this), out);
+            if (credit <= 0) break;
+            // forge-lint: disable-next-line(unsafe-typecast) - guarded positive above.
+            amount = uint256(credit);
+        }
 
         // Debts before credits: the vault pays a credit out of real reserves, so taking first
         // can fail on a vault that is exactly funded. Same ordering as `ChoiceRouter`.
-        _settleDelta(key.currency0);
-        _settleDelta(key.currency1);
-        _takeDelta(key.currency0);
-        _takeDelta(key.currency1);
+        //
+        // Across BOTH legs, and the intermediate is the interesting one: leg 1 credits it and
+        // leg 2 owes it, so a route that consumed everything nets to zero here and neither call
+        // does anything. A second leg that filled only PARTIALLY leaves a positive remainder,
+        // which `_takeDelta` brings into this contract as a real balance - where the registered
+        // route makes it convertible again on the next call, rather than stranding it.
+        _settleDelta(route.first.currency0);
+        _settleDelta(route.first.currency1);
+        if (route.legs > 1) {
+            _settleDelta(route.second.currency0);
+            _settleDelta(route.second.currency1);
+        }
+        _takeDelta(route.first.currency0);
+        _takeDelta(route.first.currency1);
+        if (route.legs > 1) {
+            _takeDelta(route.second.currency0);
+            _takeDelta(route.second.currency1);
+        }
         return "";
     }
 
@@ -672,13 +879,15 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// so a pool already pushed off-market by an attacker moves the reference with it; the rate
     /// limit, not this, is what makes that unprofitable to farm.
     ///
-    /// One bound serves both legs. A conversion sells into a graduate's own pool, which is
-    /// thinner than SPROUT/wINJ rather than deeper, so a setting sized for the buyback is if
-    /// anything conservative there - and a conversion that hits the bound fills PARTIALLY and
-    /// leaves the rest for the next window, exactly as an oversized buyback does.
-    function _priceLimit(PoolKey memory key, bool zeroForOne) private view returns (uint160) {
+    /// One setting serves every path, and `lockAcquired` divides it by the number of legs before
+    /// calling this - so `bps` here is this leg's SHARE of the conversion's total allowance, not
+    /// `maxImpactBps` itself. A conversion sells into a graduate's own pool, which is thinner
+    /// than SPROUT/wINJ rather than deeper, so a setting sized for the buyback is if anything
+    /// conservative there - and a leg that hits its bound fills PARTIALLY and leaves the rest
+    /// for the next window, exactly as an oversized buyback does.
+    function _priceLimit(PoolKey memory key, bool zeroForOne, uint16 bps) private view returns (uint160) {
         (uint160 sqrtPriceX96,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
-        uint256 halfImpact = uint256(maxImpactBps) / 2;
+        uint256 halfImpact = uint256(bps) / 2;
         if (zeroForOne) {
             // 0 -> 1 walks the price DOWN.
             return FullMath.mulDiv(sqrtPriceX96, BPS_DENOMINATOR - halfImpact, BPS_DENOMINATOR).toUint160();
@@ -768,11 +977,20 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// for a held currency, which is the point: holding is meant to be visible from outside, not
     /// inferred from nothing happening. It also answers false for a hint that would revert, so a
     /// caller can tell a bad launch id from an empty balance without spending a transaction.
+    /// @notice The registered second leg for a quote asset, if it has one.
+    /// @return key The pool; zero when nothing is registered.
+    /// @return assetIsCurrency0 True when `asset` is that pool's `currency0`.
+    /// @return found Whether a route exists at all.
+    function quoteRoute(Currency asset) external view returns (PoolKey memory key, bool assetIsCurrency0, bool found) {
+        key = _quoteRoutes[asset];
+        found = address(key.poolManager) != address(0);
+        assetIsCurrency0 = found && key.currency0 == asset;
+    }
+
     function canConvert(Currency currency, uint256 launchId) external view returns (bool) {
         if (Currency.unwrap(currency) == address(BURN_TOKEN) || currency == QUOTE) return false;
         if (isHeld[currency]) return false;
-        (,, bool found) = _verifiedPool(currency, launchId);
-        if (!found) return false;
+        if (_resolveRoute(currency, launchId).legs == 0) return false;
         uint256 amountIn = currency.balanceOfSelf();
         uint64 last = lastConvertAt[currency];
         return amountIn > 0 && amountIn >= minConvertAmount[currency]
@@ -784,14 +1002,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// rather than infer it from a swap that did or did not happen. A zero `poolManager` means
     /// the hint does not resolve - either no locker knows the launch, or its pool does not trade
     /// this currency against `QUOTE`.
-    function conversionPool(Currency currency, uint256 launchId)
-        external
-        view
-        returns (PoolKey memory key, bool zeroForOne)
-    {
-        bool found;
-        (key, zeroForOne, found) = _verifiedPool(currency, launchId);
-        if (!found) return (key, false);
+    function conversionRoute(Currency currency, uint256 launchId) external view returns (Route memory) {
+        return _resolveRoute(currency, launchId);
     }
 
     /// @notice A launch's real graduation pool key, whatever currencies it holds.
@@ -923,6 +1135,59 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
         _lockers = newLockers;
         emit LockersUpdated(newLockers);
+    }
+
+    /// @notice Register the pool a quote asset reaches `QUOTE` through - the second leg.
+    ///
+    /// @param asset The quote asset a launch may be paired against. Neither leg of the buyback
+    /// is accepted: `QUOTE` is already the destination and the burn token has its own path.
+    /// @param key The pool. A zero `poolManager` CLEARS the route, which is the only way to
+    /// remove one - so retiring a venue is an explicit call that emits, never an omission.
+    ///
+    /// @dev 🔑 **Why this is registered and not derived.** A5 proved a graduation pool's key
+    /// rather than guessing it, and that works there because `LaunchPoolGuardHook` makes such a
+    /// key un-createable by anyone but an allowlisted settler. An ordinary SAI/wINJ pool has no
+    /// hook: anyone may open a hookless pool at any key, at any price. A derived second leg
+    /// would therefore name a pool an ATTACKER can create and price, and `maxImpactBps` would
+    /// not help, because it is measured against that pool's own spot. Deriving is not merely
+    /// unavailable here - it is worse than useless. Letting the permissionless caller pass a key
+    /// is the same hole with fewer steps.
+    ///
+    /// 🔑 **And it is the same object as `buybackPool`, not a return of `conversionTier`.** This
+    /// contract has always had one owner-named venue, for the same reason: liquidity moves and
+    /// the sink should follow it without a redeploy. `conversionTier` was different in kind - a
+    /// COPY of the settler's mutable config, describing a class of pools rather than naming one,
+    /// which went stale the moment a launch graduated on another tier. Nothing else in this
+    /// system decides which pool trades SAI against wINJ, so there is nothing for this to drift
+    /// from.
+    ///
+    /// The two checks are what keep it a choice of VENUE rather than of destination:
+    ///
+    /// - the key must trade exactly `{asset, QUOTE}`, so a route can only ever end where the
+    ///   buyback spends. The owner cannot point revenue at a third currency.
+    /// - the pool must be initialised, so a key on a tier nobody has opened is refused here,
+    ///   where the error names the cause, rather than parking every tranche silently.
+    function setQuoteRoute(Currency asset, PoolKey calldata key) external onlyOwner {
+        if (Currency.unwrap(asset) == address(BURN_TOKEN) || asset == QUOTE) {
+            revert NotAConvertibleCurrency(asset);
+        }
+
+        if (address(key.poolManager) == address(0)) {
+            delete _quoteRoutes[asset];
+            PoolKey memory cleared;
+            emit QuoteRouteUpdated(asset, cleared, false);
+            return;
+        }
+
+        bool assetFirst = key.currency0 == asset && key.currency1 == QUOTE;
+        bool quoteFirst = key.currency1 == asset && key.currency0 == QUOTE;
+        if (!assetFirst && !quoteFirst) revert RouteMissingLeg(asset);
+
+        (uint160 sqrtPriceX96,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
+        if (sqrtPriceX96 == 0) revert PoolNotInitialised();
+
+        _quoteRoutes[asset] = key;
+        emit QuoteRouteUpdated(asset, key, assetFirst);
     }
 
     /// @notice D32. Designate a launch token to accumulate here instead of being converted.

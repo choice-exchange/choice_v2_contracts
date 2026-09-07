@@ -54,6 +54,8 @@ contract BuybackBurnSinkTest is Test {
     uint256 internal constant STRAGGLER_LAUNCH = 14;
     /// The tier that launch graduated on, which is NOT the one anything graduates on today.
     uint24 internal constant OLD_FEE = 6722;
+    /// A launch paired against a quote asset that is not `QUOTE`. Testnet's launch 19.
+    uint256 internal constant SAI_LAUNCH = 19;
 
     Vault internal vault;
     CLPoolManager internal manager;
@@ -73,6 +75,12 @@ contract BuybackBurnSinkTest is Test {
     /// straggler the derived tier could not reach.
     MockERC20 internal straggler;
 
+    /// A second quote asset - testnet's SAI - and a launch paired against it. This is testnet
+    /// launch 19 in miniature: it graduates fine, its fees collect and claim fine, and until a
+    /// route exists the sink can do nothing with either half of them.
+    MockERC20 internal sai;
+    MockERC20 internal pre2e;
+
     /// The real guard hook. It no longer gates the conversion (a locked position does), but it
     /// is still what a graduation pool is keyed to, so the fixture pools carry it.
     LaunchPoolGuardHook internal guardHook;
@@ -88,6 +96,12 @@ contract BuybackBurnSinkTest is Test {
     PoolKey internal memePool;
     PoolKey internal meme2Pool;
     PoolKey internal stragglerPool;
+    /// The SAI-paired graduate's own pool - guard-hooked, like every graduation pool.
+    PoolKey internal saiLaunchPool;
+    /// 🔴 And the second leg: an ORDINARY SAI/wINJ pool with NO HOOK. That is the whole reason
+    /// this one has to be registered rather than derived - anyone can open a hookless pool at
+    /// any key, at any price, so a derived second leg would name a pool an attacker can create.
+    PoolKey internal saiQuotePool;
 
     function setUp() public {
         vault = new Vault();
@@ -101,6 +115,8 @@ contract BuybackBurnSinkTest is Test {
         meme = new MockERC20("Launch", "LAUNCH", 18);
         meme2 = new MockERC20("Launch Two", "LAUNCH2", 18);
         straggler = new MockERC20("Old Launch", "OLD", 18);
+        sai = new MockERC20("SAI", "SAI", 18);
+        pre2e = new MockERC20("SAI-paired Launch", "PRE2E", 18);
         guardHook = new LaunchPoolGuardHook(address(this), address(this));
 
         posm = new MockPositionManager();
@@ -124,11 +140,19 @@ contract BuybackBurnSinkTest is Test {
         stragglerPool = _graduationKey(straggler, OLD_FEE);
         _seed(stragglerPool, 100_000 ether);
 
+        // Launch 19's shape: the graduate trades against SAI, and SAI reaches wINJ through an
+        // ordinary pool nobody's settler opened.
+        saiLaunchPool = _pairKey(pre2e, sai, FEE);
+        _seed(saiLaunchPool, 100_000 ether);
+        saiQuotePool = _key(sai, quote, FEE);
+        _seed(saiQuotePool, 500_000 ether);
+
         // The chain a launch id walks: locker says which position, position manager says which
         // pool. Registered here rather than derived, which is the whole of A5.
         _lock(MEME_LAUNCH, 1, memePool);
         _lock(MEME2_LAUNCH, 2, meme2Pool);
         _lock(STRAGGLER_LAUNCH, 3, stragglerPool);
+        _lock(SAI_LAUNCH, 4, saiLaunchPool);
 
         vm.startPrank(TIMELOCK);
         sink.setBuybackPool(pool);
@@ -302,10 +326,11 @@ contract BuybackBurnSinkTest is Test {
     /// launch's LOCKED POSITION and takes the key that position is actually in. Checked here
     /// against the pool that exists, by its id.
     function test_theConversionPoolIsReadOffTheLockedPosition() public view {
-        (PoolKey memory found, bool zeroForOne) = sink.conversionPool(Currency.wrap(address(meme)), MEME_LAUNCH);
+        BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(meme)), MEME_LAUNCH);
 
-        assertEq(PoolId.unwrap(found.toId()), PoolId.unwrap(memePool.toId()), "that is not the graduated pool");
-        assertEq(zeroForOne, address(meme) < address(quote), "the sell direction is wrong");
+        assertEq(route.legs, 1, "a QUOTE-paired graduate needs exactly one leg");
+        assertEq(PoolId.unwrap(route.first.toId()), PoolId.unwrap(memePool.toId()), "that is not the graduated pool");
+        assertEq(route.firstZeroForOne, address(meme) < address(quote), "the sell direction is wrong");
     }
 
     /// 🔴 **The regression A5 exists for.** A launch that graduated on an earlier fee tier used
@@ -321,8 +346,8 @@ contract BuybackBurnSinkTest is Test {
         uint256 supplyBefore = sprout.totalSupply();
         straggler.mint(address(sink), 100 ether);
 
-        (PoolKey memory found,) = sink.conversionPool(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
-        assertEq(found.fee, OLD_FEE, "the sink did not follow the launch onto its own tier");
+        BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
+        assertEq(route.first.fee, OLD_FEE, "the sink did not follow the launch onto its own tier");
 
         sink.convert(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
 
@@ -838,20 +863,238 @@ contract BuybackBurnSinkTest is Test {
         assertEq(sprout.balanceOf(address(sink)), 10 ether, "a refused call moved something anyway");
     }
 
+    // ── the second leg: a launch paired against another quote asset (D28/A2) ──
+
+    /// 🔴 **The gap this closes, stated as a before and after.** Testnet launch 19 is
+    /// SAI-paired: it graduated fine, its fees collect and claim fine, and the sink then refused
+    /// them, having no second leg from SAI to wINJ. Both halves of its LP fee sat.
+    function test_aSaiPairedGraduateIsRefusedUntilARouteExistsAndThenBurns() public {
+        Currency pre2eCurrency = Currency.wrap(address(pre2e));
+        pre2e.mint(address(sink), 100 ether);
+
+        // BEFORE. A named revert, not a silent park - the caller is told what is missing.
+        assertEq(sink.conversionRoute(pre2eCurrency, SAI_LAUNCH).legs, 0, "there should be no route yet");
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.LaunchDoesNotTrade.selector, SAI_LAUNCH, pre2eCurrency));
+        sink.convert(pre2eCurrency, SAI_LAUNCH);
+
+        // AFTER. One owner call, naming a venue rather than a destination.
+        vm.prank(TIMELOCK);
+        sink.setQuoteRoute(Currency.wrap(address(sai)), saiQuotePool);
+
+        BuybackBurnSink.Route memory route = sink.conversionRoute(pre2eCurrency, SAI_LAUNCH);
+        assertEq(route.legs, 2, "a SAI-paired graduate needs two legs");
+        assertEq(
+            PoolId.unwrap(route.first.toId()),
+            PoolId.unwrap(saiLaunchPool.toId()),
+            "the first leg must be the launch's OWN pool, still derived from its locked position"
+        );
+        assertEq(
+            PoolId.unwrap(route.second.toId()),
+            PoolId.unwrap(saiQuotePool.toId()),
+            "the second leg must be the registered route"
+        );
+
+        uint256 supplyBefore = sprout.totalSupply();
+        sink.convert(pre2eCurrency, SAI_LAUNCH);
+
+        assertEq(pre2e.balanceOf(address(sink)), 0, "the launch token did not convert");
+        assertEq(sai.balanceOf(address(sink)), 0, "the intermediate should not linger in the sink");
+        assertLt(sprout.totalSupply(), supplyBefore, "a SAI-paired graduate's revenue never reached the burn");
+    }
+
+    /// 🔑 **The other half of a SAI-paired launch's fee, and it needs no hint at all.** A
+    /// full-range position earns in BOTH currencies, so the launchpad's share of launch 19 is
+    /// part PRE2E and part SAI - and SAI is not a launch token, so no launch id resolves it. It
+    /// used to park with reason 6 for ever. A registered route IS the lookup, so `burn` alone
+    /// moves it.
+    function test_thePairAssetHalfOfTheFeeConvertsWithNoLaunchId() public {
+        Currency saiCurrency = Currency.wrap(address(sai));
+        sai.mint(address(sink), 500 ether);
+
+        // BEFORE: it parks, and says exactly why.
+        vm.expectEmit(true, false, false, true, address(sink));
+        emit BuybackBurnSink.Parked(saiCurrency, 500 ether, 6);
+        sink.burn(saiCurrency, 0);
+        assertEq(sai.balanceOf(address(sink)), 500 ether, "a parked tranche must stay put");
+
+        vm.prank(TIMELOCK);
+        sink.setQuoteRoute(saiCurrency, saiQuotePool);
+
+        uint256 supplyBefore = sprout.totalSupply();
+        sink.burn(saiCurrency, 0);
+
+        assertEq(sai.balanceOf(address(sink)), 0, "the pair asset did not convert");
+        assertLt(sprout.totalSupply(), supplyBefore, "the pair asset's revenue never reached the burn");
+    }
+
+    /// ⚠️ **The registered route chooses a VENUE, never a destination.** Both checks in
+    /// `setQuoteRoute` exist so that the owner's one lever cannot point revenue anywhere but
+    /// `QUOTE`, which is immutable.
+    function test_aRouteCannotRedirectRevenueAnywhereButQuote() public {
+        Currency saiCurrency = Currency.wrap(address(sai));
+
+        // A pool that does not touch QUOTE at all.
+        PoolKey memory elsewhere = _key(sai, stray, FEE);
+        _seed(elsewhere, 10_000 ether);
+        vm.prank(TIMELOCK);
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.RouteMissingLeg.selector, saiCurrency));
+        sink.setQuoteRoute(saiCurrency, elsewhere);
+
+        // A pool that trades the right pair on a tier nobody has opened. It would install
+        // cleanly and then park every tranche, so it is refused where the error names the cause.
+        PoolKey memory unopened = _key(sai, quote, 3000);
+        vm.prank(TIMELOCK);
+        vm.expectRevert(BuybackBurnSink.PoolNotInitialised.selector);
+        sink.setQuoteRoute(saiCurrency, unopened);
+
+        // And neither leg of the buyback is a routable asset: they have their own paths.
+        vm.startPrank(TIMELOCK);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(quote)))
+        );
+        sink.setQuoteRoute(Currency.wrap(address(quote)), saiQuotePool);
+        vm.expectRevert(
+            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(sprout)))
+        );
+        sink.setQuoteRoute(Currency.wrap(address(sprout)), saiQuotePool);
+        vm.stopPrank();
+    }
+
+    /// Only the owner can name a venue, and retiring one is an explicit call that emits.
+    function test_onlyTheOwnerRoutes_andClearingRestoresTheRefusal() public {
+        Currency saiCurrency = Currency.wrap(address(sai));
+
+        vm.prank(STRANGER);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
+        sink.setQuoteRoute(saiCurrency, saiQuotePool);
+
+        vm.prank(TIMELOCK);
+        sink.setQuoteRoute(saiCurrency, saiQuotePool);
+        (,, bool found) = sink.quoteRoute(saiCurrency);
+        assertTrue(found, "the route did not install");
+        assertEq(sink.conversionRoute(Currency.wrap(address(pre2e)), SAI_LAUNCH).legs, 2, "two legs expected");
+
+        PoolKey memory cleared;
+        vm.prank(TIMELOCK);
+        sink.setQuoteRoute(saiCurrency, cleared);
+        (,, found) = sink.quoteRoute(saiCurrency);
+        assertFalse(found, "a zero poolManager must clear the route");
+        assertEq(
+            sink.conversionRoute(Currency.wrap(address(pre2e)), SAI_LAUNCH).legs,
+            0,
+            "clearing a route must restore the refusal rather than leaving a stale path"
+        );
+    }
+
+    /// 🔑 **`maxImpactBps` keeps ONE meaning however long the route is.** Giving each leg the
+    /// full setting would silently let a two-leg conversion move prices twice as far as a
+    /// one-leg one at the same number, so the allowance is SPLIT: two legs get half each, and
+    /// the two moves sum to what one leg alone is allowed.
+    ///
+    /// Measured on the pools themselves, either side of a conversion far too large to fill.
+    function test_theImpactBoundIsSplitAcrossTheLegsRatherThanAppliedTwice() public {
+        vm.startPrank(TIMELOCK);
+        sink.setGuards(1 ether, 500, INTERVAL);
+        sink.setQuoteRoute(Currency.wrap(address(sai)), saiQuotePool);
+        vm.stopPrank();
+
+        // A one-leg conversion may walk its pool by the FULL 500 bps of sqrt price (250 either
+        // side of the halving `_priceLimit` does).
+        uint160 memeBefore = _sqrtPrice(memePool);
+        meme.mint(address(sink), 10_000_000 ether);
+        sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
+        uint256 oneLegMoveBps = _moveBps(memeBefore, _sqrtPrice(memePool));
+
+        // A two-leg conversion gets 250 bps per leg instead.
+        uint160 launchBefore = _sqrtPrice(saiLaunchPool);
+        uint160 routeBefore = _sqrtPrice(saiQuotePool);
+        pre2e.mint(address(sink), 10_000_000 ether);
+        sink.convert(Currency.wrap(address(pre2e)), SAI_LAUNCH);
+        uint256 legOneMoveBps = _moveBps(launchBefore, _sqrtPrice(saiLaunchPool));
+        uint256 legTwoMoveBps = _moveBps(routeBefore, _sqrtPrice(saiQuotePool));
+
+        // `memePool` and `saiLaunchPool` are the same shape - same tier, same spacing, both
+        // seeded with 100,000 - and both are fed the same oversized tranche, so the two numbers
+        // are directly comparable. That comparison IS the claim: the same setting gives a leg of
+        // a two-leg route half of what it gives a one-leg conversion.
+        assertApproxEqAbs(oneLegMoveBps, 250, 1, "a one-leg conversion should walk to its full allowance");
+        assertApproxEqAbs(legOneMoveBps, 125, 1, "leg one of two should get half the allowance");
+
+        // Leg two's share is a CEILING, not a target: leg one stopped at its own bound, so what
+        // reached the route pool was far too small to walk it 125 bps. What must hold is that it
+        // could not have gone further even if it were.
+        assertLe(legTwoMoveBps, 126, "leg two exceeded its share of the allowance");
+        assertLe(
+            legOneMoveBps + legTwoMoveBps,
+            oneLegMoveBps + 1,
+            "two legs must not be allowed to move prices further in total than one"
+        );
+    }
+
+    /// ⚠️ **A launch's PAIR asset must never be sold into the launch's own pool.** `convert(SAI,
+    /// 19)` matches launch 19's pool - SAI is one of its two currencies - but selling SAI there
+    /// buys the launch token, which is backwards. The resolution order is what prevents it: the
+    /// launch's pool is tried first and DECLINES, because the other side is neither `QUOTE` nor
+    /// a routable asset, and the registered route then takes it.
+    function test_thePairAssetIsNeverSoldIntoTheLaunchsOwnPool() public {
+        vm.prank(TIMELOCK);
+        sink.setQuoteRoute(Currency.wrap(address(sai)), saiQuotePool);
+
+        BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(sai)), SAI_LAUNCH);
+        assertEq(route.legs, 1, "the pair asset takes its route, not two hops through the launch");
+        assertEq(
+            PoolId.unwrap(route.first.toId()),
+            PoolId.unwrap(saiQuotePool.toId()),
+            "the pair asset was routed through the launch's own pool"
+        );
+
+        uint160 launchPriceBefore = _sqrtPrice(saiLaunchPool);
+        sai.mint(address(sink), 100 ether);
+        sink.convert(Currency.wrap(address(sai)), SAI_LAUNCH);
+        assertEq(_sqrtPrice(saiLaunchPool), launchPriceBefore, "the launch's own pool was traded");
+    }
+
+    /// The anchored path wins. A launch token that somehow also had a route registered still
+    /// converts through the pool its settler opened, because that is the one nobody chose.
+    function test_theLaunchsOwnPoolIsPreferredOverARegisteredRoute() public {
+        PoolKey memory rival = _key(meme, quote, OLD_FEE);
+        _seed(rival, 50_000 ether);
+
+        vm.prank(TIMELOCK);
+        sink.setQuoteRoute(Currency.wrap(address(meme)), rival);
+
+        BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(meme)), MEME_LAUNCH);
+        assertEq(route.legs, 1, "one leg either way");
+        assertEq(
+            PoolId.unwrap(route.first.toId()),
+            PoolId.unwrap(memePool.toId()),
+            "a registered route displaced the launch's own anchored pool"
+        );
+    }
+
     // ── guards that fail where they are set, not where they bite ───────────
 
     /// `_priceLimit` halves the setting, so 0 and 1 both produce a bound equal to the pool's
     /// own price - which no swap can cross. This was the value a sink carried before
     /// `setGuards` had ever been called.
+    ///
+    /// 🔴 The floor is **4** since conversions became two-legged, not 2. `maxImpactBps` bounds
+    /// the WHOLE conversion, so a two-leg route halves it before `_priceLimit` halves it again -
+    /// and at 2 or 3 the second leg's limit would truncate to its pool's own price. The floor
+    /// has to be the smallest number that is still a bound on the LONGEST route this contract
+    /// can build, or the guard would be real for one-leg conversions and vacuous for two.
     function test_anImpactGuardBelowItsFloorIsRefused() public {
+        uint16 floor = sink.MIN_IMPACT_BPS();
+        assertEq(floor, 4, "the floor must cover the two-leg split");
+
         vm.startPrank(TIMELOCK);
-        for (uint16 bps = 0; bps < 2; bps++) {
-            vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.ImpactBpsTooLow.selector, bps, uint16(2)));
+        for (uint16 bps = 0; bps < floor; bps++) {
+            vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.ImpactBpsTooLow.selector, bps, floor));
             sink.setGuards(1 ether, bps, INTERVAL);
         }
-        sink.setGuards(1 ether, 2, INTERVAL); // the floor itself is fine
+        sink.setGuards(1 ether, floor, INTERVAL); // the floor itself is fine
         vm.stopPrank();
-        assertEq(sink.maxImpactBps(), 2);
+        assertEq(sink.maxImpactBps(), floor);
     }
 
     /// D20 is answered by the rate limit, so the rate limit is not optional.
@@ -1078,6 +1321,16 @@ contract BuybackBurnSinkTest is Test {
             fee: fee,
             parameters: _graduationParameters()
         });
+    }
+
+    function _sqrtPrice(PoolKey memory key) internal view returns (uint160 sqrtPriceX96) {
+        (sqrtPriceX96,,,) = manager.getSlot0(key.toId());
+    }
+
+    /// How far a pool's sqrt price moved, in basis points, either direction.
+    function _moveBps(uint160 before, uint160 present) internal pure returns (uint256) {
+        uint256 diff = present > before ? present - before : before - present;
+        return diff * 10_000 / uint256(before);
     }
 
     function _seed(PoolKey memory key, uint256 amount) internal {

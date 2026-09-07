@@ -49,7 +49,7 @@ contract DeployBuybackBurnSink is BaseScript {
     /// ⚠️ It also needs the timelock to `setLockers` before any launch token can convert, and to
     /// repoint `PositionLocker.launchpadTreasury` at the new address on EVERY live locker - the
     /// old sink keeps whatever is parked in it until it is swept.
-    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.2.0");
+    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.3.0");
 
     /// TEST values (§9.3). ⛔ Not mainnet's: the floor is immutable and one shot, and B2 puts it
     /// at 5000 with `burnBps` 7000. 8000/8000 is what the testnet sink it replaces carries, kept
@@ -116,6 +116,7 @@ contract DeployBuybackBurnSink is BaseScript {
         _requireLockers(sink);
         _requireGuards(sink);
         _requireBuybackPool(sink);
+        _reportQuoteRoutes(sink);
 
         console.log("");
         if (outstanding == 0) {
@@ -157,6 +158,36 @@ contract DeployBuybackBurnSink is BaseScript {
             console.log("           want", wanted[i]);
         }
         _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setLockers, (wanted)));
+    }
+
+    /// @dev A2/D28. Which quote assets can currently reach `QUOTE`, and which cannot.
+    ///
+    /// A launch paired against an asset with no registered route collects and claims exactly as
+    /// it should, and the sink then refuses BOTH halves of its fee - the launch token by name,
+    /// and the pair asset because nothing knows where to sell it. Neither is stranded and neither
+    /// is silent, but neither burns either, so this belongs on the same list as the other three.
+    ///
+    /// ⚠️ It REPORTS rather than requiring, deliberately. A route names an ordinary pool that
+    /// nobody's settler opened, so there is nothing on chain for this script to derive it from
+    /// and nothing safe to guess - which is the whole reason the route is registered in the first
+    /// place. `choice.quoteRouteAssetKeys` in the address book is the operator's list of assets
+    /// that SHOULD have one; the pool key itself is supplied when the timelock call is made.
+    ///
+    /// 🔑 It holds BOOK KEYS (`"external.sai"`), not addresses. CI refuses a book in which one
+    /// address appears under two keys, and rightly: an address written twice is an address that
+    /// can be updated once.
+    function _reportQuoteRoutes(address sink) internal view {
+        address[] memory assets = readAddressesByKeyList("choice.quoteRouteAssetKeys");
+        if (assets.length == 0) {
+            console.log("  [note] no quoteRouteAssetKeys in the address book.");
+            console.log("           A launch paired against anything but QUOTE will park both halves");
+            console.log("           of its LP fee until setQuoteRoute names a pool. See plan A2/D28.");
+            return;
+        }
+        for (uint256 i; i < assets.length; ++i) {
+            (,, bool found) = BuybackBurnSink(payable(sink)).quoteRoute(Currency.wrap(assets[i]));
+            console.log(found ? "  [ok]   quote route" : "  [TODO] quote route MISSING for", assets[i]);
+        }
     }
 
     /// @dev The live locker, plus any superseded one still holding graduated positions.

@@ -41,8 +41,11 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployLaunchFeeCranker is BaseScript {
-    /// 1.0.0 is plan A6. 🔴 Bump this whenever the sink's salt moves - see the header.
-    bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/1.0.0");
+    /// 1.1.0 is plan A6 against sink 1.3.0. 🔴 Bump this whenever the sink's salt moves - see
+    /// the header. It moved for A2: the sink gained `setQuoteRoute` and a two-leg `convert`, and
+    /// this contract's `SINK` is immutable, so an instance pointed at 1.2.0 would keep driving
+    /// the superseded sink for ever while every document said the second leg was live.
+    bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/1.1.0");
 
     function run() public {
         Create3Factory factory = Create3Factory(readAddress("governance.create3Factory"));
@@ -53,7 +56,7 @@ contract DeployLaunchFeeCranker is BaseScript {
         requireCode("buybackBurnSink", sink);
 
         address cranker = factory.computeAddress(CRANKER_SALT);
-        console.log("LaunchFeeCranker 1.0.0 ->", cranker);
+        console.log("LaunchFeeCranker 1.1.0 ->", cranker);
 
         if (cranker.code.length == 0) {
             // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments

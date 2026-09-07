@@ -56,12 +56,18 @@ GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
 # so carrying 1.0.0's $DEPLOYER forward would fail with a bytecode mismatch that reads like a
 # compiler-settings problem.
 SPROUT=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
-# 🔴 The LIVE sink is 1.2.0 (plan A5). 1.1.0 stays verified and in this list: it is still
-# deployed, still timelock-owned, and a superseded contract that reads as unverified is exactly
-# how a reader concludes the wrong one is current.
-BBSINK=0xd8aDFa9E13d9116914837A381392EE2EEf595d4B
+# 🔴 The LIVE sink is 1.3.0 (plan A2 - quote routes and the two-leg conversion). 1.2.0 and 1.1.0
+# stay verified and in this list: both are still deployed and still timelock-owned, and a
+# superseded contract that reads as unverified is exactly how a reader concludes the wrong one is
+# current. ⚠️ Only 1.3.0 is fed - B6 repointed BOTH lockers' `launchpadTreasury` at it.
+BBSINK=0x4435DD1a7f61FEfFc00d9283855c9Cc42D29c96D
+BBSINK_120=0xd8aDFa9E13d9116914837A381392EE2EEf595d4B
 BBSINK_110=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
-CRANKER=0x4Ffcd7a35A041A4a776C38417cde2CAb80f9c15d
+# 🔴 The cranker moves in LOCKSTEP with the sink: its `SINK` is immutable and it calls functions
+# that only exist from a given sink version, so 1.3.0's sink forced cranker 1.1.0. 1.0.0 stays
+# listed for the same reason the old sinks do - it is deployed, and it drives the 1.2.0 sink.
+CRANKER=0x5A1702665EFF2C6A94053518cc26d3c2D1c6f576
+CRANKER_100=0x4Ffcd7a35A041A4a776C38417cde2CAb80f9c15d
 # ⚠️ The 1.0.0 PUSH locker 0x9b28F31B… is NOT in the manifest and is deliberately left out even
 # though A5 made it load-bearing again (it holds launches 13-17 and is in the sink's locker set).
 # It is already verified on Blockscout, it was deployed before this manifest existed, and its
@@ -107,8 +113,10 @@ MANIFEST=(
 # be reused for it; a stale copy would fail with a bytecode mismatch reading like a compiler
 # settings problem.
 "$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
+"$BBSINK_120|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
 "$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"
 "$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK)"
+"$CRANKER_100|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK_120)"
 # 🔴 ONE argument: a static `RouterParameters` struct, so it encodes as 12 flat words with NO
 # offset head — which is why the whole thing is a single parenthesised tuple here rather than a
 # list of scalars. Confirmed byte-identical (all 384) against the bytes actually deployed:
