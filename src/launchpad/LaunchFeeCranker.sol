@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.26;
 
+import {Ownable2Step, Ownable} from "@openzeppelin/contracts/access/Ownable2Step.sol";
+
 import {Currency} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
 import {BuybackBurnSink} from "../fees/BuybackBurnSink.sol";
+import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
 /// @title LaunchFeeCranker
@@ -40,9 +43,42 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 /// the same bargain the three calls already offered.
 ///
 /// **It holds nothing.** No token ever lands here: `collect` pays the locker, `claim` pays the
-/// treasury, and the sink acts on its own balance. There is therefore no owner, no sweep and no
-/// upgrade path - and ⚠️ a token deliberately sent here is stuck for ever, which is the honest
-/// price of having no privileged address at all.
+/// treasury, and the sink acts on its own balance. There is no sweep and no upgrade path - and
+/// ⚠️ a token deliberately sent here is stuck for ever, which is the honest price of not having
+/// a way to move money out.
+///
+/// 🔑 **It has an owner as of 2.0.0, and A6 deliberately gave it none. Here is why that was
+/// re-taken.** The original argument is real and has not stopped being real: *a cranker that can
+/// be repointed is a cranker whose destination is mutable*, and the whole reason this contract
+/// adds no trust is that every destination was fixed by somebody else before it was deployed.
+/// An owner that can call `setSink` can, in principle, point the burn somewhere that does not
+/// burn.
+///
+/// What changed is that the immutability was measured, and it did not buy what it was supposed
+/// to:
+///
+/// - **It never actually pinned the destination.** `SINK` was immutable, but the sink's
+///   `treasury`, `burnBps`, `buybackPool`, `lockers` and `quoteRoute` are all owner-settable, and
+///   `PositionLocker.launchpadTreasury` - the field that decides whether a crank's money reaches
+///   the sink at all - is owner-settable too and **has pointed at three different addresses**.
+///   The same timelock owns all of them. So the burn destination was always mutable by the
+///   timelock; the immutable here made it mutable *in more transactions*, not in fewer hands.
+/// - **It cost real money to keep, twice.** Sink 1.2.0 -> 1.3.0 forced cranker 1.0.0 -> 1.1.0
+///   for no reason but this field. And because `LOCKER` is immutable too, one instance reaches
+///   exactly one locker generation - so plan A9 had to deploy a *second cranker* rather than
+///   change a setting, and until it did, **SPROUT's own launch 15 had nothing scheduled to move
+///   its fees** while the keeper reported a healthy pass every fifteen minutes. Nothing was
+///   broken and nothing said anything. That is the failure mode immutability produced.
+/// - **The comparison case is in the same repo.** `BuybackBurnSink.setLockers` is the identical
+///   problem decided the other way, and it is why ONE sink serves both locker generations.
+///
+/// ⛔ **So the trade is deliberate and it is bounded.** The owner is the **timelock**, so every
+/// repoint is Safe -> propose -> wait out the full delay -> execute, in public, with an event. It
+/// buys nothing that the timelock could not already do by redeploying this contract and repointing
+/// the keeper; it removes the redeploy, the second cranker, and the fifteen minutes of healthy
+/// passes over a launch nobody was collecting. 🔴 It does NOT make the setters safe to give to
+/// anything else: an EOA owner here really would be a mutable burn destination in one hand, which
+/// is exactly what A6 refused. The owner must be the timelock and script 10 asserts it.
 ///
 /// ## Why every leg is wrapped
 ///
@@ -60,36 +96,51 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 ///
 /// ## Which locker
 ///
-/// 🔑 Bound to ONE locker, as an immutable, because the settler binds its locker the same way and
-/// an ABI that can change under a contract is what wedged a graduation on 2026-09-06.
+/// 🔑 Bound to ONE locker at a time. Settable as of 2.0.0 (see above), but still ONE - this
+/// contract does not branch on which generation it faces, and deliberately so, because a helper
+/// that sniffs that is the "N copies of what is current" problem in a new place.
 ///
 /// It is written against the PULL locker (1.1.0): collect credits, claim pays. The PUSH locker
-/// (1.0.0) does not have `claim` at all, so a cranker deployed against one would find step 2
-/// reverting with empty returndata into the `try` and step 1 having already delivered the money -
-/// which is correct behaviour, by accident of the wrapping rather than by design. A second
-/// instance is therefore one deploy if the older locker's launches are ever worth cranking; this
-/// contract does not branch on which it is talking to, and deliberately so, because a helper that
-/// sniffs which generation it faces is the same "five copies of what is current" problem in a
-/// new place.
-contract LaunchFeeCranker {
+/// (1.0.0) does not have `claim` at all, so a cranker pointed at one finds step 2 reverting with
+/// empty returndata into the `try` and step 1 having already delivered the money - which is
+/// correct behaviour, by accident of the wrapping rather than by design, and is exercised by
+/// `test_aSecondInstanceAgainstAPushLockerStillBurns`.
+///
+/// 🔴 **A generation is still a `setLocker` call, never a branch, and the two are not
+/// interchangeable at the same instant**: while this cranker points at one locker it cannot
+/// collect the other's launches. Serving both simultaneously is still two instances. What the
+/// setter removes is the case where serving the *newer* one meant redeploying.
+contract LaunchFeeCranker is Ownable2Step {
     /// @notice The locker holding the launch positions this cranker collects from.
-    ILaunchPositionLocker public immutable LOCKER;
+    /// @dev ⚠️ SCREAMING_CASE, and as of 2.0.0 it is NOT immutable. The name is kept because
+    /// `LOCKER()` and `SINK()` are what script 10 asserts and what the keeper reads, and the two
+    /// live 1.1.0 instances answer to those names - renaming would mean one tool could no longer
+    /// check both generations. Read the setters, not the casing.
+    ILaunchPositionLocker public LOCKER;
 
     /// @notice Where the locked positions live. Read off the locker, so it cannot disagree.
-    ICLPositionManager public immutable POSITION_MANAGER;
+    /// @dev Re-derived by `setLocker`, never set directly. A locker generation that moved to a
+    /// new position manager would otherwise leave this pointing at the old one and every
+    /// `getPoolAndPositionInfo` would answer about somebody else's token id.
+    ICLPositionManager public POSITION_MANAGER;
 
     /// @notice The sink the fees are driven into.
     /// @dev Typed as the concrete contract on purpose. This contract calls four of its functions
     /// and one of them, `convert(Currency,uint256)`, is new in sink 1.2.0 - so the compiler, not
-    /// a comment, is what keeps the two in lockstep. ⚠️ The consequence is that a sink redeploy
-    /// is ALSO a cranker redeploy, because this reference is immutable. Say so in the script.
-    BuybackBurnSink public immutable SINK;
+    /// a comment, is what keeps the two in lockstep at BUILD time. 🔴 That says nothing about the
+    /// address `setSink` is given, which is why the setter probes it.
+    BuybackBurnSink public SINK;
 
-    /// @notice `SINK.QUOTE()`, cached. Immutable there, so the copy cannot go stale.
-    Currency public immutable QUOTE;
+    /// @notice `SINK.QUOTE()`, cached. Immutable on the sink, so it can only change when the sink does.
+    /// @dev Re-derived by `setSink`. It decides which leg `_drive` takes, so a stale copy would
+    /// route a launch token into `buyback` or the quote into `convert` - silently, since both are
+    /// wrapped in `try`.
+    Currency public QUOTE;
 
-    /// @notice `SINK.BURN_TOKEN()`, cached. Immutable there, so the copy cannot go stale.
-    address public immutable BURN_TOKEN;
+    /// @notice `SINK.BURN_TOKEN()`, cached. Immutable on the sink, so it can only change when the sink does.
+    /// @dev Re-derived by `setSink`, and the old and new values are both in `SinkUpdated` -
+    /// changing which token gets destroyed is the loudest thing a sink swap can do quietly.
+    address public BURN_TOKEN;
 
     /// @notice What one crank did. Returned rather than only emitted so a keeper can decide
     /// whether the next one is worth its gas from an `eth_call`.
@@ -107,6 +158,32 @@ contract LaunchFeeCranker {
 
     error ZeroAddress();
     error NotRegistered(uint256 launchId);
+    /// @dev The address given to `setSink` does not answer `QUOTE()` and `BURN_TOKEN()`.
+    /// A NAMED error, because the alternative is the empty revert of a missing selector: this
+    /// repo has already spent one wedged graduation learning that an absent function reverts
+    /// with nothing to read (plan A3).
+    error NotASink(address given);
+    /// @dev The address given to `setLocker` does not answer `POSITION_MANAGER()` and
+    /// `launchpadTreasury()`. Same reasoning as `NotASink`. ⚠️ Both generations of locker answer
+    /// both, which is the point - this check accepts a 1.0.0 push locker and rejects a contract
+    /// that is not a locker at all.
+    error NotALocker(address given);
+
+    /// @notice The sink was repointed. Carries every derived value either side of the change,
+    /// so a reader of the log never has to go and ask what `QUOTE` or `BURN_TOKEN` became.
+    event SinkUpdated(
+        address indexed oldSink,
+        address indexed newSink,
+        Currency oldQuote,
+        Currency newQuote,
+        address oldBurnToken,
+        address newBurnToken
+    );
+
+    /// @notice The locker was repointed, with the position manager it re-derived.
+    event LockerUpdated(
+        address indexed oldLocker, address indexed newLocker, address oldPositionManager, address newPositionManager
+    );
 
     event Cranked(
         uint256 indexed launchId,
@@ -118,15 +195,108 @@ contract LaunchFeeCranker {
         bool drove1
     );
 
-    constructor(ILaunchPositionLocker _locker, BuybackBurnSink _sink) {
+    /// @param _owner 🔴 The TIMELOCK. See the header: the setters below are only defensible
+    /// behind a delay, and an EOA owner here is a mutable burn destination in one hand.
+    constructor(ILaunchPositionLocker _locker, BuybackBurnSink _sink, address _owner) Ownable(_owner) {
+        // Ownable(0) reverts on its own with OwnableInvalidOwner, which is a better error than
+        // ours would be, so only the two this contract knows about are checked here.
         if (address(_locker) == address(0) || address(_sink) == address(0)) revert ZeroAddress();
-        LOCKER = _locker;
-        SINK = _sink;
-        // Read rather than passed: two arguments that must agree are two arguments that can be
-        // given inconsistently, and every one of these is immutable at its source.
-        POSITION_MANAGER = _locker.POSITION_MANAGER();
-        QUOTE = _sink.QUOTE();
-        BURN_TOKEN = address(_sink.BURN_TOKEN());
+        _setLocker(_locker);
+        _setSink(_sink);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Wiring
+    // -------------------------------------------------------------------------------------
+
+    /// @notice Point this cranker at a different burn sink. Timelock only.
+    ///
+    /// @dev This is the setter that ends *"a sink redeploy is ALWAYS a cranker redeploy"*, which
+    /// this deployment paid for once already when sink 1.2.0 -> 1.3.0 forced cranker 1.0.0 ->
+    /// 1.1.0 for no other reason. See the header for why A6's immutability was re-taken.
+    ///
+    /// 🔴 **A sink swap is still not free, and this setter is not the whole of it.** The sink's
+    /// own `lockers` set must contain `LOCKER` or every crank collects, claims, and then finds no
+    /// route - `feedIsWired()` and `sinkKnowsOurLocker()` are the two questions to ask
+    /// afterwards, and script 10 asserts both. Neither is *required* here on purpose: forcing an
+    /// order would make a legitimate move of both ends impossible in a single timelock batch.
+    function setSink(BuybackBurnSink newSink) external onlyOwner {
+        if (address(newSink) == address(0)) revert ZeroAddress();
+        _setSink(newSink);
+    }
+
+    /// @notice Point this cranker at a different position locker. Timelock only.
+    ///
+    /// @dev This is the setter that ends *"one instance reaches exactly one locker generation"*.
+    /// Plan A9 had to deploy a second cranker because of it, and for as long as only one existed,
+    /// **SPROUT's own launch 15 had nothing scheduled to move its fees** while the keeper
+    /// reported a healthy pass every fifteen minutes.
+    ///
+    /// ⚠️ It moves this instance from one generation to the other; it does not serve both. The
+    /// launches of the locker being left behind stop being cranked by *this* contract the moment
+    /// this lands, so a second instance is still the answer when both need serving at once.
+    function setLocker(ILaunchPositionLocker newLocker) external onlyOwner {
+        if (address(newLocker) == address(0)) revert ZeroAddress();
+        _setLocker(newLocker);
+    }
+
+    /// @dev Probe, derive, then assign. The probe is the whole value of the setter being a
+    /// function rather than a raw storage write: a wrong address here would otherwise be found
+    /// by `_drive` swallowing an empty revert into a `try` and reporting `false` for ever.
+    function _setSink(BuybackBurnSink newSink) private {
+        // 🔴 An address with NO CODE first, and separately, because `try` does not reliably turn
+        // it into a catchable failure: a high-level call to an EOA can return empty and revert on
+        // the decode OUTSIDE the catch, which surfaces as a bare revert with no data - the exact
+        // unreadable failure the named errors below exist to prevent. A typo'd address is the
+        // likeliest wrong argument this function will ever get.
+        if (address(newSink).code.length == 0) revert NotASink(address(newSink));
+
+        Currency newQuote;
+        address newBurnToken;
+        try newSink.QUOTE() returns (Currency q) {
+            newQuote = q;
+        } catch {
+            revert NotASink(address(newSink));
+        }
+        try newSink.BURN_TOKEN() returns (IBurnableERC20 b) {
+            newBurnToken = address(b);
+        } catch {
+            revert NotASink(address(newSink));
+        }
+        if (newBurnToken == address(0)) revert NotASink(address(newSink));
+
+        emit SinkUpdated(address(SINK), address(newSink), QUOTE, newQuote, BURN_TOKEN, newBurnToken);
+
+        SINK = newSink;
+        // Derived, never passed: two arguments that must agree are two arguments that can be
+        // given inconsistently, and both of these are immutable at their source.
+        QUOTE = newQuote;
+        BURN_TOKEN = newBurnToken;
+    }
+
+    /// @dev Same shape as `_setSink`. `launchpadTreasury()` is probed as well as
+    /// `POSITION_MANAGER()` because `crank` calls it every time and `feedIsWired()` is built on
+    /// it, so a locker that answered one and not the other would pass a check and fail in use.
+    function _setLocker(ILaunchPositionLocker newLocker) private {
+        // Same reasoning as `_setSink`: an EOA is checked by code size, not by `try`.
+        if (address(newLocker).code.length == 0) revert NotALocker(address(newLocker));
+
+        ICLPositionManager newPositionManager;
+        try newLocker.POSITION_MANAGER() returns (ICLPositionManager pm) {
+            newPositionManager = pm;
+        } catch {
+            revert NotALocker(address(newLocker));
+        }
+        try newLocker.launchpadTreasury() returns (address) {}
+        catch {
+            revert NotALocker(address(newLocker));
+        }
+        if (address(newPositionManager) == address(0)) revert NotALocker(address(newLocker));
+
+        emit LockerUpdated(address(LOCKER), address(newLocker), address(POSITION_MANAGER), address(newPositionManager));
+
+        LOCKER = newLocker;
+        POSITION_MANAGER = newPositionManager;
     }
 
     /// @notice Collect a launch's accrued LP fees, pay the launchpad's share to the sink, and
@@ -210,6 +380,17 @@ contract LaunchFeeCranker {
     /// somewhere that does not burn; this is how a deploy script and a dashboard tell.
     function feedIsWired() external view returns (bool) {
         return LOCKER.launchpadTreasury() == address(SINK);
+    }
+
+    /// @notice Whether the sink can resolve this cranker's locker's launches at all.
+    /// @dev The other half of the wiring, and the half `feedIsWired` cannot see. Since plan A5 the
+    /// sink finds a graduate's pool by asking a locker in its OWN `lockers` set, so a cranker
+    /// whose locker is not in that set collects and claims correctly and then has every `convert`
+    /// refused. Both setters deliberately decline to enforce this - ordering a two-ended move
+    /// would be impossible if they did - so this is the question to ask after one, and script 10
+    /// asserts it at deploy.
+    function sinkKnowsOurLocker() external view returns (bool) {
+        return SINK.isLocker(address(LOCKER));
     }
 
     /// @notice What `crank` would find without collecting: the launch's position and its pool.
