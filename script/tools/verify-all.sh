@@ -26,7 +26,13 @@ P2=0x000000000022D473030F116dDEE9F6B43aC78BA3
 WETH=0x0000000088827d2d103ee2d9A6b781773AE03FfB
 DEAD=0x000000000000000000000000000000000000dEaD
 UNSUP=0xCB7340356Df545a6DCc10998078F3E0089640E2d
-UR=0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7
+# 🔴 The 1.2.0 router, deployed 2026-09-07, REPLACING 1.0.0 0x4c7d611F09FB896cd3517cA92CcE6B5d2808DfE7.
+# The superseded one is left in place, timelock-owned, with nothing pointing at it, and is
+# deliberately NOT verified from here - a manifest that verifies dead contracts is how three live
+# CREATE3 contracts sat unverified for a day with nothing reporting a failure (see the settler note
+# above). ⚠️ 1.1.0 0xdfa954e35851D71c3c6a4D6c35ACF957bE4CE88f is NOT in this list either and never
+# should be: it was byte-identical to 1.0.0 and is abandoned unowned. See meta.forkPinsNote.
+UR=0x6F82761E0103846E4F4588DB5B7A5505A2907B04
 B32Z=0x0000000000000000000000000000000000000000000000000000000000000000
 CLQ=0xb7a4f84508c36255Bc29cc4dECaD6cBabd651a60
 BNQ=0x0e41128C6Eb88E1DDc97683d78Cf58035eeabD46
