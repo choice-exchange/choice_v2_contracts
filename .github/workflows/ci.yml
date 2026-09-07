@@ -21,6 +21,20 @@ jobs:
         with:
           submodules: recursive
 
+      # 🔴 FIRST, because it needs no toolchain and because it is the check that would have
+      # caught the bug that cost a testnet router deploy on 2026-09-07. It lives in THIS job
+      # rather than beside the other address-book checks purely because this is the job that
+      # already pays for `submodules: recursive`; a second recursive checkout would double
+      # that cost on every PR, and the org has overrun its Actions minutes before.
+      #
+      # What it asserts: every copy of a fork, AT ANY DEPTH, is the commit meta.forkPins
+      # names. The `address-book` job below checks only this repo's own three submodules,
+      # which is not enough - each fork carries its own copies of the others, and a build
+      # resolves the copy belonging to the repo it runs from. The script's header has the
+      # full account.
+      - name: Every nested fork pin matches the address book
+        run: script/tools/check-fork-pins.sh
+
       # PINNED, not `stable`. `forge fmt` output changes between Foundry releases, so an
       # unpinned toolchain turns this gate red overnight with no code change - it did, on
       # 1.8.1, the moment checkout started working (2026-09-05). The workspace calls local
@@ -127,7 +141,12 @@ jobs:
               echo "::error file=$f::address appears under more than one key: $dupes"; fail=1
             fi
 
-            # the fork pins here must match what the submodules are actually checked out at
+            # The fork pins here must match this repo's own submodules. ⚠️ NECESSARY BUT
+            # NOT SUFFICIENT, and it read as sufficient for a while: each fork carries its
+            # OWN copies of the others, and those are what a build run from that fork
+            # resolves. `script/tools/check-fork-pins.sh`, run by the build job above, is
+            # what covers those. This stays because it is free here and catches the common
+            # case in five seconds without a recursive checkout.
             for r in infinity-core infinity-periphery infinity-universal-router; do
               pinned="$(jq -r --arg r "$r" '.meta.forkPins[$r]' "$f")"
               actual="$(git ls-tree HEAD "lib/$r" | awk '{print $3}')"
