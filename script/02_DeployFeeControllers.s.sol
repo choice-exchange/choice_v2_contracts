@@ -43,13 +43,14 @@ contract DeployFeeControllers is BaseScript {
     // graduate pays Choice no protocol fee, so `protocolFeesAccrued` holds only Choice's own
     // revenue by construction.
     //
-    // 🔴 The BIN salt is deliberately NOT bumped. A salt is an address slot, not a version
-    // stamp - both controllers compile from the same `ChoiceFeeController.sol`, so a fresh
-    // deployment gets the new code at either salt. Bumping it would only force a live rewire
-    // of a pool manager that has no launch pools and never will: the settler is CL-only, so
-    // the new function is unreachable there. Bump it if a bin graduation path is ever built.
-    bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.1.0");
-    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.0.0");
+    // 🔴 BOTH salts move this time, and the reason the bin one did not move for 1.1.0 no
+    // longer holds. That bump added `zeroLaunchPoolProtocolFee`, which is unreachable on the
+    // bin manager (the settler is CL-only), so leaving bin at 1.0.0 cost nothing. This bump
+    // changes the CONSTRUCTOR - the fee policy is now an argument - so a bin controller left
+    // at its old salt would be a live contract whose policy came from upstream's defaults
+    // rather than from the address book, on a chain where the book says zero. Both must move.
+    bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.2.0");
+    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.1.0");
 
     Create3Factory internal factory;
     address internal timelock;
@@ -62,6 +63,26 @@ contract DeployFeeControllers is BaseScript {
         treasury = readAddress("choice.treasury");
         address clPoolManager = readAddress("infinity.clPoolManager");
         address binPoolManager = readAddress("infinity.binPoolManager");
+
+        // The fee policy, per network, from the book rather than from upstream's defaults.
+        // Mainnet launches at 0/0 - Choice takes no protocol cut at all, so a partner routing
+        // volume against their own liquidity pays only an LP fee they earn straight back -
+        // while testnet keeps 330000/300 so the fee path stays exercised. See the constructor.
+        uint256 splitRatio = readUint("choice.protocolFeeSplitRatio");
+        uint256 dynamicDefault = readUint("choice.defaultProtocolFeeForDynamicFeePool");
+        require(dynamicDefault <= type(uint24).max, "defaultProtocolFeeForDynamicFeePool overflows uint24");
+        // The book has no uint24 reader, so the narrowing happens once, here, immediately
+        // under the bound that makes it safe - rather than twice at the two call sites, where
+        // the check would be a scroll away. The constructor bounds it again anyway.
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint24 dynamicDefaultFee = uint24(dynamicDefault);
+        console.log("protocol fee split ratio (1e6 = 100%):", splitRatio);
+        console.log("default protocol fee, dynamic-fee pools:", dynamicDefault);
+        if (splitRatio == 0 && dynamicDefault == 0) {
+            console.log("  [note] Choice's protocol fee is PARKED AT ZERO on this network.");
+            console.log("         Turning it on later is one timelock call per controller for");
+            console.log("         NEW pools, plus one setProtocolFee per pool that already exists.");
+        }
 
         requireCode("timelock", timelock);
         requireCode("clPoolManager", clPoolManager);
@@ -98,14 +119,16 @@ contract DeployFeeControllers is BaseScript {
         address clFeeController = _deploy(
             CL_FEE_CONTROLLER_SALT,
             abi.encodePacked(
-                type(ChoiceFeeController).creationCode, abi.encode(clPoolManager, treasury, IBurnSink(directSink))
+                type(ChoiceFeeController).creationCode,
+                abi.encode(clPoolManager, treasury, IBurnSink(directSink), splitRatio, dynamicDefaultFee)
             ),
             toTimelock
         );
         address binFeeController = _deploy(
             BIN_FEE_CONTROLLER_SALT,
             abi.encodePacked(
-                type(ChoiceFeeController).creationCode, abi.encode(binPoolManager, treasury, IBurnSink(directSink))
+                type(ChoiceFeeController).creationCode,
+                abi.encode(binPoolManager, treasury, IBurnSink(directSink), splitRatio, dynamicDefaultFee)
             ),
             toTimelock
         );

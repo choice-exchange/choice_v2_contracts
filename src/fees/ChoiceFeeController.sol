@@ -7,6 +7,7 @@ import {IProtocolFees} from "infinity-core/src/interfaces/IProtocolFees.sol";
 import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {PoolId, PoolIdLibrary} from "infinity-core/src/types/PoolId.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
+import {ProtocolFeeLibrary} from "infinity-core/src/libraries/ProtocolFeeLibrary.sol";
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
 
 /// @title ChoiceFeeController
@@ -105,9 +106,67 @@ contract ChoiceFeeController is ProtocolFeeController {
     event LaunchPoolGuardHookUpdated(IHooks oldHook, IHooks newHook);
     event LaunchPoolProtocolFeeZeroed(PoolId indexed poolId);
 
-    constructor(address _poolManager, address _treasury, IBurnSink _burnSink) ProtocolFeeController(_poolManager) {
+    /// @notice Denominator for `protocolFeeSplitRatio`, mirroring upstream's own private
+    /// constant so the constructor can bound its argument the way `setProtocolFeeSplitRatio`
+    /// bounds its own.
+    uint256 public constant SPLIT_RATIO_DENOMINATOR = 1e6;
+
+    /// @param _protocolFeeSplitRatio Choice's share of the total fee, in hundredths of a bip:
+    /// `33 * 1e4` is upstream's 33% (plan D10), and **0 disables the protocol fee entirely**.
+    /// @param _defaultProtocolFeeForDynamicFeePool The protocol fee handed to a dynamic-fee
+    /// pool at initialisation, in hundredths of a bip. Upstream ships 300 (0.03%).
+    ///
+    /// @dev 🔴 BOTH fee-policy numbers are constructor arguments rather than upstream's
+    /// defaults, and the second one is the reason the first is not enough. A dynamic-fee pool
+    /// never consults `protocolFeeSplitRatio` at all - `protocolFeeForPool` branches on the
+    /// dynamic flag FIRST and answers `defaultProtocolFeeForDynamicFeePool` - so a deployment
+    /// that zeroes only the ratio still charges every dynamic-fee pool anybody opens, quietly.
+    /// Disabling Choice's cut means both, which is a thing to get wrong once and never notice.
+    ///
+    /// 🔑 They are constructor arguments and not hardcoded because the two networks run two
+    /// policies on purpose: mainnet launches with the cut parked at zero so partners can route
+    /// volume against their own liquidity for free, while testnet keeps upstream's 33% so the
+    /// fee path stays exercised and the frontend's tier table keeps being checked against a
+    /// live pool. Same bytecode, policy read from the address book.
+    ///
+    /// ⛔ And they are constructor arguments rather than a post-deploy call because under
+    /// CREATE3 this contract is born owned by the factory's one-shot proxy child, with the
+    /// timelock only as `pendingOwner` - so between deployment and the timelock's
+    /// `acceptOwnership` there is NOBODY who can call either setter. Pool creation is
+    /// permissionless, so any pool opened in that window would bake in whatever the
+    /// constructor left behind, permanently for that pool. Setting it here closes the window
+    /// by construction rather than by being quick.
+    ///
+    /// Neither is immutable: both stay settable by the timelock, so turning the fee on later
+    /// is one governance call and never a redeploy. See `setProtocolFeeSplitRatio`.
+    constructor(
+        address _poolManager,
+        address _treasury,
+        IBurnSink _burnSink,
+        uint256 _protocolFeeSplitRatio,
+        uint24 _defaultProtocolFeeForDynamicFeePool
+    ) ProtocolFeeController(_poolManager) {
+        // The same bounds the inherited setters enforce. Checked here too, because a
+        // constructor that skipped them would be the one path into this state that upstream's
+        // own validation does not cover.
+        if (_protocolFeeSplitRatio > SPLIT_RATIO_DENOMINATOR) revert InvalidProtocolFeeSplitRatio();
+        if (_defaultProtocolFeeForDynamicFeePool > ProtocolFeeLibrary.MAX_PROTOCOL_FEE) {
+            revert InvalidDefaultProtocolFeeForDynamicFeePool();
+        }
+
         treasury = _treasury;
         burnSink = _burnSink;
+
+        // Emitted so the initial policy appears in the log stream alongside every later
+        // change: an indexer folding these events reconstructs the current value without
+        // having to special-case "the one that was never emitted".
+        emit ProtocolFeeSplitRatioUpdated(protocolFeeSplitRatio, _protocolFeeSplitRatio);
+        emit DefaultProtocolFeeForDynamicFeePoolUpdated(
+            defaultProtocolFeeForDynamicFeePool, _defaultProtocolFeeForDynamicFeePool
+        );
+
+        protocolFeeSplitRatio = _protocolFeeSplitRatio;
+        defaultProtocolFeeForDynamicFeePool = _defaultProtocolFeeForDynamicFeePool;
     }
 
     /// @notice Pull everything the pool manager holds for `currency` and split it.

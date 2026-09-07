@@ -90,14 +90,49 @@ contract ForkLinkTest is Test {
         assertEq(vm.parseJsonAddress(book, ".external.arachnidCreate2"), 0x4e59b44847b379578588920cA78FbF26c0B4956C);
     }
 
-    /// @dev The two numbers that are decisions rather than facts, asserted so that changing
-    /// either is a visible diff in a test rather than a quiet edit to a JSON file.
-    /// CHOICE_V2_MAINNET_OPS.md §8, settled 2026-09-07: 3-of-5 on hardware wallets, 24 hours.
-    /// 🔴 The delay is also the UNPAUSE latency - unpausePoolManager is onlyOwner and the
-    /// timelock is the owner - so lowering it is a security decision in both directions.
+    /// @dev The numbers that are decisions rather than facts, asserted so that changing any of
+    /// them is a visible diff in a test rather than a quiet edit to a JSON file.
+    ///
+    /// Settled 2026-09-08, superseding CHOICE_V2_MAINNET_OPS.md §8's 3-of-5 / 24h: Choice v2
+    /// mainnet reuses Choice v1's TWO multisig signers, so the Safe is 2-of-2 and the timelock
+    /// delay is an hour.
+    ///
+    /// 🔴 The delay is also the UNPAUSE latency - `unpausePoolManager` is `onlyOwner` and the
+    /// timelock is the owner - so moving it is a security decision in both directions: longer
+    /// means swaps can stay down longer, shorter means less time to spot and cancel a hostile
+    /// proposal. With two signers there are fewer people watching, which is what an hour
+    /// assumes.
     function test_mainnetGovernanceNumbersAreTheDecidedOnes() public view {
         string memory book = vm.readFile("deployments/injective_mainnet.json");
-        assertEq(vm.parseJsonUint(book, ".governance.timelockMinDelay"), 86_400, "mainnet timelock delay is 24h");
-        assertEq(vm.parseJsonUint(book, ".governance.safeThreshold"), 3, "mainnet Safe is 3-of-5");
+        assertEq(vm.parseJsonUint(book, ".governance.timelockMinDelay"), 3_600, "mainnet timelock delay is 1h");
+        assertEq(vm.parseJsonUint(book, ".governance.safeThreshold"), 2, "mainnet Safe is 2-of-2");
+    }
+
+    /// @dev The launch fee policy, which is the other decision that lives only in JSON.
+    /// Mainnet ships with Choice's protocol cut fully OFF so partners route volume against
+    /// their own liquidity for free; testnet deliberately keeps upstream's numbers so the fee
+    /// path stays exercised against a live pool.
+    ///
+    /// 🔴 TWO keys, not one, and the second is the one that gets missed. A dynamic-fee pool
+    /// never consults `protocolFeeSplitRatio` - upstream branches on the dynamic flag first and
+    /// answers `defaultProtocolFeeForDynamicFeePool` - so a book that zeroed only the ratio
+    /// would still charge every dynamic-fee pool anybody opened. `ProtocolFeesDisabled.t.sol`
+    /// proves that on the contract; this asserts the book cannot drift away from it.
+    function test_feePolicyPerNetworkIsTheDecidedOne() public view {
+        string memory mainnet = vm.readFile("deployments/injective_mainnet.json");
+        assertEq(vm.parseJsonUint(mainnet, ".choice.protocolFeeSplitRatio"), 0, "mainnet launches fee-free");
+        assertEq(
+            vm.parseJsonUint(mainnet, ".choice.defaultProtocolFeeForDynamicFeePool"),
+            0,
+            "mainnet dynamic-fee pools would still charge"
+        );
+
+        string memory testnet = vm.readFile("deployments/injective_testnet.json");
+        assertEq(vm.parseJsonUint(testnet, ".choice.protocolFeeSplitRatio"), 330_000, "testnet keeps upstream's 33%");
+        assertEq(
+            vm.parseJsonUint(testnet, ".choice.defaultProtocolFeeForDynamicFeePool"),
+            300,
+            "testnet keeps upstream's dynamic-fee default"
+        );
     }
 }
