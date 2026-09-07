@@ -129,7 +129,7 @@ contract VerifyOwnership is BaseScript {
     /// 🔴 2 is the one that is easy to miss, because it did not exist before A0 and the
     /// controller is deployed two scripts before the hook it has to point at. Failing closed
     /// is the right behaviour there - a graduate that quietly paid Choice's protocol fee would
-    /// mix sprout's revenue into a global bucket nobody can unpick afterwards - but "fails
+    /// mix the launchpad's revenue into a global bucket nobody can unpick afterwards - but "fails
     /// closed" is only safe if the missing step is impossible to miss.
     ///
     /// A missing address book entry is SKIPPED, like everything else here, so this is runnable

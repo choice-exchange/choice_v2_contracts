@@ -54,7 +54,7 @@ LOCKER_LEGACY=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
 # CONSTRUCTED - `setInitializer` since then does not change them.
 SETTLER_10=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
-# The buyback sink and the TEST SPROUT it burns. 🔴 `BBSINK` is 1.2.0, the A5 sink deployed
+# The buyback sink and the TEST burn token it destroys. 🔴 `BBSINK` is 1.2.0, the A5 sink deployed
 # 2026-09-06; 1.1.0 is kept below because it is still deployed and still timelock-owned, while
 # the two IT superseded, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent — nothing points
 # at either and re-verifying a dead contract on every pass buys nothing.
@@ -64,7 +64,7 @@ GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
 # there is no handover and no EOA in its arguments. Verification hashes the args as CONSTRUCTED,
 # so carrying 1.0.0's $DEPLOYER forward would fail with a bytecode mismatch that reads like a
 # compiler-settings problem.
-SPROUT=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
+BURN_TOKEN=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
 # 🔴 The LIVE sink is 1.3.0 (plan A2 - quote routes and the two-leg conversion). 1.2.0 and 1.1.0
 # stay verified and in this list: both are still deployed and still timelock-owned, and a
 # superseded contract that reads as unverified is exactly how a reader concludes the wrong one is
@@ -126,9 +126,9 @@ MANIFEST=(
 # graduate's real pool key (plan A5). Seven arguments became eight, so 1.1.0's row below cannot
 # be reused for it; a stale copy would fail with a bytecode mismatch reading like a compiler
 # settings problem.
-"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
-"$BBSINK_120|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
-"$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"
+"$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
+"$BBSINK_120|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
+"$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $SAFE $TL 8000 8000)"
 "$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK)"
 "$CRANKER_LEGACY|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER_LEGACY $BBSINK)"
 "$CRANKER_100|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK_120)"

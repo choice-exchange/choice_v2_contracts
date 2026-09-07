@@ -30,7 +30,7 @@ import {IBurnSink} from "../interfaces/IBurnSink.sol";
 ///
 /// It also carries one thing that is not about Choice's revenue but about keeping somebody
 /// else's out of it: `zeroLaunchPoolProtocolFee`. `protocolFeesAccrued` is ONE global bucket
-/// per currency across every pool in the manager, so once a sprout.fun graduate pays into it
+/// per currency across every pool in the manager, so once a launchpad graduate pays into it
 /// its share is indistinguishable from a wINJ/USDC pool's by the time anyone can harvest.
 /// Rather than try to sweep a share that cannot be told apart, graduates pay no protocol fee
 /// at all - then the bucket holds only Choice's own revenue *by construction* (plan A0, D30,
@@ -73,7 +73,7 @@ contract ChoiceFeeController is ProtocolFeeController {
     /// @notice Receives the burn half. See `IBurnSink` for why this is pluggable.
     IBurnSink public burnSink;
 
-    /// @notice The hook that identifies a sprout.fun graduation pool, and the whole gate on
+    /// @notice The hook that identifies a launchpad graduation pool, and the whole gate on
     /// `zeroLaunchPoolProtocolFee`.
     ///
     /// @dev Settable rather than immutable for two reasons. The deploy order is one: the fee
@@ -156,12 +156,12 @@ contract ChoiceFeeController is ProtocolFeeController {
         return IProtocolFees(poolManager).protocolFeesAccrued(currency);
     }
 
-    /// @notice Set a sprout.fun graduation pool's protocol fee to zero, so Choice's revenue
-    /// and sprout's never mix. Anyone may call it, and it can reach nothing else.
+    /// @notice Set a launchpad graduation pool's protocol fee to zero, so Choice's revenue
+    /// and the launchpad's never mix. Anyone may call it, and it can reach nothing else.
     ///
     /// @dev Plan A0 / tokenomics D30, D31. The separation this makes is structural rather
     /// than procedural: with graduates paying nothing into `protocolFeesAccrued`, a Choice
-    /// harvest provably cannot move sprout money, and it stays provable from the pool key
+    /// harvest provably cannot move launchpad money, and it stays provable from the pool key
     /// instead of from an operator's promise. The trader pays the same 1% either way - the
     /// settler's LP fee carries the whole tier (10000 pips) rather than the 6722 that
     /// composited to 1% *alongside* a protocol leg.

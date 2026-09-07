@@ -101,7 +101,7 @@ Plan D2.
 
 ## Launchpad graduation (M4)
 
-A SHROOM launch graduates onto a Choice v2 CL pool in the **same transaction that fills the
+A launchpad launch graduates onto a Choice v2 CL pool in the **same transaction that fills the
 curve**. `LaunchpadCore.triggerGraduation` moves both legs to `InfinitySettler`, which
 initialises the pool at exactly `realPair / poolTokenAmount`, mints one full-range position to
 `PositionLocker`, and calls `LaunchpadCore.onSettled`. There is no keeper crank and no
@@ -126,7 +126,7 @@ pad keeper's 5M is comfortable.
 
 ### A graduate pays Choice nothing, and that is the separation
 
-sprout.fun and Choice are separate projects that share no money, and the obvious wiring for
+The launchpad and Choice are separate projects that share no money, and the obvious wiring for
 that - "harvest only the graduates' protocol fee" - **is not expressible**.
 `ProtocolFees.protocolFeesAccrued` is ONE global `mapping(Currency => uint256)` across every
 pool in the manager, swept in full by the single authorised controller, so a graduate's fee and
@@ -157,9 +157,10 @@ can only ever reach a pool an allowlisted settler created; the only choice a cal
 calls it right after initialising the pool, so a graduate never charges the fee for even one
 block, and it stays open afterwards as the repair path for a pool initialised outside `settle`.
 
-⛔ **`ChoiceFeeController.setBurnSink` is never pointed at the SPROUT sink.** Sprout's revenue
-reaches its own sink only through pad-owned contracts (`LaunchpadCore.treasury`,
-`PositionLocker.launchpadTreasury`). That un-made call is the other half of the wall.
+⛔ **`ChoiceFeeController.setBurnSink` is never pointed at the launchpad's burn sink.** The
+launchpad's revenue reaches its own sink only through pad-owned contracts
+(`LaunchpadCore.treasury`, `PositionLocker.launchpadTreasury`). That un-made call is the other
+half of the wall.
 
 🔴 **Four links, and a graduation walks all of them.** `08_VerifyOwnership` checks each and
 prints the Safe -> timelock payload for anything missing; run it at the end of every deploy.
@@ -172,8 +173,8 @@ prints the Safe -> timelock payload for anything missing; run it at the end of e
 2 is the one that is easy to miss: the fee controllers are deployed in script 02 and the guard
 hook does not exist until script 05, so the gate ships **unset** and a timelock call turns it
 on. While it is unset every graduation **reverts** - deliberately. Fail-closed is right here,
-because a graduate that quietly paid Choice's protocol fee would put sprout's revenue into a
-bucket nobody can unpick afterwards, and the reverted graduation leaves the launch in
+because a graduate that quietly paid Choice's protocol fee would put the launchpad's revenue
+into a bucket nobody can unpick afterwards, and the reverted graduation leaves the launch in
 `CurveFilled` with every token still in the core.
 
 ### The pool is un-campable, and that needs a hook

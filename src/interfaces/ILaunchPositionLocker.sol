@@ -41,7 +41,7 @@ interface ILaunchPositionLocker {
     function POSITION_MANAGER() external view returns (ICLPositionManager);
 
     /// @notice Where the non-creator share of a collect goes. Owner-settable, so read it, never
-    /// assume it: this field IS the sprout revenue feed (plan B6), and it has pointed at three
+    /// assume it: this field IS the launchpad's revenue feed (plan B6), and it has pointed at three
     /// different addresses.
     function launchpadTreasury() external view returns (address);
 

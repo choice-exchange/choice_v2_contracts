@@ -18,14 +18,14 @@ import {ILaunchPositionLocker} from "../src/interfaces/ILaunchPositionLocker.sol
 import {BaseScript} from "./BaseScript.sol";
 
 /**
- * The sprout.fun buyback-and-burn sink (SPROUT_TOKENOMICS §6, plan A4).
+ * The launchpad's buyback-and-burn sink (plan A4).
  *
  * Deploys `BuybackBurnSink` owned by the TIMELOCK from construction, then prints the calls that
  * still have to come from it. Nothing here wires anything: the sink's three settings are owner
  * calls and this script cannot make them.
  *
  * ⛔ It also never touches `ChoiceFeeController.setBurnSink`. Under D30 a Choice fee controller
- * is NEVER pointed at the sprout sink - sprout's revenue reaches it through the pad's treasury
+ * is NEVER pointed at this sink - the launchpad's revenue reaches it through the pad's treasury
  * and `PositionLocker.launchpadTreasury`, and the separation is the point.
  *
  * forge script script/09_DeployBuybackBurnSink.s.sol:DeployBuybackBurnSink -vv \
@@ -65,13 +65,13 @@ contract DeployBuybackBurnSink is BaseScript {
         address treasury = readAddress("choice.treasury");
         address vault = readAddress("infinity.vault");
         address quote = readAddress("external.wINJ");
-        address sprout = readAddress("launchpad.sproutToken");
+        address burnToken = readAddress("launchpad.burnToken");
         address positionManager = readAddress("infinity.clPositionManager");
 
         requireCode("timelock", timelock);
         requireCode("vault", vault);
         requireCode("wINJ", quote);
-        requireCode("sproutToken", sprout);
+        requireCode("burnToken", burnToken);
         requireCode("clPositionManager", positionManager);
 
         address sink = factory.computeAddress(SINK_SALT);
@@ -83,7 +83,7 @@ contract DeployBuybackBurnSink is BaseScript {
             bytes memory payload = abi.encodePacked(
                 type(BuybackBurnSink).creationCode,
                 abi.encode(
-                    IBurnableERC20(sprout),
+                    IBurnableERC20(burnToken),
                     Currency.wrap(quote),
                     IVault(vault),
                     ICLPositionManager(positionManager),
@@ -102,7 +102,7 @@ contract DeployBuybackBurnSink is BaseScript {
             console.log("  already deployed - checking its wiring");
         }
 
-        require(address(BuybackBurnSink(payable(sink)).BURN_TOKEN()) == sprout, "sink burns the wrong token");
+        require(address(BuybackBurnSink(payable(sink)).BURN_TOKEN()) == burnToken, "sink burns the wrong token");
         require(Currency.unwrap(BuybackBurnSink(payable(sink)).QUOTE()) == quote, "sink quotes the wrong currency");
         require(BuybackBurnSink(payable(sink)).owner() == timelock, "sink is not timelock-owned");
 
@@ -214,19 +214,19 @@ contract DeployBuybackBurnSink is BaseScript {
         }
         outstanding++;
         console.log("  [TODO] the guards are unset, so every buyback and every conversion parks");
-        console.log("           TEST values below - see SPROUT_TOKENOMICS 9.3 before mainnet");
+        console.log("           TEST values below - see the launchpad tokenomics before mainnet");
         _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (1e15, 500, 60)));
     }
 
     /// @dev The one pool the sink cannot be told about by a caller: the buyback's own.
     ///
-    /// SPROUT is a launch like any other, so its graduation pool key is read the same way every
-    /// other launch's is now - off SPROUT's own locked position, through `launchPool`. That is
+    /// The burn token is a launch like any other, so its graduation pool key is read the same way
+    /// every other launch's is now - off its own locked position, through `launchPool`. That is
     /// strictly better than the tier derivation it replaces: it is the key the position is
     /// actually in, so it cannot be one fee tier or one tick spacing away from a pool that does
     /// not exist.
     ///
-    /// ⚠️ Needs `launchpad.sproutLaunchId` in the address book, and the lockers installed first -
+    /// ⚠️ Needs `launchpad.burnTokenLaunchId` in the address book, and the lockers installed first -
     /// which is why this check runs last.
     function _requireBuybackPool(address sink) internal {
         BuybackBurnSink s = BuybackBurnSink(payable(sink));
@@ -237,19 +237,19 @@ contract DeployBuybackBurnSink is BaseScript {
         }
 
         outstanding++;
-        uint256 sproutLaunchId = readUint("launchpad.sproutLaunchId");
-        (PoolKey memory key, address locker) = s.launchPool(sproutLaunchId);
+        uint256 burnTokenLaunchId = readUint("launchpad.burnTokenLaunchId");
+        (PoolKey memory key, address locker) = s.launchPool(burnTokenLaunchId);
         if (locker == address(0)) {
             console.log("  [--]   buybackPool: install the lockers first, they answer this key");
             return;
         }
         (uint160 existing,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
         if (existing == 0) {
-            console.log("  [TODO] SPROUT's graduation pool does not exist yet - it has not graduated");
+            console.log("  [TODO] the burn token's pool does not exist yet - it has not graduated");
             return;
         }
         console.log("  [TODO] the buyback pool is unset, so quote revenue parks");
-        console.log("           read off SPROUT's locked position, launch", sproutLaunchId);
+        console.log("           read off the burn token's locked position, launch", burnTokenLaunchId);
         _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setBuybackPool, (key)));
     }
 

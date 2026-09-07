@@ -62,11 +62,11 @@ contract BuybackBurnSinkTest is Test {
     CLPoolManagerRouter internal seeder;
 
     MockERC20 internal quote; // wINJ
-    MockBurnableERC20 internal sprout; // SPROUT
+    MockBurnableERC20 internal burnToken;
     MockERC20 internal stray; // a currency with no pool anywhere
 
     /// A launch token that is NOT the burn token, which is the case §9.0's walk could not
-    /// reach: its test launch token WAS SPROUT, so it hit the `BURN_TOKEN` arm and settled.
+    /// reach: its test launch token WAS the burn token, so it hit the `BURN_TOKEN` arm and settled.
     MockERC20 internal meme;
     /// A second one, to show that one launch token's rate-limit window is its own.
     MockERC20 internal meme2;
@@ -110,7 +110,7 @@ contract BuybackBurnSinkTest is Test {
         seeder = new CLPoolManagerRouter(vault, manager);
 
         quote = new MockERC20("Wrapped INJ", "wINJ", 18);
-        sprout = new MockBurnableERC20("Sprout", "SPROUT", 18);
+        burnToken = new MockBurnableERC20("Burn Token", "BURN", 18);
         stray = new MockERC20("Stray", "STRAY", 18);
         meme = new MockERC20("Launch", "LAUNCH", 18);
         meme2 = new MockERC20("Launch Two", "LAUNCH2", 18);
@@ -124,10 +124,10 @@ contract BuybackBurnSinkTest is Test {
 
         sink = _freshSink();
 
-        pool = _key(quote, sprout, FEE);
+        pool = _key(quote, burnToken, FEE);
         _seed(pool, 1_000_000 ether);
 
-        // The graduation pool of a launch that is not SPROUT: same 1% tier, same spacing, keyed
+        // The graduation pool of a launch that is not the burn token: same 1% tier, same spacing, keyed
         // to the guard hook. Deliberately thinner than the buyback pool - a graduate's seed is
         // whatever its curve filled, not a market-made book.
         memePool = _graduationKey(meme, FEE);
@@ -166,43 +166,43 @@ contract BuybackBurnSinkTest is Test {
 
     // ── the reason this contract exists ───────────────────────────────────
 
-    /// The whole loop, end to end: revenue in quote becomes SPROUT, 80% of it is destroyed for
+    /// The whole loop, end to end: revenue in quote becomes the burn token, 80% of it is destroyed for
     /// real, and the ops share reaches the treasury.
     function test_revenueIsBoughtBackAndEightyPercentIsDestroyed() public {
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         quote.mint(address(sink), 100 ether);
 
         sink.burn(Currency.wrap(address(quote)), 100 ether);
 
-        uint256 burnt = supplyBefore - sprout.totalSupply();
-        uint256 toTreasury = sprout.balanceOf(TREASURY);
+        uint256 burnt = supplyBefore - burnToken.totalSupply();
+        uint256 toTreasury = burnToken.balanceOf(TREASURY);
         uint256 bought = burnt + toTreasury;
 
         assertGt(bought, 0, "nothing was bought");
         assertEq(burnt, bought * FLOOR / 10_000, "burn share is not burnBps of what was bought");
         assertEq(toTreasury, bought - burnt, "treasury did not get the remainder");
-        assertEq(sprout.balanceOf(address(sink)), 0, "SPROUT was left sitting in the sink");
+        assertEq(burnToken.balanceOf(address(sink)), 0, "burn tokens were left sitting in the sink");
         assertEq(quote.balanceOf(address(sink)), 0, "quote was left unspent");
     }
 
     /// The normalise leg (A4), which is the arm §9.0's walk could never reach: its launch token
-    /// WAS SPROUT, so it settled directly. A launch token that is not the burn token used to
+    /// WAS the burn token, so it settled directly. A launch token that is not the burn token used to
     /// park for ever; now it is sold for wINJ against its OWN graduation pool, and the proceeds
-    /// go straight on to buy SPROUT and burn it - all in the one call `harvest` makes.
+    /// go straight on to buy the burn token and destroy it - all in the one call `harvest` makes.
     function test_aLaunchTokenIsConvertedBoughtBackAndBurnt() public {
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         meme.mint(address(sink), 100 ether);
 
         sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
 
-        uint256 burnt = supplyBefore - sprout.totalSupply();
-        uint256 toTreasury = sprout.balanceOf(TREASURY);
+        uint256 burnt = supplyBefore - burnToken.totalSupply();
+        uint256 toTreasury = burnToken.balanceOf(TREASURY);
 
         assertGt(burnt, 0, "the launch token parked instead of burning");
         assertEq(burnt, (burnt + toTreasury) * FLOOR / 10_000, "burn share is not burnBps of what was bought");
         assertEq(meme.balanceOf(address(sink)), 0, "the launch token was not fully converted");
         assertEq(quote.balanceOf(address(sink)), 0, "the wINJ it converted to was not spent");
-        assertEq(sprout.balanceOf(address(sink)), 0, "SPROUT was left sitting in the sink");
+        assertEq(burnToken.balanceOf(address(sink)), 0, "burn tokens were left sitting in the sink");
     }
 
     /// `burn` is what `ChoiceFeeController.harvest` calls after transferring. If it can revert,
@@ -226,10 +226,10 @@ contract BuybackBurnSinkTest is Test {
         assertEq(meme.balanceOf(TREASURY), 0, "ops must not receive what the burn was entitled to");
 
         // And it is not stranded: the hinted call picks up exactly what `burn` parked.
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
         assertEq(meme.balanceOf(address(sink)), 0, "the parked tranche was not picked up");
-        assertLt(sprout.totalSupply(), supplyBefore, "the parked tranche did not reach the burn");
+        assertLt(burnToken.totalSupply(), supplyBefore, "the parked tranche did not reach the burn");
     }
 
     /// And a sink with no lockers installed yet cannot resolve any hint - it must park rather
@@ -270,7 +270,7 @@ contract BuybackBurnSinkTest is Test {
         uint256 leftover = quote.balanceOf(address(sink));
         assertGt(leftover, 0, "the limit did not bind - nothing was left over");
         assertLt(leftover, 500_000 ether, "the limit bound so hard that nothing traded");
-        assertGt(sprout.balanceOf(TREASURY), 0, "a partial fill still has to settle its burn");
+        assertGt(burnToken.balanceOf(TREASURY), 0, "a partial fill still has to settle its burn");
     }
 
     function test_belowTheMinimumRevenueAccumulatesInsteadOfTrading() public {
@@ -279,7 +279,7 @@ contract BuybackBurnSinkTest is Test {
         sink.burn(Currency.wrap(address(quote)), 0.5 ether);
 
         assertEq(quote.balanceOf(address(sink)), 0.5 ether, "dust should accumulate");
-        assertEq(sprout.balanceOf(TREASURY), 0, "nothing should have been bought");
+        assertEq(burnToken.balanceOf(TREASURY), 0, "nothing should have been bought");
     }
 
     /// D20: without a rate limit a searcher picks the moment of every buyback. With one, a
@@ -290,17 +290,17 @@ contract BuybackBurnSinkTest is Test {
 
         quote.mint(address(sink), 100 ether);
         sink.burn(Currency.wrap(address(quote)), 100 ether);
-        uint256 afterFirst = sprout.balanceOf(TREASURY);
+        uint256 afterFirst = burnToken.balanceOf(TREASURY);
         assertGt(afterFirst, 0, "the first buyback should have run");
 
         quote.mint(address(sink), 100 ether);
         sink.burn(Currency.wrap(address(quote)), 100 ether);
-        assertEq(sprout.balanceOf(TREASURY), afterFirst, "the second buyback should have been rate-limited");
+        assertEq(burnToken.balanceOf(TREASURY), afterFirst, "the second buyback should have been rate-limited");
         assertEq(quote.balanceOf(address(sink)), 100 ether, "the parked tranche should still be here");
 
         vm.warp(block.timestamp + 1 hours);
         sink.buyback();
-        assertGt(sprout.balanceOf(TREASURY), afterFirst, "the window reopened and it still did not run");
+        assertGt(burnToken.balanceOf(TREASURY), afterFirst, "the window reopened and it still did not run");
         assertEq(quote.balanceOf(address(sink)), 0, "the parked tranche should have been spent");
     }
 
@@ -343,7 +343,7 @@ contract BuybackBurnSinkTest is Test {
     function test_aLaunchThatGraduatedOnAnotherTierStillConverts() public {
         assertTrue(stragglerPool.fee != memePool.fee, "the fixture is not testing two tiers");
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         straggler.mint(address(sink), 100 ether);
 
         BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
@@ -352,7 +352,7 @@ contract BuybackBurnSinkTest is Test {
         sink.convert(Currency.wrap(address(straggler)), STRAGGLER_LAUNCH);
 
         assertEq(straggler.balanceOf(address(sink)), 0, "the straggler did not convert");
-        assertLt(sprout.totalSupply(), supplyBefore, "the straggler's revenue never reached the burn");
+        assertLt(burnToken.totalSupply(), supplyBefore, "the straggler's revenue never reached the burn");
     }
 
     /// 🔑 **Why a launch id can be taken from anybody.** It selects a pool; the pool is then
@@ -438,7 +438,7 @@ contract BuybackBurnSinkTest is Test {
         vm.prank(TIMELOCK);
         sink.setHold(Currency.wrap(address(meme)), true);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         meme.mint(address(sink), 100 ether);
 
         vm.expectEmit(true, false, false, true, address(sink));
@@ -446,7 +446,7 @@ contract BuybackBurnSinkTest is Test {
         sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
 
         assertEq(meme.balanceOf(address(sink)), 100 ether, "a held token should accumulate");
-        assertEq(sprout.totalSupply(), supplyBefore, "a held token must not reach the burn");
+        assertEq(burnToken.totalSupply(), supplyBefore, "a held token must not reach the burn");
 
         // A held token reports the POLICY through `burn` too, rather than the missing hint.
         vm.expectEmit(true, false, false, true, address(sink));
@@ -457,7 +457,7 @@ contract BuybackBurnSinkTest is Test {
         vm.prank(TIMELOCK);
         sink.setHold(Currency.wrap(address(meme)), false);
         sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
-        assertLt(sprout.totalSupply(), supplyBefore, "lifting the hold did not release the conversion");
+        assertLt(burnToken.totalSupply(), supplyBefore, "lifting the hold did not release the conversion");
     }
 
     /// The impact bound is one price limit serving both legs, so an oversized conversion fills
@@ -474,7 +474,7 @@ contract BuybackBurnSinkTest is Test {
         assertGt(leftover, 0, "the bound did not bind - the whole tranche converted");
         assertLt(leftover, 500_000 ether, "the bound bound so hard that nothing converted");
         assertEq(meme.balanceOf(TREASURY), 0, "the remainder must stay here, not go to ops");
-        assertGt(sprout.balanceOf(TREASURY), 0, "a partial conversion still has to reach the burn");
+        assertGt(burnToken.balanceOf(TREASURY), 0, "a partial conversion still has to reach the burn");
     }
 
     /// And the harder case the bound can produce: a pool already sitting past the limit refuses
@@ -570,7 +570,9 @@ contract BuybackBurnSinkTest is Test {
         assertFalse(sink.canConvert(memeCurrency, 999), "an unregistered launch should report false");
 
         assertFalse(sink.canConvert(Currency.wrap(address(quote)), MEME_LAUNCH), "the quote leg is not convertible");
-        assertFalse(sink.canConvert(Currency.wrap(address(sprout)), MEME_LAUNCH), "the burn token is not convertible");
+        assertFalse(
+            sink.canConvert(Currency.wrap(address(burnToken)), MEME_LAUNCH), "the burn token is not convertible"
+        );
         assertFalse(sink.canConvert(Currency.wrap(address(stray)), MEME_LAUNCH), "a currency with no pool is not");
     }
 
@@ -582,9 +584,9 @@ contract BuybackBurnSinkTest is Test {
         sink.convert(Currency.wrap(address(quote)), MEME_LAUNCH);
 
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(sprout)))
+            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(burnToken)))
         );
-        sink.convert(Currency.wrap(address(sprout)), MEME_LAUNCH);
+        sink.convert(Currency.wrap(address(burnToken)), MEME_LAUNCH);
     }
 
     /// 🔴 The load-bearing check on the one setter that can aim a conversion. A locker built
@@ -665,9 +667,9 @@ contract BuybackBurnSinkTest is Test {
         sink.setHold(Currency.wrap(address(quote)), true);
 
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(sprout)))
+            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(burnToken)))
         );
-        sink.setHold(Currency.wrap(address(sprout)), true);
+        sink.setHold(Currency.wrap(address(burnToken)), true);
         vm.stopPrank();
     }
 
@@ -702,7 +704,7 @@ contract BuybackBurnSinkTest is Test {
 
         if (paused) manager.unpause();
         // And nothing walked off with it - whatever happened, the funds are here or they are
-        // wINJ/SPROUT that this contract went on to burn and split.
+        // the buyback pool that this contract went on to burn and split.
         assertEq(token.balanceOf(TREASURY), 0, "ops received a currency the burn was entitled to");
     }
 
@@ -784,15 +786,15 @@ contract BuybackBurnSinkTest is Test {
     /// The direct path: `harvest` sent the burn token itself, so there is no swap to hide
     /// behind. A failing `burn` must park the tranche whole.
     function test_aFailingBurnParksTheTokensInsteadOfBrickingTheHarvest() public {
-        sprout.mint(address(sink), 10 ether);
-        vm.mockCallRevert(address(sprout), abi.encodeWithSelector(MockBurnableERC20.burn.selector), "burn is down");
+        burnToken.mint(address(sink), 10 ether);
+        vm.mockCallRevert(address(burnToken), abi.encodeWithSelector(MockBurnableERC20.burn.selector), "burn is down");
 
         vm.expectEmit(true, false, false, true, address(sink));
-        emit BuybackBurnSink.Parked(Currency.wrap(address(sprout)), 10 ether, 4);
-        sink.burn(Currency.wrap(address(sprout)), 10 ether);
+        emit BuybackBurnSink.Parked(Currency.wrap(address(burnToken)), 10 ether, 4);
+        sink.burn(Currency.wrap(address(burnToken)), 10 ether);
 
-        assertEq(sprout.balanceOf(address(sink)), 10 ether, "the tranche should have parked here intact");
-        assertEq(sprout.balanceOf(TREASURY), 0, "the treasury leg must not land on its own");
+        assertEq(burnToken.balanceOf(address(sink)), 10 ether, "the tranche should have parked here intact");
+        assertEq(burnToken.balanceOf(TREASURY), 0, "the treasury leg must not land on its own");
     }
 
     /// ⛔ THE reason the settle is one atomic self-call and not a `try` around each leg.
@@ -803,24 +805,24 @@ contract BuybackBurnSinkTest is Test {
     /// split has to survive the failure whole, which means neither leg may land without the
     /// other.
     function test_aFailingTreasuryTransferLeavesTheWholeSplitForTheRetry() public {
-        uint256 supplyBefore = sprout.totalSupply();
-        sprout.mint(address(sink), 10 ether);
+        uint256 supplyBefore = burnToken.totalSupply();
+        burnToken.mint(address(sink), 10 ether);
         vm.mockCallRevert(
-            address(sprout), abi.encodeWithSelector(IERC20.transfer.selector, TREASURY), "treasury is blocked"
+            address(burnToken), abi.encodeWithSelector(IERC20.transfer.selector, TREASURY), "treasury is blocked"
         );
 
-        sink.burn(Currency.wrap(address(sprout)), 10 ether);
+        sink.burn(Currency.wrap(address(burnToken)), 10 ether);
 
-        assertEq(sprout.totalSupply(), supplyBefore + 10 ether, "the burn leg landed without the treasury leg");
-        assertEq(sprout.balanceOf(address(sink)), 10 ether, "the tranche should have parked here intact");
+        assertEq(burnToken.totalSupply(), supplyBefore + 10 ether, "the burn leg landed without the treasury leg");
+        assertEq(burnToken.balanceOf(address(sink)), 10 ether, "the tranche should have parked here intact");
 
         vm.clearMockedCalls();
-        sink.burn(Currency.wrap(address(sprout)), 10 ether);
+        sink.burn(Currency.wrap(address(burnToken)), 10 ether);
 
-        uint256 burnt = supplyBefore + 10 ether - sprout.totalSupply();
+        uint256 burnt = supplyBefore + 10 ether - burnToken.totalSupply();
         assertEq(burnt, 10 ether * uint256(FLOOR) / 10_000, "the retry did not burn burnBps of the WHOLE tranche");
-        assertEq(sprout.balanceOf(TREASURY), 10 ether - burnt, "the treasury did not get the remainder");
-        assertEq(sprout.balanceOf(address(sink)), 0, "the retry left something behind");
+        assertEq(burnToken.balanceOf(TREASURY), 10 ether - burnt, "the treasury did not get the remainder");
+        assertEq(burnToken.balanceOf(address(sink)), 0, "the retry left something behind");
     }
 
     /// The buyback path is the worse of the two call sites: by the time the settle runs the swap
@@ -828,27 +830,27 @@ contract BuybackBurnSinkTest is Test {
     /// buyback along with the harvest.
     function test_aFailingSettleDoesNotUnwindTheBuybackThatPrecededIt() public {
         quote.mint(address(sink), 100 ether);
-        vm.mockCallRevert(address(sprout), abi.encodeWithSelector(MockBurnableERC20.burn.selector), "burn is down");
+        vm.mockCallRevert(address(burnToken), abi.encodeWithSelector(MockBurnableERC20.burn.selector), "burn is down");
 
         sink.burn(Currency.wrap(address(quote)), 100 ether);
 
         assertGt(sink.lastBuybackAt(), 0, "the swap was unwound along with the settle");
         assertEq(quote.balanceOf(address(sink)), 0, "the quote was not spent, so the swap did not stand");
-        assertGt(sprout.balanceOf(address(sink)), 0, "the bought SPROUT should be parked here");
-        assertEq(sprout.balanceOf(TREASURY), 0, "nothing should have reached the treasury");
+        assertGt(burnToken.balanceOf(address(sink)), 0, "the bought burn token should be parked here");
+        assertEq(burnToken.balanceOf(TREASURY), 0, "nothing should have reached the treasury");
 
         // Nothing is stranded: the balance is what the next call acts on.
         vm.clearMockedCalls();
-        uint256 parked = sprout.balanceOf(address(sink));
-        sink.burn(Currency.wrap(address(sprout)), 0);
-        assertEq(sprout.balanceOf(address(sink)), 0, "a later call did not pick the parked tranche up");
-        assertEq(sprout.balanceOf(TREASURY), parked - parked * FLOOR / 10_000, "the retry shortchanged the treasury");
+        uint256 parked = burnToken.balanceOf(address(sink));
+        sink.burn(Currency.wrap(address(burnToken)), 0);
+        assertEq(burnToken.balanceOf(address(sink)), 0, "a later call did not pick the parked tranche up");
+        assertEq(burnToken.balanceOf(TREASURY), parked - parked * FLOOR / 10_000, "the retry shortchanged the treasury");
     }
 
     /// It moves the burn token, so it exists only to be `try`ed from inside this contract. An
     /// open one would be a permissionless way to force the split at a chosen moment.
     function test_settleBurnTokenSelfIsCallableOnlyByTheContractItself() public {
-        sprout.mint(address(sink), 10 ether);
+        burnToken.mint(address(sink), 10 ether);
 
         vm.prank(STRANGER);
         vm.expectRevert(BuybackBurnSink.NotSelf.selector);
@@ -860,7 +862,7 @@ contract BuybackBurnSinkTest is Test {
         vm.expectRevert(BuybackBurnSink.NotSelf.selector);
         sink.settleBurnTokenSelf();
 
-        assertEq(sprout.balanceOf(address(sink)), 10 ether, "a refused call moved something anyway");
+        assertEq(burnToken.balanceOf(address(sink)), 10 ether, "a refused call moved something anyway");
     }
 
     // ── the second leg: a launch paired against another quote asset (D28/A2) ──
@@ -894,12 +896,12 @@ contract BuybackBurnSinkTest is Test {
             "the second leg must be the registered route"
         );
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         sink.convert(pre2eCurrency, SAI_LAUNCH);
 
         assertEq(pre2e.balanceOf(address(sink)), 0, "the launch token did not convert");
         assertEq(sai.balanceOf(address(sink)), 0, "the intermediate should not linger in the sink");
-        assertLt(sprout.totalSupply(), supplyBefore, "a SAI-paired graduate's revenue never reached the burn");
+        assertLt(burnToken.totalSupply(), supplyBefore, "a SAI-paired graduate's revenue never reached the burn");
     }
 
     /// 🔑 **The other half of a SAI-paired launch's fee, and it needs no hint at all.** A
@@ -920,11 +922,11 @@ contract BuybackBurnSinkTest is Test {
         vm.prank(TIMELOCK);
         sink.setQuoteRoute(saiCurrency, saiQuotePool);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         sink.burn(saiCurrency, 0);
 
         assertEq(sai.balanceOf(address(sink)), 0, "the pair asset did not convert");
-        assertLt(sprout.totalSupply(), supplyBefore, "the pair asset's revenue never reached the burn");
+        assertLt(burnToken.totalSupply(), supplyBefore, "the pair asset's revenue never reached the burn");
     }
 
     /// ⚠️ **The registered route chooses a VENUE, never a destination.** Both checks in
@@ -954,9 +956,9 @@ contract BuybackBurnSinkTest is Test {
         );
         sink.setQuoteRoute(Currency.wrap(address(quote)), saiQuotePool);
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(sprout)))
+            abi.encodeWithSelector(BuybackBurnSink.NotAConvertibleCurrency.selector, Currency.wrap(address(burnToken)))
         );
-        sink.setQuoteRoute(Currency.wrap(address(sprout)), saiQuotePool);
+        sink.setQuoteRoute(Currency.wrap(address(burnToken)), saiQuotePool);
         vm.stopPrank();
     }
 
@@ -1107,7 +1109,7 @@ contract BuybackBurnSinkTest is Test {
     /// Both legs being right does not make the pool exist. A key on an unopened tier used to
     /// install cleanly and then park every tranche silently.
     function test_setBuybackPoolRejectsAPoolThatWasNeverInitialised() public {
-        PoolKey memory ghost = _key(quote, sprout, 3000); // same legs, a tier nobody opened
+        PoolKey memory ghost = _key(quote, burnToken, 3000); // same legs, a tier nobody opened
         vm.prank(TIMELOCK);
         vm.expectRevert(BuybackBurnSink.PoolNotInitialised.selector);
         sink.setBuybackPool(ghost);
@@ -1140,7 +1142,7 @@ contract BuybackBurnSinkTest is Test {
     function test_constructorRejectsABurnShareUnderItsOwnFloor() public {
         vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.BurnBpsBelowFloor.selector, uint16(5000), FLOOR));
         new BuybackBurnSink(
-            IBurnableERC20(address(sprout)),
+            IBurnableERC20(address(burnToken)),
             Currency.wrap(address(quote)),
             IVault(address(vault)),
             ICLPositionManager(address(posm)),
@@ -1157,7 +1159,7 @@ contract BuybackBurnSinkTest is Test {
     /// to take burn revenue before it is burnt.
     function test_sweepCannotTouchEitherLegOfTheBuyback() public {
         quote.mint(address(sink), 10 ether);
-        deal(address(sprout), address(sink), 10 ether);
+        deal(address(burnToken), address(sink), 10 ether);
 
         vm.startPrank(TIMELOCK);
         vm.expectRevert(
@@ -1166,17 +1168,17 @@ contract BuybackBurnSinkTest is Test {
         sink.sweep(Currency.wrap(address(quote)), TIMELOCK);
 
         vm.expectRevert(
-            abi.encodeWithSelector(BuybackBurnSink.CannotSweepBuybackLeg.selector, Currency.wrap(address(sprout)))
+            abi.encodeWithSelector(BuybackBurnSink.CannotSweepBuybackLeg.selector, Currency.wrap(address(burnToken)))
         );
-        sink.sweep(Currency.wrap(address(sprout)), TIMELOCK);
+        sink.sweep(Currency.wrap(address(burnToken)), TIMELOCK);
         vm.stopPrank();
 
         assertEq(quote.balanceOf(address(sink)), 10 ether, "quote left the sink");
-        assertEq(sprout.balanceOf(address(sink)), 10 ether, "burn token left the sink");
+        assertEq(burnToken.balanceOf(address(sink)), 10 ether, "burn token left the sink");
     }
 
     /// 🔴 A launch token became burn revenue the moment it became convertible, so excluding
-    /// only wINJ and SPROUT stopped being enough. Sweeping now needs the D32 designation, which
+    /// only wINJ and the burn token stopped being enough. Sweeping now needs the D32 designation, which
     /// makes taking one out two calls that both emit rather than one that looks like tidying.
     function test_sweepNeedsTheHoldDesignationFirst() public {
         meme.mint(address(sink), 7 ether);
@@ -1234,7 +1236,7 @@ contract BuybackBurnSinkTest is Test {
     }
 
     function test_setBuybackPoolDerivesTheSwapDirection() public view {
-        bool quoteIsFirst = address(quote) < address(sprout);
+        bool quoteIsFirst = address(quote) < address(burnToken);
         assertEq(sink.quoteIsCurrency0(), quoteIsFirst, "swap direction was derived wrongly");
     }
 
@@ -1274,7 +1276,7 @@ contract BuybackBurnSinkTest is Test {
 
     function _freshSink() internal returns (BuybackBurnSink) {
         return new BuybackBurnSink(
-            IBurnableERC20(address(sprout)),
+            IBurnableERC20(address(burnToken)),
             Currency.wrap(address(quote)),
             IVault(address(vault)),
             ICLPositionManager(address(posm)),

@@ -18,7 +18,7 @@
     "safeFallbackHandler": "0xfd0732Dc9E303f09fCEf3a7388Ad10A83459Ec99",
     "sai": "0x8Dc3ECb97E6E5f08cd490bA3089DA0BB9D59ccB4",
     "externalNote": "Every address in this group was read off chain 1776 on 2026-09-07, not copied from the testnet book. eth_getCode sizes: permit2 9,152 / wINJ 5,954 / Arachnid CREATE2 69 / Safe proxy factory 3,054 / Safe singleton L2 24,421 / Safe fallback handler 5,637 - identical to the testnet deployment's, which is the point: the whole Safe stack and Permit2 are canonical on both nets at the same addresses, so nothing here has to be deployed. The two precompiles answer eth_getCode with 0x on Injective and always will; that is expected and is not evidence of absence.",
-    "tokenNote": "usdt / usdc / sai were each proved by calling them: symbol() and decimals() answered USDT/6, USDC/6, SAI/18 on 1776. 🔴 THE TESTNET BOOK'S TWO-USDC TRAP DOES NOT EXIST HERE. On 1439 the launchpad quotes its own tokenfactory USDC (external.padUsdc) while external.usdc is the Circle FiatToken, and both answer symbol() == 'USDC'. On mainnet the pad quotes EVM-native USDC 0xa00C59fF..., which IS this entry - shroom_launchpad/contracts/deployments/injective_mainnet.json quoteAssets.USDC.pairAsset - so there is one USDC and no padUsdc key. Do not add one.",
+    "tokenNote": "usdt / usdc / sai were each proved by calling them: symbol() and decimals() answered USDT/6, USDC/6, SAI/18 on 1776. 🔴 THE TESTNET BOOK'S TWO-USDC TRAP DOES NOT EXIST HERE. On 1439 the launchpad quotes its own tokenfactory USDC (external.padUsdc) while external.usdc is the Circle FiatToken, and both answer symbol() == 'USDC'. On mainnet the pad quotes EVM-native USDC 0xa00C59fF..., which IS this entry - the launchpad's own mainnet book, quoteAssets.USDC.pairAsset - so there is one USDC and no padUsdc key. Do not add one.",
     "usdtNote": "Mainnet USDT is the peggy USDT ERC20-module pair, 6 decimals. It is recorded because wINJ/USDT is the deepest INJ pair on the chain and is the obvious first seeded pool, NOT because anything is committed to it. No pool exists yet; see `pools`."
   },
   "governance": {
@@ -77,9 +77,9 @@
     "core": null,
     "views": null,
     "treasury": null,
-    "sproutToken": null,
-    "sproutLaunchId": null,
-    "launchpadNote": "⛔ BLOCKED ON AN UNSETTLED DECISION, and it is not this deploy's to make. MAINNET_READINESS Part 2 opens on it: is sprout.fun mainnet a NEW core, or the live shroom core 0xd948740da926E8908A08414879490d0D8F96D463? The plan's own logic points at a new core (option A) - it is the only way the A2/C3/B7 quote gates ship, the pad has done exactly this cutover once already with a written runbook, and the 177 live shroom launches stay where they are rather than being stranded. Until it is settled in writing in SPROUT_TOKENOMICS, these stay null. 🔑 NOTHING IN CHOICE V2 PHASE 1 READS THIS GROUP - scripts 01, 02, 03, 07 and 08 are the whole DEX deploy and none of them touch the launchpad. Only 05 (settler), 09 (sink) and 10 (cranker) do, and those are sprout's phases. So this being unsettled does not block the AMM."
+    "burnToken": null,
+    "burnTokenLaunchId": null,
+    "launchpadNote": "⛔ BLOCKED ON AN UNSETTLED DECISION, and it is not this deploy's to make. MAINNET_READINESS Part 2 opens on it: is the launchpad's mainnet a NEW core, or the live core 0xd948740da926E8908A08414879490d0D8F96D463? The plan's own logic points at a new core (option A) - it is the only way the A2/C3/B7 quote gates ship, the pad has done exactly this cutover once already with a written runbook, and the 177 live launches stay where they are rather than being stranded. Until the launchpad settles it in writing, these stay null. 🔑 NOTHING IN CHOICE V2 PHASE 1 READS THIS GROUP - scripts 01, 02, 03, 07 and 08 are the whole DEX deploy and none of them touch the launchpad. Only 05 (settler), 09 (sink) and 10 (cranker) do, and those are the launchpad's phases. So this being unsettled does not block the AMM."
   },
   "pools": [],
   "meta": {

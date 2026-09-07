@@ -27,7 +27,7 @@ behind any deployed address is recoverable from this repository alone.
 
 Two files carry a different identifier and it is deliberate:
 
-  src/interfaces/IGraduationSettler.sol   MIT, mirrored from shroom_launchpad
-  src/interfaces/ILaunchpadCore.sol       MIT, mirrored from shroom_launchpad
+  src/interfaces/IGraduationSettler.sol   MIT, mirrored from the launchpad's contracts
+  src/interfaces/ILaunchpadCore.sol       MIT, mirrored from the launchpad's contracts
 
 MIT is GPL-compatible, so the combined work remains distributable under the GPL.

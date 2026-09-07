@@ -45,7 +45,7 @@ import {MockPushPositionLocker} from "./mocks/MockPushPositionLocker.sol";
 /// **Nothing is mocked below the launchpad core.** A real settler graduates a real launch onto a
 /// real `CLPoolManager` pool, a real `CLPositionManager` holds the seed position, a real
 /// `PositionLocker` owns it, real swaps accrue real LP fees, and a real `BuybackBurnSink` sells
-/// the launch token into the pool the position manager says it is in and destroys the SPROUT it
+/// the launch token into the pool the position manager says it is in and destroys the tokens it
 /// buys. That matters here more than in the sink's own unit tests: the claim under test is
 /// "one call takes accrued fees to burnt supply", and every hand-written stand-in between the
 /// two ends is somewhere the claim could be true of the fixture and false of the chain.
@@ -73,7 +73,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
     MockERC20 internal launchToken;
     MockERC20 internal quote; // wINJ, and the sink's QUOTE
-    MockBurnableERC20 internal sprout;
+    MockBurnableERC20 internal burnToken;
 
     PoolKey internal buybackPool;
 
@@ -120,10 +120,10 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         feeController.setLaunchPoolGuardHook(guardHook);
 
         quote = new MockERC20("Wrapped INJ", "wINJ", 18);
-        sprout = new MockBurnableERC20("Sprout", "SPROUT", 18);
+        burnToken = new MockBurnableERC20("Burn Token", "BURN", 18);
 
         sink = new BuybackBurnSink(
-            IBurnableERC20(address(sprout)),
+            IBurnableERC20(address(burnToken)),
             Currency.wrap(address(quote)),
             IVault(address(vault)),
             posm,
@@ -134,7 +134,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         );
         cranker = new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), sink, OWNER);
 
-        buybackPool = _plainKey(quote, sprout);
+        buybackPool = _plainKey(quote, burnToken);
         _seed(buybackPool, 1_000_000 ether);
 
         address[] memory lockers = new address[](1);
@@ -143,7 +143,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         sink.setBuybackPool(buybackPool);
         sink.setLockers(lockers);
         sink.setGuards(0.0001 ether, 500, INTERVAL);
-        // B6: the field that IS the sprout revenue feed. It pointed at the pad treasury for the
+        // B6: the field that IS the burnToken revenue feed. It pointed at the pad treasury for the
         // whole life of the first two sinks, so the burn leg was fed by nothing.
         locker.setLaunchpadTreasury(address(sink));
         vm.stopPrank();
@@ -157,13 +157,13 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
     /// **The claim this contract exists to make.** Trading a graduated pool accrues LP fees
     /// inside a locked position and nothing else happens. One permissionless call turns that
-    /// into destroyed SPROUT.
-    function test_oneCallTakesAccruedFeesAllTheWayToBurntSprout() public {
+    /// into a destroyed burn token.
+    function test_oneCallTakesAccruedFeesAllTheWayToABurntToken() public {
         _graduate();
         _swap(_launchKey(), true, 50_000e18);
         _swap(_launchKey(), false, 10e18);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
 
         vm.prank(STRANGER);
         LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
@@ -171,11 +171,11 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertGt(result.collected0 + result.collected1, 0, "the crank collected nothing");
         assertGt(result.claimed0 + result.claimed1, 0, "the crank claimed nothing to the sink");
         assertTrue(result.drove0 && result.drove1, "one of the sink legs did not run");
-        assertLt(sprout.totalSupply(), supplyBefore, "no SPROUT was destroyed");
+        assertLt(burnToken.totalSupply(), supplyBefore, "no burn token was destroyed");
 
         // 80% burnt, 20% to ops - the immutable floor, measured rather than assumed.
-        uint256 burnt = supplyBefore - sprout.totalSupply();
-        uint256 toOps = sprout.balanceOf(OPS);
+        uint256 burnt = supplyBefore - burnToken.totalSupply();
+        uint256 toOps = burnToken.balanceOf(OPS);
         assertEq(burnt, (burnt + toOps) * FLOOR / 10_000, "the split is not burnBps of what was bought");
     }
 
@@ -203,7 +203,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
         assertEq(launchToken.balanceOf(address(sink)), 0, "the launch-token leg did not clear");
         assertEq(quote.balanceOf(address(sink)), 0, "the quote leg did not clear in the same call");
-        assertEq(sprout.balanceOf(address(sink)), 0, "SPROUT was left sitting in the sink");
+        assertEq(burnToken.balanceOf(address(sink)), 0, "burn tokens were left sitting in the sink");
     }
 
     /// 🔴 A helper that reverts when there is nothing to do is useless to the keeper it exists
@@ -255,12 +255,12 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         ids[1] = LAUNCH_ID;
         ids[2] = 1000;
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         bool[] memory ok = cranker.crankMany(ids);
         assertFalse(ok[0], "an unregistered launch reported success");
         assertTrue(ok[1], "the real launch was skipped because of its neighbours");
         assertFalse(ok[2], "an unregistered launch reported success");
-        assertLt(sprout.totalSupply(), supplyBefore, "the batch burnt nothing");
+        assertLt(burnToken.totalSupply(), supplyBefore, "the batch burnt nothing");
     }
 
     /// ⛔ The crank moves the LAUNCHPAD's share and nothing else. The creator's credit is their
@@ -304,7 +304,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
         assertEq(launchToken.balanceOf(address(cranker)), 0, "the cranker kept launch tokens");
         assertEq(quote.balanceOf(address(cranker)), 0, "the cranker kept quote");
-        assertEq(sprout.balanceOf(address(cranker)), 0, "the cranker kept SPROUT");
+        assertEq(burnToken.balanceOf(address(cranker)), 0, "the cranker kept burn tokens");
     }
 
     /// It adds no trust: every destination was already fixed, so anybody may choose the moment.
@@ -317,7 +317,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
         assertEq(launchToken.balanceOf(STRANGER), 0, "the caller was paid in launch tokens");
         assertEq(quote.balanceOf(STRANGER), 0, "the caller was paid in quote");
-        assertEq(sprout.balanceOf(STRANGER), 0, "the caller was paid in SPROUT");
+        assertEq(burnToken.balanceOf(STRANGER), 0, "the caller was paid in burn tokens");
     }
 
     /// 🔴 B6, as a question anybody can ask. Both lockers pointed `launchpadTreasury` somewhere
@@ -339,12 +339,12 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         vm.prank(OWNER);
         locker.setLaunchpadTreasury(OPS);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
 
         assertGt(result.claimed0 + result.claimed1, 0, "nothing was paid out at all");
         assertGt(launchToken.balanceOf(OPS) + quote.balanceOf(OPS), 0, "the named treasury was not paid");
-        assertEq(sprout.totalSupply(), supplyBefore, "an unwired feed still burnt something");
+        assertEq(burnToken.totalSupply(), supplyBefore, "an unwired feed still burnt something");
     }
 
     /// ⚠️ D28's open edge, reached through the crank. A launch paired against an asset that is
@@ -358,14 +358,14 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         _swap(_launchKeyAgainst(otherQuote), true, 50_000e18);
         _swap(_launchKeyAgainst(otherQuote), false, 10e18);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
 
         assertGt(result.collected0 + result.collected1, 0, "the collect was taken down with the convert");
         assertGt(result.claimed0 + result.claimed1, 0, "the claim was taken down with the convert");
         assertFalse(result.drove0 && result.drove1, "a leg with no route reported that it drove");
         assertGt(launchToken.balanceOf(address(sink)) + otherQuote.balanceOf(address(sink)), 0, "nothing arrived");
-        assertEq(sprout.totalSupply(), supplyBefore, "something burnt through a pool that cannot exist");
+        assertEq(burnToken.totalSupply(), supplyBefore, "something burnt through a pool that cannot exist");
     }
 
     /// 🔫 **The same launch, after the second leg exists — the whole of A2, end to end.**
@@ -374,7 +374,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     /// the same real `PositionLocker` and the same real `CLPositionManager`. One owner call
     /// registers the pool SAI reaches wINJ through, and the identical crank now takes BOTH
     /// halves of the fee — the launch token through two legs, and the SAI half through one —
-    /// all the way to destroyed SPROUT.
+    /// all the way to a destroyed burn token.
     function test_aLaunchPairedAgainstAnotherAssetBurnsOnceTheSecondLegIsRegistered() public {
         MockERC20 otherQuote = new MockERC20("Sai", "SAI", 18);
         launchToken = _tokenOrderedAgainst(otherQuote, true);
@@ -390,7 +390,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         vm.prank(OWNER);
         sink.setQuoteRoute(Currency.wrap(address(otherQuote)), hop);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
 
         vm.prank(STRANGER);
         LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
@@ -398,25 +398,25 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertGt(result.collected0 + result.collected1, 0, "nothing was collected");
         assertGt(result.claimed0 + result.claimed1, 0, "nothing was claimed");
         assertTrue(result.drove0 && result.drove1, "a leg was still refused after the route existed");
-        assertLt(supplyBefore - sprout.totalSupply(), supplyBefore, "sanity");
-        assertGt(supplyBefore - sprout.totalSupply(), 0, "a SAI-paired graduate still burnt nothing");
-        assertGt(sprout.balanceOf(OPS), 0, "the ops share never reached the treasury");
+        assertLt(supplyBefore - burnToken.totalSupply(), supplyBefore, "sanity");
+        assertGt(supplyBefore - burnToken.totalSupply(), 0, "a SAI-paired graduate still burnt nothing");
+        assertGt(burnToken.balanceOf(OPS), 0, "the ops share never reached the treasury");
     }
 
     /// The launchpad's own token is a launch like any other, and its LP fees are burn revenue
     /// with no swap in the way: the sink's `BURN_TOKEN` arm splits and destroys the balance.
-    function test_aSproutPairedLaunchBurnsItsOwnLegDirectly() public {
-        launchToken = MockERC20(address(sprout));
+    function test_aBurnTokenPairedLaunchBurnsItsOwnLegDirectly() public {
+        launchToken = MockERC20(address(burnToken));
         _graduate();
         _swap(_launchKey(), true, 50_000e18);
         _swap(_launchKey(), false, 10e18);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
 
         assertTrue(result.drove0 && result.drove1, "one of the legs did not run");
-        assertLt(sprout.totalSupply(), supplyBefore, "the burn token's own fee leg was not destroyed");
-        assertEq(sprout.balanceOf(address(sink)), 0, "SPROUT was left sitting in the sink");
+        assertLt(burnToken.totalSupply(), supplyBefore, "the burn token's own fee leg was not destroyed");
+        assertEq(burnToken.balanceOf(address(sink)), 0, "burn tokens were left sitting in the sink");
     }
 
     // =====================================================================================
@@ -481,7 +481,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertEq(address(cranker.SINK()), address(sink), "wrong sink");
         assertEq(address(cranker.POSITION_MANAGER()), address(posm), "position manager was not read off the locker");
         assertEq(Currency.unwrap(cranker.QUOTE()), address(quote), "quote was not read off the sink");
-        assertEq(cranker.BURN_TOKEN(), address(sprout), "burn token was not read off the sink");
+        assertEq(cranker.BURN_TOKEN(), address(burnToken), "burn token was not read off the sink");
     }
 
     function test_theCrankerRefusesAZeroArgument() public {
@@ -507,7 +507,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     // =====================================================================================
 
     /// **The claim A9 rests on, executed rather than asserted.** The 1.0.0 locker holds
-    /// launches 13-17 on testnet - SPROUT's own launch 15 among them - and has no `claim` at
+    /// launches 13-17 on testnet - the burn token's own launch among them - and has no `claim` at
     /// all: it PUSHES the launchpad's share on `collect`. A6's header says one bytecode serves
     /// both generations because the `try` around `claim` tolerates the missing function, and
     /// until this test nothing had ever run it against a locker that lacks it. A call to an
@@ -515,7 +515,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     /// every gate and then wedged a graduation on 2026-09-06.
     ///
     /// So: the same contract, deployed against a push locker, still takes accrued LP fees to
-    /// destroyed SPROUT - and reports `claimed == 0`, because the money arrived a step earlier.
+    /// a destroyed burn token - and reports `claimed == 0`, because the money arrived a step earlier.
     function test_aSecondInstanceAgainstAPushLockerStillBurns() public {
         LaunchFeeCranker legacyCranker = _pushLockerCranker();
 
@@ -523,7 +523,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         _swap(_launchKey(), true, 50_000e18);
         _swap(_launchKey(), false, 10e18);
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
 
         vm.prank(STRANGER);
         LaunchFeeCranker.Crank memory result = legacyCranker.crank(LAUNCH_ID);
@@ -534,7 +534,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         // already been delivered by `collect`.
         assertEq(result.claimed0 + result.claimed1, 0, "a push locker cannot have claimed anything");
         assertTrue(result.drove0 && result.drove1, "one of the sink legs did not run");
-        assertLt(sprout.totalSupply(), supplyBefore, "no SPROUT was destroyed through the push locker");
+        assertLt(burnToken.totalSupply(), supplyBefore, "nothing was destroyed through the push locker");
     }
 
     /// ⚠️ And it must not be an accident of the fixture: prove the locker really does refuse
@@ -596,7 +596,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     /// **The A9 case, undone.** This is the whole argument for the setters, as one test.
     ///
     /// Plan A9 had to deploy a SECOND cranker to reach the older locker generation, because
-    /// `LOCKER` was immutable - and for as long as only one existed, SPROUT's own launch 15 had
+    /// `LOCKER` was immutable - and for as long as only one existed, the burn token's own launch had
     /// nothing scheduled to move its fees while the keeper reported a healthy pass every fifteen
     /// minutes. Here the SAME instance is repointed and immediately cranks the other
     /// generation's launch, burning real supply. One timelock call instead of a deploy.
@@ -625,9 +625,9 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertTrue(cranker.feedIsWired(), "the repointed locker does not pay this sink");
         assertTrue(cranker.sinkKnowsOurLocker(), "the sink cannot resolve the repointed locker");
 
-        uint256 supplyBefore = sprout.totalSupply();
+        uint256 supplyBefore = burnToken.totalSupply();
         cranker.crank(LAUNCH_ID);
-        assertLt(sprout.totalSupply(), supplyBefore, "the repointed cranker burnt nothing");
+        assertLt(burnToken.totalSupply(), supplyBefore, "the repointed cranker burnt nothing");
     }
 
     /// 🔴 The derived caches are the reason these are setters and not raw storage writes.
@@ -654,7 +654,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     /// wrapped in a `try`, so a stale copy would misroute in silence rather than revert.
     function test_repointingTheSinkReDerivesQuoteAndBurnToken() public {
         MockERC20 otherQuote = new MockERC20("Other", "OTH", 18);
-        MockBurnableERC20 otherBurn = new MockBurnableERC20("Other Sprout", "OSPT", 18);
+        MockBurnableERC20 otherBurn = new MockBurnableERC20("Other Burn Token", "OBRN", 18);
         BuybackBurnSink otherSink = new BuybackBurnSink(
             IBurnableERC20(address(otherBurn)),
             Currency.wrap(address(otherQuote)),
@@ -672,7 +672,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
             address(otherSink),
             Currency.wrap(address(quote)),
             Currency.wrap(address(otherQuote)),
-            address(sprout),
+            address(burnToken),
             address(otherBurn)
         );
         vm.prank(OWNER);
@@ -787,7 +787,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         });
     }
 
-    /// @dev The buyback pool. Not a graduation pool - SPROUT has not graduated in this fixture -
+    /// @dev The buyback pool. Not a graduation pool - the burn token has not graduated in this fixture -
     /// so it carries no hook and is opened directly.
     function _plainKey(MockERC20 a, MockERC20 b) internal view returns (PoolKey memory) {
         (address c0, address c1) = address(a) < address(b) ? (address(a), address(b)) : (address(b), address(a));
