@@ -37,6 +37,7 @@ import {LaunchPoolGuardHook} from "../src/launchpad/LaunchPoolGuardHook.sol";
 import {PositionLocker} from "../src/launchpad/PositionLocker.sol";
 import {MockBurnableERC20} from "./mocks/MockBurnableERC20.sol";
 import {MockLaunchpadCore} from "./mocks/MockLaunchpadCore.sol";
+import {MockPushPositionLocker} from "./mocks/MockPushPositionLocker.sol";
 
 /// @notice Plan A6, and the end-to-end half of A5.
 ///
@@ -496,6 +497,93 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         (uint256 tokenId, PoolKey memory key) = cranker.launchPool(LAUNCH_ID);
         assertEq(tokenId, locker.getPosition(LAUNCH_ID).tokenId, "the wrong position");
         assertEq(PoolId.unwrap(key.toId()), PoolId.unwrap(_launchKey().toId()), "the wrong pool");
+    }
+
+    // =====================================================================================
+    // A9 - a SECOND instance, bound to the PUSH locker generation
+    // =====================================================================================
+
+    /// **The claim A9 rests on, executed rather than asserted.** The 1.0.0 locker holds
+    /// launches 13-17 on testnet - SPROUT's own launch 15 among them - and has no `claim` at
+    /// all: it PUSHES the launchpad's share on `collect`. A6's header says one bytecode serves
+    /// both generations because the `try` around `claim` tolerates the missing function, and
+    /// until this test nothing had ever run it against a locker that lacks it. A call to an
+    /// absent selector reverts with EMPTY returndata, which is exactly the shape that passed
+    /// every gate and then wedged a graduation on 2026-09-06.
+    ///
+    /// So: the same contract, deployed against a push locker, still takes accrued LP fees to
+    /// destroyed SPROUT - and reports `claimed == 0`, because the money arrived a step earlier.
+    function test_aSecondInstanceAgainstAPushLockerStillBurns() public {
+        LaunchFeeCranker legacyCranker = _pushLockerCranker();
+
+        _graduate();
+        _swap(_launchKey(), true, 50_000e18);
+        _swap(_launchKey(), false, 10e18);
+
+        uint256 supplyBefore = sprout.totalSupply();
+
+        vm.prank(STRANGER);
+        LaunchFeeCranker.Crank memory result = legacyCranker.crank(LAUNCH_ID);
+
+        assertGt(result.collected0 + result.collected1, 0, "the crank collected nothing");
+        // 🔑 The distinguishing observation: a PULL locker reports what it claimed, a PUSH
+        // locker reports zero because `claim` reverted into the `try` and the money had
+        // already been delivered by `collect`.
+        assertEq(result.claimed0 + result.claimed1, 0, "a push locker cannot have claimed anything");
+        assertTrue(result.drove0 && result.drove1, "one of the sink legs did not run");
+        assertLt(sprout.totalSupply(), supplyBefore, "no SPROUT was destroyed through the push locker");
+    }
+
+    /// ⚠️ And it must not be an accident of the fixture: prove the locker really does refuse
+    /// `claim` with empty returndata, which is the only thing the `try` can be tolerating.
+    function test_thePushLockerHasNoClaimToCall() public {
+        MockPushPositionLocker pushLocker = new MockPushPositionLocker(locker, address(sink));
+        (bool ok, bytes memory ret) =
+            address(pushLocker).call(abi.encodeCall(ILaunchPositionLocker.claim, (Currency.wrap(address(quote)), OPS)));
+        assertFalse(ok, "the push locker answered claim");
+        assertEq(ret.length, 0, "the refusal carried returndata - that is not a missing function");
+    }
+
+    /// 🔴 Two instances, two lockers, ONE sink - and neither can reach the other's launches.
+    /// That is the property that made launch 15 invisible for a day, stated from both sides so
+    /// a future "just teach it to sniff the generation" has something to fail against.
+    function test_eachInstanceSeesOnlyItsOwnLockersLaunches() public {
+        LaunchFeeCranker legacyCranker = _pushLockerCranker();
+        _graduate();
+
+        (uint256 liveTokenId,) = cranker.launchPool(LAUNCH_ID);
+        (uint256 legacyTokenId,) = legacyCranker.launchPool(LAUNCH_ID);
+        assertGt(liveTokenId, 0, "the live cranker cannot see its own locker's launch");
+        // The fixture graduates into the inner locker, which the push wrapper delegates to, so
+        // here BOTH see it. What must never be equal is the locker each one collects from.
+        assertEq(legacyTokenId, liveTokenId, "the push wrapper reports a different position");
+        assertTrue(
+            address(cranker.LOCKER()) != address(legacyCranker.LOCKER()), "two instances collecting from one locker"
+        );
+
+        // A launch registered in NEITHER is invisible to both, and says so the same way.
+        (uint256 none,) = legacyCranker.launchPool(LAUNCH_ID + 1);
+        assertEq(none, 0, "an unregistered launch reported a position");
+        vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotRegistered.selector, LAUNCH_ID + 1));
+        legacyCranker.crank(LAUNCH_ID + 1);
+    }
+
+    /// @dev A cranker bound to a push locker whose credit feeds this sink, wired the way script
+    /// 10 wires it: the sink must LIST the locker or every crank collects and finds no route.
+    function _pushLockerCranker() internal returns (LaunchFeeCranker legacyCranker) {
+        MockPushPositionLocker pushLocker = new MockPushPositionLocker(locker, address(sink));
+        legacyCranker = new LaunchFeeCranker(ILaunchPositionLocker(address(pushLocker)), sink);
+
+        address[] memory lockers = new address[](2);
+        lockers[0] = address(locker);
+        lockers[1] = address(pushLocker);
+        vm.startPrank(OWNER);
+        sink.setLockers(lockers);
+        // The inner locker now credits the WRAPPER, which is what makes the wrapper a push.
+        locker.setLaunchpadTreasury(address(pushLocker));
+        vm.stopPrank();
+
+        assertTrue(legacyCranker.feedIsWired(), "the push locker does not pay this sink");
     }
 
     // =====================================================================================
