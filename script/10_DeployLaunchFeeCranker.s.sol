@@ -65,17 +65,21 @@ contract DeployLaunchFeeCranker is BaseScript {
     string internal constant LIVE_LOCKER_KEY = "choice.positionLocker";
     string internal constant LEGACY_LOCKER_KEY = "choice.positionLockerLegacy";
 
-    /// 1.1.0 is plan A6 against sink 1.3.0. 🔴 Bump this whenever the sink's salt moves - see
-    /// the header. It moved for A2: the sink gained `setQuoteRoute` and a two-leg `convert`, and
-    /// this contract's `SINK` is immutable, so an instance pointed at 1.2.0 would keep driving
-    /// the superseded sink for ever while every document said the second leg was live.
-    bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/1.1.0");
+    /// 2.0.0 adds the timelock-owned `setSink` / `setLocker`, so the constructor takes an owner
+    /// and the creation code changed - a CREATE3 salt MUST move with it, or `factory.deploy`
+    /// lands on an address that already has code and reverts.
+    ///
+    /// ✅ **And this is the LAST time the salt has to move for a sink swap.** Bumping it used to
+    /// be mandatory whenever the sink's own salt moved, because `SINK` was immutable; from 2.0.0
+    /// that is a `setSink` call behind the timelock. Bump this only when THIS contract's code
+    /// changes.
+    bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/2.0.0");
 
     /// The A9 instance, bound to the 1.0.0 PUSH locker. A DISTINCT salt, deliberately spelled
     /// out rather than derived from the locker key: the live instance is already deployed at the
     /// address the constant above names, and a scheme that computed both would be one refactor
     /// away from moving it.
-    bytes32 internal constant CRANKER_LEGACY_SALT = keccak256("CHOICE-V2/LaunchFeeCrankerLegacy/1.1.0");
+    bytes32 internal constant CRANKER_LEGACY_SALT = keccak256("CHOICE-V2/LaunchFeeCrankerLegacy/2.0.0");
 
     function run() public {
         string memory lockerKey = vm.envOr("CRANKER_LOCKER_KEY", LIVE_LOCKER_KEY);
@@ -84,9 +88,11 @@ contract DeployLaunchFeeCranker is BaseScript {
         Create3Factory factory = Create3Factory(readAddress("governance.create3Factory"));
         address locker = readAddress(lockerKey);
         address sink = readAddress("choice.buybackBurnSink");
+        address timelock = readAddress("governance.timelock");
 
         requireCode("positionLocker", locker);
         requireCode("buybackBurnSink", sink);
+        requireCode("timelock", timelock);
 
         console.log("locker key       :", lockerKey);
         console.log("locker           :", locker);
@@ -100,7 +106,7 @@ contract DeployLaunchFeeCranker is BaseScript {
             // included - hashing the bare `creationCode` fails with `CreationCodeHashMismatch`.
             bytes memory payload = abi.encodePacked(
                 type(LaunchFeeCranker).creationCode,
-                abi.encode(ILaunchPositionLocker(locker), BuybackBurnSink(payable(sink)))
+                abi.encode(ILaunchPositionLocker(locker), BuybackBurnSink(payable(sink)), timelock)
             );
 
             vm.startBroadcast(deployerKey());
@@ -122,6 +128,12 @@ contract DeployLaunchFeeCranker is BaseScript {
         // instances alive, checking the live locker unconditionally would pass the legacy
         // instance's deploy for the wrong reason and then fail it for a real one.
         require(address(c.LOCKER()) == locker, "cranker collects from a different locker than the book names");
+        // 🔴 The owner assertion, and it is the one that makes 2.0.0's setters defensible at all.
+        // `setSink` and `setLocker` behind a 24-hour timelock is a bounded trade (see the
+        // contract's header); the same two functions behind an EOA are a mutable burn destination
+        // in one hand, which is exactly what plan A6 refused. An instance owned by anything but
+        // the timelock must not be adopted, and this is where a deploy finds out.
+        require(c.owner() == timelock, "cranker is not owned by the timelock");
 
         // The sink must be able to resolve this locker's launches, or every crank collects and
         // claims and then finds no route. It is a `setLockers` call on the sink, not here.

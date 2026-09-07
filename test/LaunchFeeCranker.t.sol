@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Test} from "forge-std/Test.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IAllowanceTransfer} from "permit2/src/interfaces/IAllowanceTransfer.sol";
 import {DeployPermit2} from "permit2/test/utils/DeployPermit2.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
@@ -131,7 +132,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
             FLOOR,
             FLOOR
         );
-        cranker = new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), sink);
+        cranker = new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), sink, OWNER);
 
         buybackPool = _plainKey(quote, sprout);
         _seed(buybackPool, 1_000_000 ether);
@@ -290,8 +291,10 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     }
 
     /// It holds nothing, by construction: `collect` pays the locker, `claim` pays the treasury,
-    /// the sink acts on its own balance. There is no owner and no sweep, so a balance stuck here
-    /// would be stuck for ever - which is why it must never be on a path.
+    /// the sink acts on its own balance. ⚠️ There is no sweep - and 2.0.0's owner does NOT add
+    /// one, deliberately: `setSink` and `setLocker` move where money goes NEXT, and neither can
+    /// reach a balance. So a token stuck here is still stuck for ever, which is why it must never
+    /// be on a path.
     function test_theCrankerNeverHoldsABalance() public {
         _graduate();
         _swap(_launchKey(), true, 50_000e18);
@@ -483,10 +486,10 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
     function test_theCrankerRefusesAZeroArgument() public {
         vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
-        new LaunchFeeCranker(ILaunchPositionLocker(address(0)), sink);
+        new LaunchFeeCranker(ILaunchPositionLocker(address(0)), sink, OWNER);
 
         vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
-        new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), BuybackBurnSink(payable(address(0))));
+        new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), BuybackBurnSink(payable(address(0))), OWNER);
     }
 
     function test_launchPoolViewAnswersForAGraduateAndNotForAnythingElse() public {
@@ -572,7 +575,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     /// 10 wires it: the sink must LIST the locker or every crank collects and finds no route.
     function _pushLockerCranker() internal returns (LaunchFeeCranker legacyCranker) {
         MockPushPositionLocker pushLocker = new MockPushPositionLocker(locker, address(sink));
-        legacyCranker = new LaunchFeeCranker(ILaunchPositionLocker(address(pushLocker)), sink);
+        legacyCranker = new LaunchFeeCranker(ILaunchPositionLocker(address(pushLocker)), sink, OWNER);
 
         address[] memory lockers = new address[](2);
         lockers[0] = address(locker);
@@ -584,6 +587,169 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         vm.stopPrank();
 
         assertTrue(legacyCranker.feedIsWired(), "the push locker does not pay this sink");
+    }
+
+    // =====================================================================================
+    // 2.0.0 - the wiring setters, and why A6's immutability was re-taken
+    // =====================================================================================
+
+    /// **The A9 case, undone.** This is the whole argument for the setters, as one test.
+    ///
+    /// Plan A9 had to deploy a SECOND cranker to reach the older locker generation, because
+    /// `LOCKER` was immutable - and for as long as only one existed, SPROUT's own launch 15 had
+    /// nothing scheduled to move its fees while the keeper reported a healthy pass every fifteen
+    /// minutes. Here the SAME instance is repointed and immediately cranks the other
+    /// generation's launch, burning real supply. One timelock call instead of a deploy.
+    function test_repointingTheLockerReachesTheOtherGenerationWithoutASecondDeploy() public {
+        MockPushPositionLocker pushLocker = new MockPushPositionLocker(locker, address(sink));
+
+        address[] memory lockers = new address[](2);
+        lockers[0] = address(locker);
+        lockers[1] = address(pushLocker);
+        vm.startPrank(OWNER);
+        sink.setLockers(lockers);
+        locker.setLaunchpadTreasury(address(pushLocker));
+        vm.stopPrank();
+
+        _graduate();
+        _swap(_launchKey(), true, 50_000e18);
+        _swap(_launchKey(), false, 10e18);
+
+        // Before: this instance collects from the PULL locker, which now credits the wrapper.
+        assertEq(address(cranker.LOCKER()), address(locker), "fixture is not on the pull locker");
+
+        vm.prank(OWNER);
+        cranker.setLocker(ILaunchPositionLocker(address(pushLocker)));
+
+        assertEq(address(cranker.LOCKER()), address(pushLocker), "setLocker did not take");
+        assertTrue(cranker.feedIsWired(), "the repointed locker does not pay this sink");
+        assertTrue(cranker.sinkKnowsOurLocker(), "the sink cannot resolve the repointed locker");
+
+        uint256 supplyBefore = sprout.totalSupply();
+        cranker.crank(LAUNCH_ID);
+        assertLt(sprout.totalSupply(), supplyBefore, "the repointed cranker burnt nothing");
+    }
+
+    /// 🔴 The derived caches are the reason these are setters and not raw storage writes.
+    /// `POSITION_MANAGER` is read OFF the locker, so a locker generation that moved to a new
+    /// position manager would leave a stale one behind and every `getPoolAndPositionInfo` would
+    /// answer about somebody else's token id.
+    function test_repointingTheLockerReDerivesThePositionManager() public {
+        CLPositionManager other = new CLPositionManager(
+            vault, clPoolManager, permit2, 100_000, ICLPositionDescriptor(address(0)), IWETH9(address(new WETH()))
+        );
+        PositionLocker otherLocker = new PositionLocker(other, OPS, OWNER, address(settler));
+
+        assertEq(address(cranker.POSITION_MANAGER()), address(posm), "fixture");
+
+        vm.prank(OWNER);
+        cranker.setLocker(ILaunchPositionLocker(address(otherLocker)));
+
+        assertEq(address(cranker.POSITION_MANAGER()), address(other), "position manager was not re-derived");
+    }
+
+    /// **The sink-redeploy cascade, ended.** `SINK` being immutable is what forced cranker
+    /// 1.0.0 -> 1.1.0 when the sink went 1.2.0 -> 1.3.0, for no other reason. 🔴 `QUOTE` and
+    /// `BURN_TOKEN` must move WITH it: they decide which leg `_drive` takes, and every leg is
+    /// wrapped in a `try`, so a stale copy would misroute in silence rather than revert.
+    function test_repointingTheSinkReDerivesQuoteAndBurnToken() public {
+        MockERC20 otherQuote = new MockERC20("Other", "OTH", 18);
+        MockBurnableERC20 otherBurn = new MockBurnableERC20("Other Sprout", "OSPT", 18);
+        BuybackBurnSink otherSink = new BuybackBurnSink(
+            IBurnableERC20(address(otherBurn)),
+            Currency.wrap(address(otherQuote)),
+            IVault(address(vault)),
+            posm,
+            OPS,
+            OWNER,
+            FLOOR,
+            FLOOR
+        );
+
+        vm.expectEmit(true, true, false, true, address(cranker));
+        emit LaunchFeeCranker.SinkUpdated(
+            address(sink),
+            address(otherSink),
+            Currency.wrap(address(quote)),
+            Currency.wrap(address(otherQuote)),
+            address(sprout),
+            address(otherBurn)
+        );
+        vm.prank(OWNER);
+        cranker.setSink(otherSink);
+
+        assertEq(address(cranker.SINK()), address(otherSink), "setSink did not take");
+        assertEq(Currency.unwrap(cranker.QUOTE()), address(otherQuote), "quote was not re-derived");
+        assertEq(cranker.BURN_TOKEN(), address(otherBurn), "burn token was not re-derived");
+    }
+
+    /// ⛔ The bound on the trade. The setters are defensible because they sit behind the
+    /// timelock; the same two functions reachable by anyone are a mutable burn destination in
+    /// one hand, which is exactly what A6 refused.
+    function test_onlyTheOwnerCanRepointAnything() public {
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        cranker.setSink(sink);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, address(this)));
+        cranker.setLocker(ILaunchPositionLocker(address(locker)));
+
+        assertEq(cranker.owner(), OWNER, "the cranker is not owned by the timelock");
+    }
+
+    /// 🔴 A wrong address here would otherwise be found by `_drive` swallowing an empty revert
+    /// into a `try` and reporting `false` for ever. A NAMED error is the presence check - this
+    /// repo has already spent one wedged graduation learning that a missing selector reverts
+    /// with nothing to read.
+    function test_anAddressThatIsNotASinkOrNotALockerIsRefusedByName() public {
+        vm.startPrank(OWNER);
+
+        // The locker is a real contract and answers neither QUOTE() nor BURN_TOKEN().
+        vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotASink.selector, address(locker)));
+        cranker.setSink(BuybackBurnSink(payable(address(locker))));
+
+        // 🔑 The sink DOES answer `POSITION_MANAGER()` - it has one, for exactly the check
+        // `setLockers` does - so it gets past the first probe and is caught by the second. That
+        // is why `launchpadTreasury()` is probed too: one selector is not an identity.
+        vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotALocker.selector, address(sink)));
+        cranker.setLocker(ILaunchPositionLocker(address(sink)));
+
+        // An EOA. Caught by the code-size check rather than by `try`, and it has to be: a
+        // high-level call to a codeless address can revert on the DECODE, outside the catch,
+        // with no data to read.
+        vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotALocker.selector, OPS));
+        cranker.setLocker(ILaunchPositionLocker(OPS));
+
+        vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotASink.selector, OPS));
+        cranker.setSink(BuybackBurnSink(payable(OPS)));
+
+        vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
+        cranker.setSink(BuybackBurnSink(payable(address(0))));
+
+        vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
+        cranker.setLocker(ILaunchPositionLocker(address(0)));
+
+        vm.stopPrank();
+    }
+
+    /// ⚠️ `sinkKnowsOurLocker` is the half of the wiring `feedIsWired` cannot see, and neither
+    /// setter enforces it - forcing an order would make a legitimate move of both ends
+    /// impossible in one timelock batch. So it has to be ASKABLE, and it has to be able to
+    /// answer false.
+    function test_theWiringIsAskableAfterARepointAndCanBeFalse() public {
+        MockPushPositionLocker unlisted = new MockPushPositionLocker(locker, address(sink));
+
+        vm.prank(OWNER);
+        cranker.setLocker(ILaunchPositionLocker(address(unlisted)));
+
+        assertFalse(cranker.sinkKnowsOurLocker(), "the sink lists a locker it was never given");
+
+        address[] memory lockers = new address[](2);
+        lockers[0] = address(locker);
+        lockers[1] = address(unlisted);
+        vm.prank(OWNER);
+        sink.setLockers(lockers);
+
+        assertTrue(cranker.sinkKnowsOurLocker(), "the sink still cannot resolve the repointed locker");
     }
 
     // =====================================================================================
