@@ -63,6 +63,7 @@
     "launchPoolGuardHook": null,
     "choiceRouter": null,
     "treasury": null,
+    "treasuryNote": "⛔ NULL, and script 02 reverts on it - readAddress refuses a null - so this must be filled BETWEEN script 01 and script 02. It cannot be pre-filled here because it is the Safe, and the Safe's address is not known until script 01 has created it. ⇒ After script 01, copy governance.safe into this field. That is what testnet does (choice.treasury == governance.safe 0x0ee0Db41...), and it is right for the same reason: protocol revenue should land somewhere the signers already control rather than at a fresh address nobody has tested a withdrawal from. ✅ Low stakes at launch and easy to move later: with protocolFeeSplitRatio at 0 nothing is ever collected, so this address receives nothing until the fee is turned on, and setTreasury is a plain timelock call. ⚠️ It is still a CONSTRUCTOR argument to both fee controllers, so getting it wrong means a Tier-1 redeploy of both rather than a setting change - check it before broadcasting.",
     "directTransferBurnSink": null,
     "exchangeSubaccountBurnSink": null,
     "buybackBurnSink": null,
