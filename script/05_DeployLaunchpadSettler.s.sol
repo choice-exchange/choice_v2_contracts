@@ -36,17 +36,27 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployLaunchpadSettler is BaseScript {
-    // 1.1.0 is plan A3: the PULL version of `collect` (credit + `claim`) and a `register`
-    // that binds the position to its pool. 1.0.0 predates `2cf25cc` and its `register` takes
-    // FOUR arguments, no `PoolKey` - see `_preflightLockerAbi` for why that has to be checked
-    // rather than assumed.
-    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.1.0");
-    // 1.1.0 is plan A0: the LP fee carries the WHOLE 1.00% tier (10000, not 6722) and `settle`
-    // calls `ChoiceFeeController.zeroLaunchPoolProtocolFee` so a graduate never pays Choice's
-    // protocol fee for even one block. The locker and the guard hook are UNCHANGED and keep
-    // their 1.0.0 addresses - which is why a re-deploy needs `setSettler` and `setInitializer`
-    // from the timelock, printed at the end of this script.
-    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.2.0");
+    // 1.2.0 is the TESTNET CORE CUTOVER (2026-09-08), and the bump is forced by the LAUNCH ID
+    // SPACE rather than by any change to this contract - which is a reason a salt can move that
+    // is worth naming, because nothing in the source diff shows it. `_positions` is keyed by
+    // `launchId` ALONE, so a second `LaunchpadCore` numbering from 0 re-registers ids the 1.1.0
+    // locker already holds (19, 20) and `register` reverts `AlreadyRegistered` INSIDE `settle` -
+    // mid-graduation, after every gate has passed. ⇒ ONE LOCKER GENERATION PER CORE GENERATION.
+    //
+    // Earlier generations, both still live and both still holding positions: 1.1.0 (plan A3, the
+    // PULL `collect`+`claim` and a `register` that binds the position to its pool) and 1.0.0,
+    // which predates `2cf25cc`, PUSHES on `collect` and whose `register` takes FOUR arguments
+    // with no `PoolKey` - see `_requireLockerSpeaksOurAbi` for why that is checked, not assumed.
+    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.2.0");
+    // 1.3.0 is the same cutover, and it had no choice: the settler holds BOTH `CORE` and `LOCKER`
+    // as immutables, so a new core forces a new settler and so does a new locker. This salt can
+    // never lag either of them.
+    //
+    // What the previous generations carried: 1.2.0 was plan A0 - the LP fee is the WHOLE 1.00%
+    // tier (10000, not the 6722 that composited to 1% alongside a protocol fee) and `settle`
+    // calls `ChoiceFeeController.zeroLaunchPoolProtocolFee`, so a graduate never pays Choice's
+    // protocol fee for even one block. 1.1.0 is DEAD - same code, wrong locker.
+    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.3.0");
     bytes32 internal constant GUARD_HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolGuardHook/1.0.0");
 
     Create3Factory internal factory;
@@ -59,7 +69,15 @@ contract DeployLaunchpadSettler is BaseScript {
         address clPoolManager = readAddress("infinity.clPoolManager");
         address positionManager = readAddress("infinity.clPositionManager");
         address padCore = readAddress("launchpad.core");
-        address padTreasury = readAddress("launchpad.treasury");
+        // 🔑 B6 BY CONSTRUCTION. This argument becomes `PositionLocker.launchpadTreasury`, the
+        // address the non-creator share of every graduated pool's LP fees is credited to - which
+        // under D30 IS the launchpad's burn sink, not the pad's own FeeTreasury. It used to read
+        // `launchpad.treasury` and therefore had to be corrected by a timelock
+        // `setLaunchpadTreasury` after every deploy; that step was forgotten once already and the
+        // fees went somewhere that does not burn, silently, while every crank reported success.
+        // Reading the sink directly makes a fresh locker born correct. The post-deploy assertion
+        // below still prints the timelock payload if the two ever drift.
+        address lockerTreasury = readAddress("choice.buybackBurnSink");
 
         requireCode("timelock", timelock);
         requireCode("clPoolManager", clPoolManager);
@@ -81,7 +99,7 @@ contract DeployLaunchpadSettler is BaseScript {
         address locker = _deploy(
             LOCKER_SALT,
             abi.encodePacked(
-                type(PositionLocker).creationCode, abi.encode(positionManager, padTreasury, timelock, settler)
+                type(PositionLocker).creationCode, abi.encode(positionManager, lockerTreasury, timelock, settler)
             )
         );
 
@@ -120,6 +138,7 @@ contract DeployLaunchpadSettler is BaseScript {
         console.log("");
 
         _requireLockerSettler(locker, settler);
+        _requireLockerTreasury(locker);
         _requireHookAllowsSettler(guardHook, settler);
         _requireLaunchPoolGate(guardHook);
 
@@ -151,6 +170,26 @@ contract DeployLaunchpadSettler is BaseScript {
         outstanding++;
         console.log("  [TODO] positionLocker still registers for", current);
         _printTimelockPayloads(locker, abi.encodeCall(PositionLocker.setSettler, (settler)));
+    }
+
+    /// @dev B6. `launchpadTreasury` is the launchpad's revenue feed (D30): `collect` credits the
+    /// non-creator share of a graduated position's LP fees to it, and the sink is what turns that
+    /// into a burn. A fresh locker is now BORN pointing at the sink (see `run`), so this is an
+    /// assertion rather than a step - but it stays, because a SINK REDEPLOY still moves this
+    /// field on every locker generation that already exists, and a locker pointing at a
+    /// superseded sink is completely silent: `collect` works, `claim` works, the cranker reports
+    /// success, and the money simply lands somewhere that never burns.
+    function _requireLockerTreasury(address locker) internal {
+        address want = readAddress("choice.buybackBurnSink");
+        address current = PositionLocker(payable(locker)).launchpadTreasury();
+        if (current == want) {
+            console.log("  [ok]   positionLocker.launchpadTreasury");
+            return;
+        }
+        outstanding++;
+        console.log("  [TODO] positionLocker pays the launchpad share to", current);
+        console.log("           the current burn sink is", want);
+        _printTimelockPayloads(locker, abi.encodeCall(PositionLocker.setLaunchpadTreasury, (want)));
     }
 
     /// @dev Without this the settler cannot create the pool at all: the guard permissions
