@@ -40,6 +40,9 @@ PADT=0xBf08c09Fe227ada4A86d279e98E695344848d33D
 # anything reporting a failure. That is the drift the header below warns about, caught.
 SETTLER=0xe06aFC826Aa2d7C86b6C1f17ef4C8A8173756182
 LOCKER=0x0f0Df7bDa12Bea99A5A514b11f7cF6314C038bF5
+# The 1.0.0 PUSH locker. Not verified from here - it predates this repo's source, which is
+# exactly why it is not in the manifest - but it IS a constructor argument of the A9 cranker.
+LOCKER_LEGACY=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
 # ⛔ The guard hook was constructed with the 1.0.0 SETTLER as its `_initializer` and is not
 # redeployed, so its arguments must keep that address. Verification hashes the arguments as
 # CONSTRUCTED - `setInitializer` since then does not change them.
@@ -68,6 +71,11 @@ BBSINK_110=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
 # listed for the same reason the old sinks do - it is deployed, and it drives the 1.2.0 sink.
 CRANKER=0x5A1702665EFF2C6A94053518cc26d3c2D1c6f576
 CRANKER_100=0x4Ffcd7a35A041A4a776C38417cde2CAb80f9c15d
+# 🔴 The A9 instance: the SAME bytecode against the LEGACY (1.0.0, push) locker, so its
+# constructor arguments differ in ONE word and it is a separate row rather than a re-verify.
+# Two crankers exist because the cranker's LOCKER is immutable and each generation's launches
+# are invisible to the other's instance.
+CRANKER_LEGACY=0x667fB75FE972097E40b7eB3eB997442E517231f2
 # ⚠️ The 1.0.0 PUSH locker 0x9b28F31B… is NOT in the manifest and is deliberately left out even
 # though A5 made it load-bearing again (it holds launches 13-17 and is in the sink's locker set).
 # It is already verified on Blockscout, it was deployed before this manifest existed, and its
@@ -116,6 +124,7 @@ MANIFEST=(
 "$BBSINK_120|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
 "$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $SPROUT $WETH $VAULT $SAFE $TL 8000 8000)"
 "$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK)"
+"$CRANKER_LEGACY|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER_LEGACY $BBSINK)"
 "$CRANKER_100|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK_120)"
 # 🔴 ONE argument: a static `RouterParameters` struct, so it encodes as 12 flat words with NO
 # offset head — which is why the whole thing is a single parenthesised tuple here rather than a

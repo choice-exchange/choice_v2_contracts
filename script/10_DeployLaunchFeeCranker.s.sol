@@ -10,7 +10,8 @@ import {LaunchFeeCranker} from "../src/launchpad/LaunchFeeCranker.sol";
 import {BaseScript} from "./BaseScript.sol";
 
 /**
- * The one permissionless call that takes a graduated launch's LP fees to the burn (plan A6).
+ * The one permissionless call that takes a graduated launch's LP fees to the burn (plan A6),
+ * deployed once per LOCKER GENERATION (plan A9).
  *
  * Trading a graduated pool accrues fees inside a locked position and nothing else happens.
  * Turning them into destroyed SPROUT was three calls - `collect`, `claim` per currency, then the
@@ -26,13 +27,33 @@ import {BaseScript} from "./BaseScript.sol";
  * only from sink 1.2.0. A sink redeploy is therefore ALWAYS a cranker redeploy** - bump both
  * salts, run 09 then 10, and check `cranker.SINK()` afterwards. That is the A3 lockstep rule
  * applied forwards; the compiler enforces the ABI half of it, because this contract holds the
- * concrete `BuybackBurnSink` type rather than an interface copy of it.
+ * concrete `BuybackBurnSink` type rather than an interface copy of it. ⚠️ Since A9 that is
+ * "bump BOTH instances' salts and run this script twice", once per `CRANKER_LOCKER_KEY`.
  *
- * ⚠️ It is deployed against the LIVE locker. Locker 1.0.0 has no `claim` at all (it pushes on
- * `collect`), and the cranker's `try` around that leg means an instance pointed at it would
- * still work - but this script deploys ONE, at `choice.positionLocker`. If the older locker's
- * launches are ever worth cranking, deploy a second instance with a different salt rather than
- * teaching this one to sniff which generation it is talking to.
+ * ## 🔑 One cranker per locker generation, and why it is a second instance rather than a branch
+ *
+ * The cranker's `LOCKER` is immutable, so an instance reaches exactly one generation's launches
+ * and the other's are invisible to it. That is not theoretical: the 1.0.0 locker holds launches
+ * 13-17, **SPROUT's own launch 15 among them**, and for as long as one cranker existed those
+ * fees had nothing scheduled to move them while the keeper's auto-crank ran every fifteen
+ * minutes against the 1.1.0 locker and reported a healthy pass every time. Nothing was broken
+ * and nothing said anything.
+ *
+ * The answer is a SECOND INSTANCE, never a branch inside the contract. A cranker that sniffed
+ * which generation it was talking to would be the "five copies of what is current" problem in a
+ * new place, and A6's own header rejected it in advance. It costs nothing to avoid: locker 1.0.0
+ * has no `claim` at all (it PUSHES on `collect`) and the cranker's `try` around that leg already
+ * tolerates the missing selector, so the same bytecode serves both generations unchanged.
+ *
+ *   CRANKER_LOCKER_KEY=choice.positionLocker       (default) -> book choice.launchFeeCranker
+ *   CRANKER_LOCKER_KEY=choice.positionLockerLegacy           -> book choice.launchFeeCrankerLegacy
+ *
+ * 🔴 That variable names a BOOK KEY, not an address - the same rule `quoteRouteAssetKeys`
+ * follows, so each locker's address still lives in exactly one place. And an unrecognised key
+ * REVERTS rather than deriving a salt from whatever string it was handed: a typo that hashed to
+ * a fresh salt would deploy a third cranker at an address this book never records, and the
+ * keeper would go on cranking the two it knows about while a locker's fees sat still. That is
+ * precisely the failure A9 exists to fix, reintroduced one layer up.
  *
  * forge script script/10_DeployLaunchFeeCranker.s.sol:DeployLaunchFeeCranker -vv \
  *     --rpc-url $RPC_URL --broadcast
@@ -41,22 +62,38 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployLaunchFeeCranker is BaseScript {
+    string internal constant LIVE_LOCKER_KEY = "choice.positionLocker";
+    string internal constant LEGACY_LOCKER_KEY = "choice.positionLockerLegacy";
+
     /// 1.1.0 is plan A6 against sink 1.3.0. 🔴 Bump this whenever the sink's salt moves - see
     /// the header. It moved for A2: the sink gained `setQuoteRoute` and a two-leg `convert`, and
     /// this contract's `SINK` is immutable, so an instance pointed at 1.2.0 would keep driving
     /// the superseded sink for ever while every document said the second leg was live.
     bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/1.1.0");
 
+    /// The A9 instance, bound to the 1.0.0 PUSH locker. A DISTINCT salt, deliberately spelled
+    /// out rather than derived from the locker key: the live instance is already deployed at the
+    /// address the constant above names, and a scheme that computed both would be one refactor
+    /// away from moving it.
+    bytes32 internal constant CRANKER_LEGACY_SALT = keccak256("CHOICE-V2/LaunchFeeCrankerLegacy/1.1.0");
+
     function run() public {
+        string memory lockerKey = vm.envOr("CRANKER_LOCKER_KEY", LIVE_LOCKER_KEY);
+        (bytes32 salt, string memory bookKey) = _instanceFor(lockerKey);
+
         Create3Factory factory = Create3Factory(readAddress("governance.create3Factory"));
-        address locker = readAddress("choice.positionLocker");
+        address locker = readAddress(lockerKey);
         address sink = readAddress("choice.buybackBurnSink");
 
         requireCode("positionLocker", locker);
         requireCode("buybackBurnSink", sink);
 
-        address cranker = factory.computeAddress(CRANKER_SALT);
-        console.log("LaunchFeeCranker 1.1.0 ->", cranker);
+        console.log("locker key       :", lockerKey);
+        console.log("locker           :", locker);
+        console.log("book key         :", bookKey);
+
+        address cranker = factory.computeAddress(salt);
+        console.log("LaunchFeeCranker ->", cranker);
 
         if (cranker.code.length == 0) {
             // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments
@@ -67,7 +104,7 @@ contract DeployLaunchFeeCranker is BaseScript {
             );
 
             vm.startBroadcast(deployerKey());
-            address deployed = factory.deploy(CRANKER_SALT, payload, keccak256(payload), 0, "", 0);
+            address deployed = factory.deploy(salt, payload, keccak256(payload), 0, "", 0);
             vm.stopBroadcast();
             require(deployed == cranker, "create3 address prediction is wrong");
         } else {
@@ -81,6 +118,9 @@ contract DeployLaunchFeeCranker is BaseScript {
         // `convert` calls would land on a contract that no longer has that selector - the exact
         // shape that reverted with empty returndata and wedged a graduation on 2026-09-06.
         require(address(c.SINK()) == sink, "cranker drives a different sink than the address book names");
+        // ⚠️ And against the locker THIS RUN was asked for, not against a fixed key: with two
+        // instances alive, checking the live locker unconditionally would pass the legacy
+        // instance's deploy for the wrong reason and then fail it for a real one.
         require(address(c.LOCKER()) == locker, "cranker collects from a different locker than the book names");
 
         // The sink must be able to resolve this locker's launches, or every crank collects and
@@ -90,19 +130,40 @@ contract DeployLaunchFeeCranker is BaseScript {
             "the sink does not list this locker - run 09 and make the setLockers call first"
         );
 
-        writeAddress("choice.launchFeeCranker", cranker);
+        writeAddress(bookKey, cranker);
 
         console.log("");
         if (c.feedIsWired()) {
-            console.log("  [ok]   positionLocker.launchpadTreasury is the sink - a crank burns");
+            console.log("  [ok]   this locker's launchpadTreasury is the sink - a crank burns");
         } else {
-            console.log("  [TODO] positionLocker.launchpadTreasury is NOT the sink (plan B6)");
+            console.log("  [TODO] this locker's launchpadTreasury is NOT the sink (plan B6)");
             console.log("           a crank will collect and pay, and nothing will burn");
             _printTimelockPayloads(locker, abi.encodeWithSignature("setLaunchpadTreasury(address)", sink));
         }
         console.log("");
         console.log("  Nothing else to configure. crank(launchId) is permissionless;");
         console.log("  crankMany(uint256[]) is the keeper shape.");
+        console.log("  [!] The keeper's CRANK_CRANKER is a SET - add this address to it, or the");
+        console.log("     instance exists and still nothing calls it.");
+    }
+
+    /// @dev The book key -> (salt, book entry) table. Deliberately exhaustive and deliberately
+    /// reverting: see the header. Compared by hash because Solidity cannot compare strings.
+    function _instanceFor(string memory lockerKey) internal pure returns (bytes32 salt, string memory bookKey) {
+        bytes32 h = keccak256(bytes(lockerKey));
+        if (h == keccak256(bytes(LIVE_LOCKER_KEY))) return (CRANKER_SALT, "choice.launchFeeCranker");
+        if (h == keccak256(bytes(LEGACY_LOCKER_KEY))) return (CRANKER_LEGACY_SALT, "choice.launchFeeCrankerLegacy");
+        revert(
+            string.concat(
+                "CRANKER_LOCKER_KEY=",
+                lockerKey,
+                " is not a locker this script knows. Use ",
+                LIVE_LOCKER_KEY,
+                " or ",
+                LEGACY_LOCKER_KEY,
+                " - a salt derived from an unknown key would deploy a cranker the book never records."
+            )
+        );
     }
 
     /// @dev Both halves, because matching `execute`'s arguments to the `schedule` they came
