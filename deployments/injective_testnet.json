@@ -34,9 +34,13 @@
     "safeSaltNonce": 0,
     "timelock": "0xfE9811111Cffd823aA2c1c8F31A77009BFaeDE42",
     "timelockMinDelay": 60,
+    "pauser": null,
+    "deployComplete": false,
     "create3Factory": "0x2Be6e98818A7CbBd1c7fD8e06A3B0449715790CD",
     "create3DeployerEOA": "0x15248340974929CeF4194a9Be763960d8A807fbc",
-    "deployerEOA": "0xAcA0d67c52B503ED15706df5fE29E19677338bc6"
+    "deployerEOA": "0xAcA0d67c52B503ED15706df5fE29E19677338bc6",
+    "pauserNote": "NULL on testnet too, deliberately: nothing here needs pausing in seconds, and leaving it unset keeps the mainnet book's note - which explains what the role costs in both directions - the one place the decision is described. Script 08 skips the check while it is null.",
+    "deployCompleteNote": "FALSE on testnet as a deliberate non-decision. It gates the STANDING-HYGIENE checks in script 08 - the per-owner CANCELLER grants, the pause role, de-whitelisting the deploy key, handing the CREATE3 factory to the timelock - which are mainnet disciplines. Testnet's deploy key stays whitelisted because testnet exists to be redeployed, so flipping this here would fail every verify run for reasons that are correct on 1776 and meaningless on 1439. Everything else script 08 checks is enforced here regardless. See the mainnet book for the full note."
   },
   "infinity": {
     "vault": "0x17BDb95424cA07c31C23ecA9925CBA10818CBF6e",

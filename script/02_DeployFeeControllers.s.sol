@@ -18,6 +18,10 @@ interface IOwnable {
     function owner() external view returns (address);
 }
 
+interface IDirectSinkView {
+    function AUCTION() external view returns (address);
+}
+
 /**
  * M1 step 1, in place of upstream core scripts 04 and 05.
  *
@@ -51,6 +55,12 @@ contract DeployFeeControllers is BaseScript {
     // rather than from the address book, on a chain where the book says zero. Both must move.
     bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.2.0");
     bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.1.0");
+
+    /// @dev Injective's real `ExchangeAuctionFeesAddress`, not a placeholder - it is
+    /// `inj1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3t5qxqh`, swept into the burn auction basket by the
+    /// exchange module. Asserted rather than assumed because the whole burn leg is one
+    /// hardcoded constant in a contract this script only ever deploys by salt.
+    address internal constant AUCTION_ADDRESS = 0x1111111111111111111111111111111111111111;
 
     Create3Factory internal factory;
     address internal timelock;
@@ -133,6 +143,20 @@ contract DeployFeeControllers is BaseScript {
             toTimelock
         );
 
+        // 🔴 Every `_deploy` above returns early when the CREATE3 address already has code, and
+        // it does not ask what that code IS. That is correct for a re-run after a dropped
+        // receipt and wrong for everything else: `Create3.addressOf(salt)` is not namespaced by
+        // `msg.sender`, so any address whitelisted on the factory can place arbitrary code at
+        // one of these salts, and this script would then write it into the address book as
+        // Choice's fee controller. These are view calls on what is actually there, and they
+        // check the CONSTRUCTOR arguments specifically - the fee policy is a constructor
+        // argument precisely because nobody can set it afterwards, so it is also the thing that
+        // cannot be repaired if it is wrong.
+        _verifyController(clFeeController, clPoolManager, splitRatio, dynamicDefaultFee);
+        _verifyController(binFeeController, binPoolManager, splitRatio, dynamicDefaultFee);
+        require(IDirectSinkView(directSink).AUCTION() == AUCTION_ADDRESS, "direct sink does not burn to the auction");
+        require(IOwnable(exchangeSink).owner() == timelock, "exchange sink is not owned by the timelock");
+
         // --- point the pool managers at them ----------------------------------------------
         // On a FIRST deploy this runs while the DEPLOYER still owns the pool managers, which
         // saves a governance round trip. On a re-run after script 03 the managers sit behind
@@ -183,6 +207,31 @@ contract DeployFeeControllers is BaseScript {
         console.log("         Safe -> timelock -> clFeeController.setLaunchPoolGuardHook(%s)", guardHook);
         _printTimelockPayloads(
             clFeeController, abi.encodeCall(ChoiceFeeController.setLaunchPoolGuardHook, (IHooks(guardHook)))
+        );
+    }
+
+    /// @dev What a fee controller at one of our salts must be, whether this run deployed it or
+    /// adopted it. The owner clause allows either state on purpose: under CREATE3 the
+    /// controller is born owned by the factory's one-shot proxy child with the timelock only as
+    /// `pendingOwner`, so "owned by the timelock" is only true after the accept that script 08
+    /// chases.
+    function _verifyController(
+        address controller,
+        address expectedPoolManager,
+        uint256 expectedSplitRatio,
+        uint24 expectedDynamicDefault
+    ) internal view {
+        ChoiceFeeController c = ChoiceFeeController(payable(controller));
+        require(c.poolManager() == expectedPoolManager, "fee controller points at the wrong pool manager");
+        require(c.treasury() == treasury, "fee controller has the wrong treasury");
+        require(c.protocolFeeSplitRatio() == expectedSplitRatio, "fee controller's split ratio is not the book's");
+        require(
+            c.defaultProtocolFeeForDynamicFeePool() == expectedDynamicDefault,
+            "fee controller's dynamic-fee default is not the book's"
+        );
+        require(
+            c.owner() == timelock || c.pendingOwner() == timelock,
+            "fee controller is neither owned by nor pending for the timelock"
         );
     }
 

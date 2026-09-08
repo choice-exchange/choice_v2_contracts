@@ -93,19 +93,52 @@ contract ForkLinkTest is Test {
     /// @dev The numbers that are decisions rather than facts, asserted so that changing any of
     /// them is a visible diff in a test rather than a quiet edit to a JSON file.
     ///
-    /// Settled 2026-09-08, superseding CHOICE_V2_MAINNET_OPS.md §8's 3-of-5 / 24h: Choice v2
-    /// mainnet reuses Choice v1's TWO multisig signers, so the Safe is 2-of-2 and the timelock
-    /// delay is an hour.
+    /// Settled 2026-09-08 evening: the Safe is **2-of-3** - one voter from Choice v1's dev
+    /// multisig plus two keys held by one person - and the timelock delay is an hour at launch,
+    /// raised to 24h later. This supersedes the 2-of-2 recorded earlier the same day, which in
+    /// turn superseded §8's 3-of-5 / 24h. 🔒 Which owner is which, and what each key is stored
+    /// in, are custody questions and are deliberately not in this repo, which is public; they
+    /// are in the private security audit. The book's `safeSignersNote` says the same.
     ///
     /// 🔴 The delay is also the UNPAUSE latency - `unpausePoolManager` is `onlyOwner` and the
     /// timelock is the owner - so moving it is a security decision in both directions: longer
     /// means swaps can stay down longer, shorter means less time to spot and cancel a hostile
-    /// proposal. With two signers there are fewer people watching, which is what an hour
-    /// assumes.
+    /// proposal. An hour only helps if somebody who is not the proposer can cancel, which is why
+    /// every owner is granted CANCELLER_ROLE - two of the three keys are held by one person.
+    ///
+    /// 🔑 `timelockTargetDelay` is pinned too, so the planned raise cannot quietly evaporate.
+    /// When it is executed, this test moves to 86400 in the same PR that updates the book -
+    /// script 08 compares the live `getMinDelay()` against the book, so they cannot drift.
     function test_mainnetGovernanceNumbersAreTheDecidedOnes() public view {
         string memory book = vm.readFile("deployments/injective_mainnet.json");
         assertEq(vm.parseJsonUint(book, ".governance.timelockMinDelay"), 3_600, "mainnet timelock delay is 1h");
-        assertEq(vm.parseJsonUint(book, ".governance.safeThreshold"), 2, "mainnet Safe is 2-of-2");
+        assertEq(vm.parseJsonUint(book, ".governance.timelockTargetDelay"), 86_400, "the planned raise is 24h");
+        assertEq(vm.parseJsonUint(book, ".governance.safeThreshold"), 2, "mainnet Safe is 2-of-3");
+    }
+
+    /// @dev The signer set itself, which is the one governance value no script can derive and no
+    /// later step can repair: a Safe deployed with the wrong owners is a new Safe, a new
+    /// timelock and a redeploy of everything beneath it.
+    ///
+    /// 🔴 A duplicate would be the silent one. Safe's own `setup` rejects it, but only after the
+    /// broadcast has spent gas and consumed the CREATE2 salt - and a book naming the same signer
+    /// twice describes a 2-of-3 that is really a 2-of-2, which reads as fine in a diff. Script 01
+    /// checks this before broadcasting; this checks it before anyone runs script 01.
+    function test_mainnetSafeSignersAreThreeDistinctRealAddresses() public view {
+        string memory book = vm.readFile("deployments/injective_mainnet.json");
+        address[] memory signers = vm.parseJsonAddressArray(book, ".governance.safeSigners");
+        assertEq(signers.length, 3, "mainnet Safe has three owners");
+
+        uint256 threshold = vm.parseJsonUint(book, ".governance.safeThreshold");
+        assertLe(threshold, signers.length, "threshold cannot exceed the owner count");
+        assertGt(threshold, 0, "a zero threshold would make the Safe callable by anyone");
+
+        for (uint256 i; i < signers.length; ++i) {
+            assertTrue(signers[i] != address(0), "a signer is the zero address");
+            for (uint256 j = i + 1; j < signers.length; ++j) {
+                assertTrue(signers[i] != signers[j], "the same signer appears twice");
+            }
+        }
     }
 
     /// @dev The launch fee policy, which is the other decision that lives only in JSON.
