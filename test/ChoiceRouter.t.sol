@@ -19,7 +19,65 @@ import {IPoolManager} from "infinity-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {CLPoolManagerRouter} from "infinity-core/test/pool-cl/helpers/CLPoolManagerRouter.sol";
 
+import {BalanceDelta} from "infinity-core/src/types/BalanceDelta.sol";
+
 import {ChoiceRouter} from "../src/router/ChoiceRouter.sol";
+
+/// A pool manager that swaps NOTHING and touches no ledger, so a stage can run to completion
+/// without any vault lock existing. It is what lets `HostileVault` below drive a real callback
+/// through to the end and then try a second one - the property under test is what the router
+/// does on the SECOND call, and a first call that reverted for unrelated reasons would prove
+/// nothing (a caught revert also rolls the transient slot back).
+contract SilentPoolManager {
+    function swap(PoolKey calldata, ICLPoolManager.SwapParams calldata, bytes calldata)
+        external
+        pure
+        returns (BalanceDelta)
+    {
+        return BalanceDelta.wrap(0);
+    }
+}
+
+/// An allowlisted vault that does not behave like `Vault`.
+///
+/// This is the threat the payload binding exists for, and it cannot be expressed with the real
+/// `Vault`: allowlisting is the router's whole trust boundary, and an allowlist entry cannot
+/// tell a reference deployment from a proxy or a modified fork. `Vault.lock` echoes `data` back
+/// verbatim; nothing forces a foreign vault to.
+contract HostileVault {
+    enum Mode {
+        Tamper,
+        Twice
+    }
+
+    ChoiceRouter public router;
+    Mode public mode;
+
+    function arm(ChoiceRouter router_, Mode mode_) external {
+        router = router_;
+        mode = mode_;
+    }
+
+    /// @dev The router calls this as `IVault.lock`.
+    function lock(bytes calldata data) external returns (bytes memory) {
+        if (mode == Mode.Tamper) {
+            // Hand back a DIFFERENT stage: same shape, twice the entry amount. Everything the
+            // router settles - destination, currencies, amounts - is read out of these bytes.
+            (ChoiceRouter.Stage memory stage, uint256 entry, uint256 stageIndex) =
+                abi.decode(data, (ChoiceRouter.Stage, uint256, uint256));
+            router.lockAcquired(abi.encode(stage, entry * 2, stageIndex));
+        } else {
+            router.lockAcquired(data);
+            router.lockAcquired(data);
+        }
+        return "";
+    }
+
+    /// @dev Every delta is zero, so `_settleStage` neither settles nor takes.
+    function currencyDelta(address, Currency) external pure returns (int256) {
+        return 0;
+    }
+}
 
 /// Two independent Infinity deployments, standing in for Choice and Pumex. That is the whole
 /// point of the contract under test, so neither side is mocked: both are the real `Vault` +
@@ -207,6 +265,69 @@ contract ChoiceRouterTest is Test, DeployPermit2 {
         router.lockAcquired("");
     }
 
+    // ── the payload binding ───────────────────────────────────────────────
+
+    /// The finding this closes (2026-09-08 audit, R-1). Authenticating the CALLER left the
+    /// PAYLOAD chosen by that caller: `lockAcquired` decoded the stage out of whatever bytes
+    /// came back, and settlement pays out to `stage.vault`, in the currencies of `stage`'s hop
+    /// keys, for amounts read from `stage.vault`. The reference `Vault` echoes `data` verbatim,
+    /// so a correct vault cannot forge one - but allowlisting is the whole trust boundary and
+    /// it cannot rule out a proxy or a modified fork.
+    function test_aVaultThatEchoesADifferentStageIsRefused() public {
+        ChoiceRouter.RouteParams memory p = _hostileRoute(HostileVault.Mode.Tamper);
+
+        vm.prank(USER);
+        vm.expectRevert(ChoiceRouter.StagePayloadMismatch.selector);
+        router.execute(p);
+    }
+
+    /// The payload is single-use per lock. Without clearing the slot, a vault could run the
+    /// whole stage twice inside one lock - passing the hash check both times - and spend the
+    /// route's own funds against a ledger the second pass reads differently.
+    ///
+    /// 🔑 The first callback must SUCCEED for this to test anything, which is why the stage
+    /// runs against `SilentPoolManager`: a first call that reverted would roll the transient
+    /// slot back with it and the second would then be indistinguishable from a first.
+    function test_theSamePayloadCannotDriveTwoCallbacksInOneLock() public {
+        ChoiceRouter.RouteParams memory p = _hostileRoute(HostileVault.Mode.Twice);
+
+        vm.prank(USER);
+        vm.expectRevert(ChoiceRouter.StagePayloadMismatch.selector);
+        router.execute(p);
+    }
+
+    /// An honest route still settles, so the binding costs the normal path nothing. This is the
+    /// same two-vault round trip as the first test in this file, asserted here as the control
+    /// the two negatives are read against.
+    function test_theBindingDoesNotDisturbAnHonestRoute() public {
+        ChoiceRouter.RouteParams memory p = _route(1000 ether, 0);
+
+        vm.prank(USER);
+        uint256 amountOut = router.execute(p);
+
+        assertGt(amountOut, 0, "the honest route produced nothing");
+        assertEq(tokenOut.balanceOf(RECIPIENT), amountOut, "the recipient did not receive the output");
+    }
+
+    /// @dev Stage 0 is the real Choice leg, so the router genuinely holds `mid` when the
+    /// hostile stage opens; stage 1 is the hostile vault, whose hop names a pool manager that
+    /// moves nothing.
+    function _hostileRoute(HostileVault.Mode mode) internal returns (ChoiceRouter.RouteParams memory p) {
+        HostileVault hostile = new HostileVault();
+        hostile.arm(router, mode);
+        SilentPoolManager silent = new SilentPoolManager();
+
+        vm.prank(TIMELOCK);
+        router.setVault(IVault(address(hostile)), true);
+
+        p = _route(1000 ether, 0);
+
+        PoolKey memory silentKey = _key(CLPoolManager(address(silent)), mid, tokenOut, FEE);
+        ChoiceRouter.Hop[] memory hops = new ChoiceRouter.Hop[](1);
+        hops[0] = _hop(silentKey, address(mid), 10_000);
+        p.stages[1] = ChoiceRouter.Stage({vault: IVault(address(hostile)), hops: hops});
+    }
+
     function test_onlyTheOwnerCanChangeTheAllowlist() public {
         Vault other = new Vault();
 
@@ -326,10 +447,21 @@ contract ChoiceRouterTest is Test, DeployPermit2 {
         assertEq(far.balanceOf(address(router)), 0, "the crossing token was stranded");
     }
 
+    /// @dev Both slots are literals in the contract because inline assembly cannot reference a
+    /// computed constant, so this is the only thing standing between a mistyped nibble and two
+    /// gates that silently read the wrong word.
     function test_transientSlotMatchesItsDerivation() public pure {
         assertEq(
             uint256(keccak256("choice.v2.router.activeVault")) - 1,
             0xf6d74ac3105b1000971a93f4dbcb94238b3965db702346eeed7fa44221e4b5e9
+        );
+        assertEq(
+            uint256(keccak256("choice.v2.router.stagePayload")) - 1,
+            0x9bd89f6d9008db88003b7a3b8977f0f681f4ebefb915840e9f4c4627596ea03c
+        );
+        assertTrue(
+            keccak256("choice.v2.router.activeVault") != keccak256("choice.v2.router.stagePayload"),
+            "the two gates would share one word"
         );
     }
 

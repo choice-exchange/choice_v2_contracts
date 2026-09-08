@@ -38,12 +38,36 @@ import {TickMath} from "infinity-core/src/pool-cl/libraries/TickMath.sol";
 ///
 /// **We lock the vaults ourselves rather than calling Pumex's UniversalRouter.** Measured on
 /// mainnet 2026-09-05: Pumex's UniversalRouter `0xbc291687...` is `Ownable` + `Pausable`, its
-/// `execute` is `whenNotPaused`, and its owner is a 3-of-6 Gnosis Safe. Routing through it
-/// would hand three signers outside Choice a kill switch over every cross-venue route. A
-/// vault's `lock` is permissionless, so we take it directly - the pattern already runs in
-/// production in Choice's own `InjEvmArbRouted`. This is why the contract carries a
-/// swap/settle/take loop at all; the M5 plan's "orchestrates the two UniversalRouters" wording
-/// predates that measurement.
+/// `execute` is `whenNotPaused`, and its owner is a 3-of-6 Gnosis Safe. A vault's `lock` is
+/// permissionless, so we take it directly - the pattern already runs in production in Choice's
+/// own `InjEvmArbRouted`. This is why the contract carries a swap/settle/take loop at all; the
+/// M5 plan's "orchestrates the two UniversalRouters" wording predates that measurement.
+///
+/// ⚠️ **This paragraph used to claim that taking the lock directly denies Pumex a kill switch
+/// over cross-venue routes. IT DOES NOT, and the corrected version is worth knowing before
+/// anyone allowlists a foreign vault** (2026-09-08 audit, R-2). Two powers survive:
+///
+/// 1. **The pause.** Every hop calls `CLPoolManager.swap`, which is `whenNotPaused`, and
+///    `CLPoolManagerOwner.pausePoolManager` is role-or-owner. Whoever holds Pumex's pause role
+///    can still halt every route that crosses their pools. Skipping their router avoids their
+///    router's pause, not their pool manager's.
+/// 2. **A debt assigned mid-stage.** A vault owner may `registerApp` any contract, and a
+///    registered app may call `accountAppBalanceDelta(currency, delta, settler)` for ANY
+///    settler while ANYONE holds the lock. During our stage on their vault that can assign this
+///    router an arbitrary debt in a stage currency, which `_settleStage` then pays out of route
+///    funds.
+///
+/// What bounds (2) is `minimumReceive` and nothing else: `_payOut`'s checked subtraction
+/// reverts if the route overspends into a pre-existing balance, and the output check reverts if
+/// the user would receive less than they asked for. 🔴 So a route submitted with
+/// `minimumReceive == 0` hands its entire input to whoever governs the foreign vault. The
+/// frontend must refuse a zero minimum on this path; the contract deliberately does not, because
+/// a floor expressed in output units is a quote, and quoting is not this contract's job.
+///
+/// ⇒ Allowlisting a foreign vault is a decision about that deployment's GOVERNANCE, not only
+/// about its code. Before `setVault`, read the candidate's bytecode against `Vault.sol` and
+/// confirm it is not a proxy - see `STAGE_PAYLOAD_SLOT` for what a non-reference vault could
+/// otherwise do inside the callback.
 ///
 /// **Vaults are allowlisted, and that is the whole trust boundary.** Hops name their own
 /// `PoolKey.poolManager`, but a pool manager cannot move value on its own: deltas only exist
@@ -112,6 +136,24 @@ contract ChoiceRouter is Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     /// `test_transientSlotMatchesItsDerivation` asserts it.
     uint256 private constant ACTIVE_VAULT_SLOT = 0xf6d74ac3105b1000971a93f4dbcb94238b3965db702346eeed7fa44221e4b5e9;
 
+    /// @dev `keccak256("choice.v2.router.stagePayload") - 1`. Holds the hash of the exact bytes
+    /// `_runStage` handed to `lock`, for the duration of that lock.
+    ///
+    /// 🔴 WHY THE CALLER CHECK WAS NOT ENOUGH. `lockAcquired` authenticates WHO is calling and
+    /// then decodes the stage out of whatever bytes that caller supplies - and `_settleStage`
+    /// transfers to `stage.vault`, in the currencies of `stage`'s hop keys, for amounts read
+    /// from `stage.vault`. Destination, currency and amount all come from the payload. The
+    /// reference `Vault` echoes `data` back verbatim and refuses a nested lock, so a correct
+    /// vault cannot forge one; the check exists because ALLOWLISTING A VAULT IS THE WHOLE TRUST
+    /// BOUNDARY of this contract, and a vault that is a proxy or a modified fork is exactly the
+    /// thing an allowlist entry cannot rule out. Binding the payload means an allowlisted vault
+    /// can still refuse to run our stage, but it cannot substitute a different one.
+    ///
+    /// @dev Written as a literal because inline assembly cannot reference a computed constant.
+    /// Reproduce with `cast keccak "choice.v2.router.stagePayload"` and subtract one;
+    /// `test_transientSlotMatchesItsDerivation` asserts it.
+    uint256 private constant STAGE_PAYLOAD_SLOT = 0x9bd89f6d9008db88003b7a3b8977f0f681f4ebefb915840e9f4c4627596ea03c;
+
     uint16 private constant BPS = 10_000;
 
     IAllowanceTransfer public immutable PERMIT2;
@@ -132,6 +174,7 @@ contract ChoiceRouter is Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     error NotCrossVault();
     error VaultNotAllowed(address vault);
     error NotVault();
+    error StagePayloadMismatch();
     error EmptyStage(uint256 stageIndex);
     error NothingToChain(uint256 stageIndex, uint256 hopIndex);
     error StageEntryEmpty(uint256 stageIndex);
@@ -193,11 +236,33 @@ contract ChoiceRouter is Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     }
 
     /// @inheritdoc ILockCallback
-    /// @dev Gated on the lock IN PROGRESS, not merely on a known vault. Both allowlisted
-    /// vaults can call this at any time; without the transient check one of them could invoke
-    /// it outside a route, when the decoded stage would be attacker-chosen.
+    /// @dev Three gates, and they answer three different questions.
+    ///
+    /// WHO: `msg.sender` is the vault whose lock is in progress, not merely a known vault.
+    /// Both allowlisted vaults can call this at any time; without the transient check one of
+    /// them could invoke it outside a route, when the decoded stage would be attacker-chosen.
+    ///
+    /// WHAT: the bytes are the ones `_runStage` handed to `lock`. See `STAGE_PAYLOAD_SLOT` for
+    /// why authenticating the caller alone leaves the payload - and therefore the settlement
+    /// destination, currencies and amounts - chosen by that caller.
+    ///
+    /// HOW OFTEN: the payload slot is cleared before the stage runs, so this is single-use per
+    /// lock. A vault that invoked the callback twice inside one lock would otherwise pass the
+    /// hash check both times and run the whole stage twice, spending the route's own funds
+    /// against a ledger the second run reads differently.
+    ///
+    /// 🔑 THERE IS DELIBERATELY NO `stage.vault == msg.sender` CHECK, and the reason is worth
+    /// stating because its absence looks like an omission. The settlement path pays out to
+    /// `stage.vault`, so that it equals the caller is exactly the invariant that matters - and
+    /// the two gates above already prove it. `_runStage` locks `stage.vault` and stores the
+    /// hash of the payload containing that same stage, so a payload whose hash matches names
+    /// the vault that was locked, which is the vault the first gate requires. Adding the check
+    /// would be a branch no test could ever reach, which is worse than the sentence.
     function lockAcquired(bytes calldata data) external override returns (bytes memory) {
         if (msg.sender != _activeVault()) revert NotVault();
+        if (keccak256(data) != _stagePayloadHash()) revert StagePayloadMismatch();
+        _setStagePayloadHash(bytes32(0));
+
         (Stage memory stage, uint256 entry, uint256 stageIndex) = abi.decode(data, (Stage, uint256, uint256));
 
         _swapHops(stage, entry, stageIndex);
@@ -211,11 +276,18 @@ contract ChoiceRouter is Ownable2Step, ReentrancyGuardTransient, ILockCallback {
         address vault = address(stage.vault);
         if (!allowedVault[vault]) revert VaultNotAllowed(vault);
 
+        // Encoded once and hashed, rather than encoded inline: the hash is what makes the bytes
+        // that come back through `lockAcquired` provably the bytes that went out.
+        bytes memory payload = abi.encode(stage, entry, stageIndex);
+
         _setActiveVault(vault);
-        stage.vault.lock(abi.encode(stage, entry, stageIndex));
-        // Cleared before anything else can run, so a stage that reverts cannot leave the
-        // callback gate open for the rest of the transaction.
+        _setStagePayloadHash(keccak256(payload));
+        stage.vault.lock(payload);
+        // Both cleared before anything else can run, so a stage that reverts cannot leave the
+        // callback gate open for the rest of the transaction. (A revert would roll the
+        // transaction back anyway; this holds for a caller that catches one.)
         _setActiveVault(address(0));
+        _setStagePayloadHash(bytes32(0));
     }
 
     function _swapHops(Stage memory stage, uint256 entry, uint256 stageIndex) private {
@@ -363,6 +435,18 @@ contract ChoiceRouter is Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     function _activeVault() private view returns (address vault) {
         assembly ("memory-safe") {
             vault := tload(ACTIVE_VAULT_SLOT)
+        }
+    }
+
+    function _setStagePayloadHash(bytes32 payloadHash) private {
+        assembly ("memory-safe") {
+            tstore(STAGE_PAYLOAD_SLOT, payloadHash)
+        }
+    }
+
+    function _stagePayloadHash() private view returns (bytes32 payloadHash) {
+        assembly ("memory-safe") {
+            payloadHash := tload(STAGE_PAYLOAD_SLOT)
         }
     }
 }
