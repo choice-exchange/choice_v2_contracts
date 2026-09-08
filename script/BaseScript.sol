@@ -49,8 +49,45 @@ abstract contract BaseScript is Script {
         return vm.parseJsonUint(book(), string.concat(".", key));
     }
 
+    /// @notice Like `readUint`, but `0` for a key that is absent or null.
+    /// @dev For numbers that are a PLAN rather than a setting - `timelockTargetDelay` is the
+    /// delay a deployment intends to raise to, and a book that has not decided one should read
+    /// as "no raise planned" rather than revert a read-only report.
+    function readUintOrZero(string memory key) internal view returns (uint256) {
+        string memory json = book();
+        string memory path = string.concat(".", key);
+        if (!vm.keyExistsJson(json, path)) return 0;
+        bytes memory raw = vm.parseJson(json, path);
+        if (raw.length != 32) return 0;
+        return abi.decode(raw, (uint256));
+    }
+
+    /// @notice A flag that is `false` unless the book says otherwise.
+    /// @dev `governance.deployComplete` gates the standing-hygiene checks in script 08: they are
+    /// required by the END of a deploy, not immediately, so before the flag they report and
+    /// after it they fail. Absent must therefore mean `false`, never a revert.
+    function readBoolOrFalse(string memory key) internal view returns (bool) {
+        string memory json = book();
+        string memory path = string.concat(".", key);
+        if (!vm.keyExistsJson(json, path)) return false;
+        bytes memory raw = vm.parseJson(json, path);
+        if (raw.length != 32) return false;
+        return abi.decode(raw, (bool));
+    }
+
     function readAddressArray(string memory key) internal view returns (address[] memory) {
         return vm.parseJsonAddressArray(book(), string.concat(".", key));
+    }
+
+    /// @notice Like `readAddressArray`, but an empty list for a key that is absent or empty.
+    /// @dev Script 01 must REVERT on an empty signer set - deploying a Safe nobody controls is
+    /// the failure the null-checking exists for. Script 08 only reports, and has to keep
+    /// running on a book whose signers have not been decided yet, so it reads through this.
+    function readAddressArrayOrEmpty(string memory key) internal view returns (address[] memory) {
+        string memory json = book();
+        string memory path = string.concat(".", key);
+        if (!vm.keyExistsJson(json, path)) return new address[](0);
+        return vm.parseJsonAddressArray(json, path);
     }
 
     /// @notice A list of BOOK KEYS resolved to the addresses they name; empty if absent.
