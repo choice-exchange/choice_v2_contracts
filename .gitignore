@@ -9,3 +9,11 @@ node_modules/
 # broadcast/<script>/<chainId>/run-latest.json with `cast send`, never with --resume.
 !broadcast/
 broadcast/**/dry-run/
+
+# Safe transaction proposals and collected signatures (script/tools/safe-tx.sh).
+# Per-run artifacts, not source: a proposal is bound to one Safe nonce and goes stale the moment
+# anything else executes, and it is regenerated in one command. Nothing in them is secret - a
+# signature over a SafeTx is only useful to whoever can also reach `threshold` - but committing
+# them would put a permanent stale file where a reader might sign it.
+safe/
+safe-rehearsal/
