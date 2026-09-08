@@ -115,7 +115,9 @@
     "lastUpdated": "2026-09-08",
     "blockscoutApi": "https://blockscout-api.injective.network",
     "blockscoutVerified": "0/0 - nothing deployed",
-    "addressAliases": {},
+    "addressAliases": {
+      "choice.treasury": "the Safe, deliberately - protocol revenue lands where the signers can move it without waiting out a timelock delay. Declared here because the well-formed check treats one address under two keys as a copy-paste until a human says otherwise, and this is the one place it is intended. Testnet declares the same alias for the same reason. See choice.treasuryNote for why Choice v1's cw3 treasury multisig was rejected: it has no EVM code, so a pure EVM ERC20 sent there would be unreachable by anyone for ever."
+    },
     "status": "PRE-DEPLOY. This file exists so that the Choice v2 mainnet deploy is scriptable, dry-runnable and reviewable - MAINNET_READINESS C10 named its absence the practical blocker, because every script resolves NETWORK to it and `make sync` reported 0/56. Every non-null value in it was read off chain 1776 on 2026-09-07. Every null is a thing that does not exist yet or a decision not yet taken, and BaseScript.readAddress reverting on null is what keeps the difference honest.",
     "readingOrder": "CHOICE_V2_MAINNET_OPS.md is the runbook (§5 the phases, §2 the three tiers, §6 standing ops, §8 the decisions). MAINNET_READINESS.md §Part 1B is the security review this deploy is conditioned on (verdict: GO on four conditions). Neither is duplicated here; the notes in this file only cover what a reader of THIS FILE would otherwise get wrong.",
     "buildProfileWarning": "🔴 BUILD PERIPHERY WITH THE PERIPHERY'S OWN OPTIMIZER PROFILE, never the contracts/ workspace profile. `forge build --sizes` from this workspace reports CLPositionManager at 24,769 B - 193 B OVER EIP-170 - while the contract deployed on testnet is 24,004 B. Nothing is broken today; it becomes a failed deploy the day somebody builds it from here (MAINNET_READINESS C6).",
