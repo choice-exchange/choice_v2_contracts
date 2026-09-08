@@ -26,35 +26,42 @@
 # the whole coordination mechanism. The proposal JSON is the artifact a reviewer reads.
 #
 # ---------------------------------------------------------------------------------------------
-# THE A4 REHEARSAL — the Ledger has never signed anything on Injective, so it is rehearsed on
-# 1439 before it is trusted with mainnet governance.
+# ✅ THE A4 REHEARSAL — DONE 2026-09-08. A Ledger Nano S+ signed a SafeTx and the Safe executed it.
 #
-# A rehearsal Safe carrying the THREE REAL MAINNET OWNERS is already deployed on 1439:
+# The rehearsal Safe carries the THREE REAL MAINNET OWNERS and lives on 1439 at
 #
 #     0x053e4204c3031422FBb1B5687f486bCbB565a5D7   (saltNonce 1, threshold 2, Safe 1.4.1)
 #
 # It is deliberately NOT in the address book: `governance.safe` there is the Safe that actually
-# owns testnet's timelock, and the rehearsal must not be able to touch it. Point this tool at it
-# with SAFE_ADDRESS. To run the rehearsal:
+# owns testnet's timelock, and the rehearsal must not be able to touch it. SAFE_ADDRESS points
+# this tool at it instead. What was executed, nonce 0 -> 1, on two signatures:
+# `choicedev` 0x20D150a0... and the LEDGER 0xA379382E... . To repeat it:
 #
 #   export NETWORK=injective_testnet
 #   export SAFE_ADDRESS=0x053e4204c3031422FBb1B5687f486bCbB565a5D7
 #   export SAFE_TX_DIR=./safe-rehearsal
 #
 #   ./script/tools/safe-tx.sh propose $SAFE_ADDRESS $(cast calldata 'getThreshold()')
-#   ./script/tools/safe-tx.sh sign  ./safe-rehearsal/0.json --ledger      # the device
-#   ./script/tools/safe-tx.sh sign  ./safe-rehearsal/0.json --account choicedev
+#   ./script/tools/safe-tx.sh sign  ./safe-rehearsal/0.json --ledger
+#   ./script/tools/safe-tx.sh sign  ./safe-rehearsal/0.json --account <choicedev keystore>
 #   ./script/tools/safe-tx.sh exec  ./safe-rehearsal/0.json
 #
-#   cast call $SAFE_ADDRESS 'nonce()(uint256)' --rpc-url $RPC_URL     # 0 -> 1 means it landed
+#   cast call $SAFE_ADDRESS 'nonce()(uint256)' --rpc-url $RPC_URL     # advanced by one = landed
 #
-# 🔴 DONE-WHEN: one EXECUTED testnet Safe transaction carrying a LEDGER signature. Until that has
-# happened, the --ledger path in this file is written but UNPROVEN - everything else here was
-# exercised against the live testnet Safe, but no hardware wallet was present.
+# 🔴 BLIND SIGNING MUST BE ENABLED ON THE DEVICE, and this is not optional advice - it was hit.
+# Ethereum app -> Settings -> Blind signing -> Enabled (older builds call it "Debug data"). The
+# symptom is exact and worth recognising rather than re-diagnosing:
 #
-# ⚠️ If the device refuses, the usual cause is that EIP-712 signing is off: on the Ledger
-# Ethereum app the setting is "Blind signing" / "Debug data", and Injective's Ledger support uses
-# that same Ethereum app. Derivation path defaults to m/44'/60'/0'/0/0; pass --hd-path to change it.
+#     Error: Ledger device: APDU Response error `Code 6a80 ([APDU_CODE_INVALID_DATA] ...)`
+#
+# The same device signed the plain A5 ceremony MESSAGE fine with the setting off - EIP-191
+# personal_sign needs nothing - so "the Ledger works" is not evidence that a SafeTx will sign.
+# ⚠️ Injective's Ledger support uses the stock Ethereum app, and the address comes out at the
+# DEFAULT path m/44'/60'/0'/0/0; pass --hd-path only if yours differs.
+#
+# ⚠️ The device LOCKS between calls and each lock breaks the connection, so a propose/sign/exec
+# run is not one uninterrupted session - expect to unlock again before the sign step. Ledger Live
+# competes for the USB device; if `cast wallet address --ledger` cannot connect, close it.
 # ---------------------------------------------------------------------------------------------
 set -euo pipefail
 
