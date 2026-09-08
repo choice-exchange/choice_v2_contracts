@@ -178,7 +178,9 @@ contract SeedSplitPools is BaseScript {
         Plan memory plan = Planner.init();
         plan = plan.add(
             Actions.CL_MINT_POSITION,
-            abi.encode(key, TICK_LOWER, TICK_UPPER, liquidity, type(uint128).max, type(uint128).max, deployer, bytes(""))
+            abi.encode(
+                key, TICK_LOWER, TICK_UPPER, liquidity, type(uint128).max, type(uint128).max, deployer, bytes("")
+            )
         );
         bytes memory payload = plan.finalizeModifyLiquidityWithClose(key);
         ICLPositionManager(positionManager).modifyLiquidities(payload, block.timestamp + 600);
