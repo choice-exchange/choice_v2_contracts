@@ -53,8 +53,8 @@ contract DeployFeeControllers is BaseScript {
     // changes the CONSTRUCTOR - the fee policy is now an argument - so a bin controller left
     // at its old salt would be a live contract whose policy came from upstream's defaults
     // rather than from the address book, on a chain where the book says zero. Both must move.
-    bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.2.0");
-    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.1.0");
+    bytes32 internal constant CL_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/CLProtocolFeeController/1.3.0");
+    bytes32 internal constant BIN_FEE_CONTROLLER_SALT = keccak256("CHOICE-V2/BinProtocolFeeController/1.2.0");
 
     /// @dev Injective's real `ExchangeAuctionFeesAddress`, not a placeholder - it is
     /// `inj1zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3t5qxqh`, swept into the burn auction basket by the

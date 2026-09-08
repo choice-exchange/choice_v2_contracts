@@ -43,10 +43,15 @@ import {IBurnSink} from "../interfaces/IBurnSink.sol";
 /// denom list, which is set by genesis or by governance proposal
 /// (`UpdateAuctionExchangeTransferDenomDecimalsProposal`). Choice earns fees in whatever a
 /// pool trades, so a long-tail launch token generally will NOT be on that list, and its burn
-/// share would accumulate at the auction address rather than being burnt. Options, none of
-/// which belong in this contract: route non-eligible currencies through a swap to INJ before
-/// burning, or set a per-pool `treasuryBps` of 100% for them. Decide per currency before
-/// pointing a pool's fees at the burn leg.
+/// share would **accumulate at `0x1111…1111`, the real `ExchangeAuctionFeesAddress`, where
+/// nobody holds a key**. That is not a stuck balance; it is a permanent loss.
+///
+/// 🔑 `burnEligible` is the answer, and it is why this is no longer only a comment. A currency
+/// is burnt only if the owner has said it can be; every other currency goes 100% to the
+/// treasury whatever `treasuryBps` says, and can be dealt with by hand. The default is
+/// `false`, so the safe behaviour is what a fresh deployment does and eligibility is a
+/// deliberate act per currency. This is a **denominator-independent** guard: it cannot be
+/// defeated by someone later lowering `treasuryBps` and forgetting the auction list.
 contract ChoiceFeeController is ProtocolFeeController {
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
@@ -91,6 +96,26 @@ contract ChoiceFeeController is ProtocolFeeController {
     /// ANYONE do it, for launch pools only.
     IHooks public launchPoolGuardHook;
 
+    /// @notice Whether `currency`'s burn share may actually be sent to the burn sink.
+    ///
+    /// @dev 🔴 FALSE BY DEFAULT, and that default is the point. Injective sweeps a denom into
+    /// the auction basket only if governance has put it on the auction-transfer denom list. A
+    /// currency that is not on it does not fail loudly - its burn share lands at
+    /// `0x1111…1111`, the real `ExchangeAuctionFeesAddress`, which nobody holds a key to. So
+    /// the failure mode of getting this wrong is silent, permanent loss, and it is worst for
+    /// exactly the currencies Choice earns most of: long-tail launch tokens, which will
+    /// essentially never be on that list.
+    ///
+    /// `harvest` therefore treats an ineligible currency as `treasuryBps = 100%` no matter
+    /// what `treasuryBps` actually is. Nothing is stranded and nothing is lost; the treasury
+    /// receives it and governance can route it by hand.
+    ///
+    /// 🔑 Why this is not just "set `treasuryBps` to 100%": that is ONE global number. The
+    /// moment it is lowered to turn burning on for INJ or USDT, it is lowered for every
+    /// long-tail token in the same instant. This is per currency, so the two decisions stop
+    /// being the same decision.
+    mapping(Currency => bool) public burnEligible;
+
     error TreasuryNotSet();
     error BurnSinkNotSet();
     error InvalidTreasuryBps();
@@ -104,6 +129,7 @@ contract ChoiceFeeController is ProtocolFeeController {
     event TreasuryBpsUpdated(uint256 oldTreasuryBps, uint256 newTreasuryBps);
     event Harvested(Currency indexed currency, uint256 toTreasury, uint256 toBurn);
     event LaunchPoolGuardHookUpdated(IHooks oldHook, IHooks newHook);
+    event BurnEligibleUpdated(Currency indexed currency, bool oldEligible, bool newEligible);
     event LaunchPoolProtocolFeeZeroed(PoolId indexed poolId);
 
     /// @notice Denominator for `protocolFeeSplitRatio`, mirroring upstream's own private
@@ -187,7 +213,14 @@ contract ChoiceFeeController is ProtocolFeeController {
         uint256 collected = currency.balanceOfSelf() - balanceBefore;
         if (collected == 0) revert NothingToHarvest();
 
-        toTreasury = collected * treasuryBps / BPS_DENOMINATOR;
+        // 🔴 An ineligible currency is treated as 100% treasury whatever `treasuryBps` says.
+        // Not a revert, deliberately: `harvest` is permissionless and the pool manager's
+        // bucket is per currency, so reverting would let one un-listed token block its own
+        // revenue indefinitely. Paying it all to the treasury keeps the money reachable and
+        // leaves the decision with governance. See `burnEligible`.
+        uint256 effectiveTreasuryBps = burnEligible[currency] ? treasuryBps : BPS_DENOMINATOR;
+
+        toTreasury = collected * effectiveTreasuryBps / BPS_DENOMINATOR;
         // The remainder rather than a second multiplication, so integer division cannot
         // strand dust in this contract on every single harvest.
         toBurn = collected - toTreasury;
@@ -284,10 +317,28 @@ contract ChoiceFeeController is ProtocolFeeController {
     }
 
     /// @param newTreasuryBps 5000 = half to treasury, half burnt.
+    /// @dev ⚠️ This reaches only currencies marked `burnEligible`. Lowering it does NOT start
+    /// burning long-tail tokens, which is the whole reason `setBurnEligible` exists.
     function setTreasuryBps(uint256 newTreasuryBps) external onlyOwner {
         if (newTreasuryBps > BPS_DENOMINATOR) revert InvalidTreasuryBps();
         emit TreasuryBpsUpdated(treasuryBps, newTreasuryBps);
         treasuryBps = newTreasuryBps;
+    }
+
+    /// @notice Allow or forbid `currency`'s burn share reaching the sink.
+    ///
+    /// @dev 🔴 BEFORE SETTING THIS TRUE, confirm the denom is on Injective's auction-transfer
+    /// denom list. That list is governance-set
+    /// (`UpdateAuctionExchangeTransferDenomDecimalsProposal`) and this contract cannot read
+    /// it - there is no precompile that answers the question - so the check is a human one
+    /// and this function is the place it is recorded. Getting it wrong sends the burn share
+    /// to `0x1111…1111` for ever.
+    ///
+    /// Safe in the other direction at any time: flipping it back to false only redirects
+    /// future harvests to the treasury.
+    function setBurnEligible(Currency currency, bool eligible) external onlyOwner {
+        emit BurnEligibleUpdated(currency, burnEligible[currency], eligible);
+        burnEligible[currency] = eligible;
     }
 
     /// @dev Native INJ arrives here from `collectProtocolFees`.

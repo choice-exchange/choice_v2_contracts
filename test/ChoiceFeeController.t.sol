@@ -132,9 +132,11 @@ contract ChoiceFeeControllerTest is Test {
     // ---------------------------------------------------------------- harvest
 
     function test_harvestSplitsFiftyFiftyAndIsPermissionless() public {
-        vm.prank(TIMELOCK);
-        controller.setTreasuryBps(5_000); // unpark: plan D10's 50/50
         Currency currency = _accrueProtocolFee(1_000_000);
+        vm.startPrank(TIMELOCK);
+        controller.setTreasuryBps(5_000); // unpark: plan D10's 50/50
+        controller.setBurnEligible(currency, true); // A6: and say this denom may be burnt
+        vm.stopPrank();
 
         // Called by an arbitrary address: revenue must not depend on a privileged keeper.
         vm.prank(RANDOM);
@@ -202,8 +204,70 @@ contract ChoiceFeeControllerTest is Test {
         parked.setTreasuryBps(5_000);
 
         Currency currency = _accrueProtocolFee(1_000);
+        parked.setBurnEligible(currency, true);
         vm.expectRevert(ChoiceFeeController.BurnSinkNotSet.selector);
         parked.harvest(currency);
+    }
+
+    // ------------------------------------------------------- A6: per-currency burn eligibility
+
+    /// @dev THE ONE THAT MATTERS. A currency that is not on Injective's auction-transfer denom
+    /// list does not fail loudly - its burn share lands at 0x1111...1111, which nobody holds a
+    /// key to. So an ineligible currency must go 100% to the treasury even with treasuryBps
+    /// explicitly set to 50/50, and the sink must not be touched at all.
+    function test_anIneligibleCurrencyGoesEntirelyToTheTreasury() public {
+        vm.prank(TIMELOCK);
+        controller.setTreasuryBps(5_000); // burning is ON globally
+        Currency currency = _accrueProtocolFee(1_000_000); // but this denom was never marked
+
+        (uint256 toTreasury, uint256 toBurn) = controller.harvest(currency);
+
+        assertEq(toTreasury, 1_000_000, "everything to the treasury");
+        assertEq(toBurn, 0, "nothing may reach the auction address");
+        assertEq(token.balanceOf(TREASURY), 1_000_000, "treasury leg");
+        assertEq(sink.received(), 0, "sink must not be notified");
+        assertEq(token.balanceOf(address(sink)), 0, "sink must not be funded");
+        assertEq(token.balanceOf(address(controller)), 0, "nothing stranded");
+    }
+
+    /// @dev Default-deny is the property, not an accident of this fixture: a fresh controller
+    /// answers false for a currency nobody has ever mentioned.
+    function test_burnEligibilityDefaultsToFalse() public view {
+        assertFalse(controller.burnEligible(Currency.wrap(address(token))));
+        assertFalse(controller.burnEligible(Currency.wrap(address(0))));
+    }
+
+    /// @dev Flipping it back must redirect FUTURE harvests, which is what makes it a safe
+    /// reaction to discovering a denom was de-listed.
+    function test_burnEligibilityCanBeRevokedAndTakesEffect() public {
+        Currency currency = _accrueProtocolFee(1_000);
+        vm.startPrank(TIMELOCK);
+        controller.setTreasuryBps(5_000);
+        controller.setBurnEligible(currency, true);
+        controller.setBurnEligible(currency, false);
+        vm.stopPrank();
+
+        (, uint256 toBurn) = controller.harvest(currency);
+        assertEq(toBurn, 0, "revoked eligibility must stop the burn leg");
+        assertEq(sink.received(), 0, "sink untouched after revocation");
+    }
+
+    function test_onlyOwnerCanSetBurnEligibility() public {
+        vm.prank(RANDOM);
+        vm.expectRevert();
+        controller.setBurnEligible(Currency.wrap(address(token)), true);
+    }
+
+    /// @dev Eligibility is PER CURRENCY, which is the whole reason it is not just
+    /// `treasuryBps = 100%`: marking one denom must not mark another.
+    function test_burnEligibilityIsPerCurrency() public {
+        Currency eligible = _accrueProtocolFee(1_000);
+        Currency other = Currency.wrap(address(0xBEEF));
+        vm.prank(TIMELOCK);
+        controller.setBurnEligible(eligible, true);
+
+        assertTrue(controller.burnEligible(eligible));
+        assertFalse(controller.burnEligible(other), "marking one denom marked another");
     }
 
     function test_harvestRevertsWhenThereIsNothingToCollect() public {
@@ -215,12 +279,12 @@ contract ChoiceFeeControllerTest is Test {
     /// the controller where it reads as revenue nobody is watching.
     function test_harvestRevertsIfTheBurnSinkReverts() public {
         RevertingBurnSink broken = new RevertingBurnSink();
+        Currency currency = _accrueProtocolFee(1_000);
         vm.startPrank(TIMELOCK);
         controller.setBurnSink(broken);
         controller.setTreasuryBps(5_000);
+        controller.setBurnEligible(currency, true);
         vm.stopPrank();
-
-        Currency currency = _accrueProtocolFee(1_000);
         vm.expectRevert();
         controller.harvest(currency);
     }
