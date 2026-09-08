@@ -28,9 +28,15 @@ dir="$1"; addr="$2"; target="$3"; ctor="${4:-}"
 ctor="${ctor#0x}"
 
 case "$dir" in
+  # An absolute path, for a contract whose build lives in neither `contracts` nor a fork: the
+  # Create3Factory is compiled from contracts/lib/infinity-core/lib/pancake-create3-factory,
+  # a nested submodule with its own foundry profile, and forge must run from THAT root or it
+  # cannot produce the standard-json for it.
+  /*)        root="$dir" ;;
   contracts) root="$CHOICE_V2/contracts" ;;
   *)         root="$CHOICE_V2/forks/$dir" ;;
 esac
+[ -d "$root" ] || { echo "no such build root: $root" >&2; exit 66; }
 
 name="${target##*:}"
 
