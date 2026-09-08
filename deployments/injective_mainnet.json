@@ -116,7 +116,7 @@
     },
     "lastUpdated": "2026-09-08",
     "blockscoutApi": "https://blockscout-api.injective.network",
-    "blockscoutVerified": "0/0 - nothing deployed",
+    "blockscoutVerified": "21/21 verified 2026-09-09 by script/tools/verify-all-mainnet.sh, and CONFIRMED INDEPENDENTLY by reading is_verified off the Blockscout API for every address in this file rather than by trusting the run - which is the only check that can catch the manifest's own failure mode, a contract that is deployed and simply not listed. The one address in this book that is a contract and is NOT verified is governance.safe (== choice.treasury): it is a canonical Safe PROXY, not our code, and the whole stack behind it is already verified on 1776 - SafeL2 singleton, SafeProxyFactory and CompatibilityFallbackHandler. 🔴 verify-all.sh is TESTNET ONLY - hardcoded 1439 addresses and the testnet API host - so mainnet has its own manifest. Both share verify-blockscout.sh.",
     "addressAliases": {
       "choice.treasury": "the Safe, deliberately - protocol revenue lands where the signers can move it without waiting out a timelock delay. Declared here because the well-formed check treats one address under two keys as a copy-paste until a human says otherwise, and this is the one place it is intended. Testnet declares the same alias for the same reason. See choice.treasuryNote for why Choice v1's cw3 treasury multisig was rejected: it has no EVM code, so a pure EVM ERC20 sent there would be unreachable by anyone for ever."
     },
