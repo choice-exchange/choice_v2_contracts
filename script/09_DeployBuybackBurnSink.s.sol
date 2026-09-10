@@ -40,22 +40,35 @@ contract DeployBuybackBurnSink is BaseScript {
     /// case - a launch that graduated on an earlier fee tier stopped being derivable, silently,
     /// and its revenue parked until somebody pointed the tier back.
     ///
-    /// 🔴 **A salt DOES move with this one.** `LaunchFeeCranker` (script 10) calls
-    /// `convert(Currency,uint256)`, which exists only from 1.2.0, and it holds its sink as an
-    /// immutable - so a sink redeploy is always a cranker redeploy. That is the A3 rule applied
-    /// forwards for once rather than discovered afterwards: bump both, deploy both, and check
-    /// `cranker.SINK()` afterwards.
+    /// 🔴 **A sink redeploy is NO LONGER a cranker redeploy.** This used to say it was, because
+    /// `LaunchFeeCranker` held its sink as an immutable - true of 1.x, and false since **2.0.0**,
+    /// which makes `SINK` ordinary storage behind an `onlyOwner` `setSink` precisely so that a
+    /// sink bump costs one timelock call instead of a contract. Checked against the deployed
+    /// testnet cranker `0x8454d702…` (2.0.0): `setSink(address)` exists and reverts
+    /// `OwnableUnauthorizedAccount` to an unprivileged caller. Point the existing cranker at the
+    /// new sink and check `cranker.SINK()` afterwards; deploy a new one only if the LOCKER moved,
+    /// which `LOCKER` being immutable still forces.
     ///
     /// ⚠️ It also needs the timelock to `setLockers` before any launch token can convert, and to
     /// repoint `PositionLocker.launchpadTreasury` at the new address on EVERY live locker - the
     /// old sink keeps whatever is parked in it until it is swept.
-    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.3.0");
+    ///
+    /// 1.4.0 carries plan **B2's numbers** rather than testnet's legacy pair - see below.
+    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.4.0");
 
-    /// TEST values (§9.3). ⛔ Not mainnet's: the floor is immutable and one shot, and B2 puts it
-    /// at 5000 with `burnBps` 7000. 8000/8000 is what the testnet sink it replaces carries, kept
-    /// so the two are comparable.
-    uint16 internal constant MIN_BURN_BPS = 8000;
-    uint16 internal constant BURN_BPS = 8000;
+    /// 🎯 **B2's values, and they are now the same on both networks — deliberately.** The floor is
+    /// immutable and one shot, so the single figure in the whole plan that must be right first
+    /// time had never been executed anywhere: every deployed sink carries 8000/8000, and on an
+    /// 8000 floor `setBurnBps(5000)` reverts. That made the plan's own Done-when 6 - *the floor
+    /// shipped at 5000, proven by `setBurnBps(5000)` succeeding and `setBurnBps(4999)` reverting* -
+    /// checkable ONLY on mainnet, i.e. only after it was irreversible.
+    ///
+    /// Deploying the rehearsal sink at 5000/7000 is what makes it checkable beforehand. ⚠️ It
+    /// costs comparability with the 2026-09-06 walk's burn figures, which were measured at 8000:
+    /// a burn under this sink destroys 7000 bps of the bought-back amount, not 8000, so do not
+    /// diff the two runs' totals without scaling.
+    uint16 internal constant MIN_BURN_BPS = 5000;
+    uint16 internal constant BURN_BPS = 7000;
 
     uint256 internal outstanding;
 
@@ -75,7 +88,7 @@ contract DeployBuybackBurnSink is BaseScript {
         requireCode("clPositionManager", positionManager);
 
         address sink = factory.computeAddress(SINK_SALT);
-        console.log("BuybackBurnSink 1.2.0 ->", sink);
+        console.log("BuybackBurnSink 1.4.0 ->", sink);
 
         if (sink.code.length == 0) {
             // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments
@@ -190,18 +203,42 @@ contract DeployBuybackBurnSink is BaseScript {
         }
     }
 
-    /// @dev The live locker, plus any superseded one still holding graduated positions.
-    /// `positionLockerLegacy` is optional: a fresh deployment has none.
+    /// @dev The live locker, plus EVERY superseded one still holding graduated positions.
+    ///
+    /// 🔴 There are THREE generations on testnet and this function used to know about two.
+    /// The `X` / `XLegacy` pair was written when that was the whole world; the 2026-09-08 core
+    /// cutover added `positionLockerPrevious` (1.1.0, launches 19-20) between them, and this read
+    /// straight past it. The consequence is not a missing entry in a log - the list it builds IS
+    /// the `setLockers` argument, so the timelock payload this script prints would have SILENTLY
+    /// DROPPED the 1.1.0 locker, and `convert` on launches 19-20 would answer
+    /// `LaunchDoesNotTrade` for ever, with the sink reporting itself correctly configured.
+    /// Found 2026-09-10 while wiring sink 1.4.0.
+    ///
+    /// ⚠️ The list is EVERY locker whose launches should stay convertible, not just the live one,
+    /// and ORDER matters twice over: `_requireLockers` compares it element-wise against what is
+    /// installed, and `launchPool(id)` returns the FIRST locker holding an id, so the oldest
+    /// generations must come after the live one for a fresh launch to win an id collision.
+    /// Both optional keys are skipped when absent, so a fresh deployment still gets a list of one.
     function _wantedLockers() internal view returns (address[] memory wanted) {
         address live = readAddress("choice.positionLocker");
+        address previous = readAddressOrZero("choice.positionLockerPrevious");
         address legacy = readAddressOrZero("choice.positionLockerLegacy");
         requireCode("positionLocker", live);
 
-        wanted = new address[](legacy == address(0) ? 1 : 2);
-        wanted[0] = live;
+        uint256 n = 1;
+        if (previous != address(0)) n++;
+        if (legacy != address(0)) n++;
+
+        wanted = new address[](n);
+        uint256 i;
+        wanted[i++] = live;
+        if (previous != address(0)) {
+            requireCode("positionLockerPrevious", previous);
+            wanted[i++] = previous;
+        }
         if (legacy != address(0)) {
             requireCode("positionLockerLegacy", legacy);
-            wanted[1] = legacy;
+            wanted[i++] = legacy;
         }
     }
 
@@ -215,7 +252,15 @@ contract DeployBuybackBurnSink is BaseScript {
         outstanding++;
         console.log("  [TODO] the guards are unset, so every buyback and every conversion parks");
         console.log("           TEST values below - see the launchpad tokenomics before mainnet");
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (1e15, 500, 60)));
+        // 🔴 `minBuybackAmount` is 1e12, not the 1e15 this printed until 2026-09-10. 1e15 was
+        // copied from sink 1.1.0 and it GATES EVERY REAL TESTNET CRANK: a graduate's accrued LP
+        // fee here is tens of MICRO-wINJ, so a buyback below 1e15 parks and the loop proves
+        // nothing. The live sink was lowered to 1e12 on 2026-09-06 and the address book records
+        // that, but this payload kept printing the number the operator had already rejected -
+        // so following the script exactly was the one way to configure a sink that never burns.
+        // ⛔ 1e12 is a TESTNET value chosen to make a session's volume visible. Do NOT carry it
+        // to mainnet; size it against measured depth after the burn token graduates (plan B4).
+        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (1e12, 500, 60)));
     }
 
     /// @dev The one pool the sink cannot be told about by a caller: the buyback's own.
