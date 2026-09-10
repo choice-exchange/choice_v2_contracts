@@ -1262,6 +1262,87 @@ contract BuybackBurnSinkTest is Test {
 
     // ── helpers ───────────────────────────────────────────────────────────
 
+    // ---------------------------------------------------------------------------------------
+    // 1.5.0 — DERIVED quote hops. A launch paired against anything but QUOTE used to need a
+    // governance transaction before its fee could ever burn; these prove it no longer does,
+    // and that derivation cannot be used to point the sink anywhere it should not go.
+
+    /// The item itself: a quote asset nobody registered, whose `{asset, QUOTE}` pool exists on a
+    /// standard tier, converts. Before 1.5.0 this parked for ever with nothing failing.
+    function test_aQuoteAssetWithAStandardTierPoolConvertsWithNothingRegistered() public {
+        posm.setPoolManager(address(manager));
+        BuybackBurnSink fresh = _freshSink();
+
+        (,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
+        assertTrue(found, "a standard-tier pool should be derivable with nothing registered");
+
+        (,, bool pinned) = fresh.registeredQuoteRoute(Currency.wrap(address(sai)));
+        assertFalse(pinned, "and it should be derived, not pinned");
+
+        _configure(fresh);
+        sai.mint(address(fresh), 500 ether);
+        fresh.burn(Currency.wrap(address(sai)), 0);
+        assertEq(sai.balanceOf(address(fresh)), 0, "the pair asset should have converted");
+    }
+
+    /// Governance still wins. A pinned route is checked BEFORE the tier search, so an operator
+    /// can always move a conversion off a pool derivation would have picked.
+    function test_aRegisteredRouteOverridesTheDerivedOne() public {
+        posm.setPoolManager(address(manager));
+        BuybackBurnSink fresh = _freshSink();
+
+        PoolKey memory override_ = _key(sai, quote, OLD_FEE);
+        _seed(override_, 5_000 ether);
+
+        vm.prank(TIMELOCK);
+        fresh.setQuoteRoute(Currency.wrap(address(sai)), override_);
+
+        (PoolKey memory used,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
+        assertTrue(found, "the pinned route should resolve");
+        assertEq(used.fee, OLD_FEE, "the pinned route must win over the derived one");
+    }
+
+    /// Several tiers may hold the same pair. Taking the first would send a conversion through a
+    /// tier somebody opened with dust while the real book sat one tier away.
+    function test_derivationPrefersTheDeepestTier() public {
+        posm.setPoolManager(address(manager));
+
+        PoolKey memory thin = _key(sai, quote, OLD_FEE);
+        _seed(thin, 1_000 ether);
+
+        BuybackBurnSink fresh = _freshSink();
+        (PoolKey memory used,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
+        assertTrue(found, "both tiers exist, one must be chosen");
+        assertEq(used.fee, FEE, "the deeper tier should win");
+    }
+
+    /// ⛔ The safety property. A derived key is built by this contract — currencies sorted,
+    /// `hooks` ZERO, manager taken from the immutable position manager — so no pool anyone else
+    /// created with a hook can ever be routed through, however deep it is.
+    function test_derivationNeverRoutesThroughAHookedPool() public {
+        posm.setPoolManager(address(manager));
+        BuybackBurnSink fresh = _freshSink();
+
+        (PoolKey memory used,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
+        assertTrue(found, "the hookless pool is still derivable");
+        assertEq(address(used.hooks), address(0), "a derived hop must never carry a hook");
+        assertEq(address(used.poolManager), address(manager), "and never another manager");
+    }
+
+    /// An asset with no pool at all stays unroutable, and `burn` still parks rather than reverts.
+    function test_anAssetWithNoPoolAnywhereStaysUnroutable() public {
+        posm.setPoolManager(address(manager));
+        BuybackBurnSink fresh = _freshSink();
+
+        (,, bool found) = fresh.quoteRoute(Currency.wrap(address(stray)));
+        assertFalse(found, "nothing should be derivable for a currency with no pool");
+
+        _configure(fresh);
+        stray.mint(address(fresh), 100 ether);
+        fresh.burn(Currency.wrap(address(stray)), 0);
+        assertEq(stray.balanceOf(address(fresh)), 100 ether, "it should park, not revert");
+    }
+
     function _key(MockERC20 a, MockERC20 b, uint24 fee) internal view returns (PoolKey memory) {
         (address c0, address c1) = address(a) < address(b) ? (address(a), address(b)) : (address(b), address(a));
         return PoolKey({
@@ -1272,6 +1353,15 @@ contract BuybackBurnSinkTest is Test {
             fee: fee,
             parameters: bytes32(0).setTickSpacing(SPACING)
         });
+    }
+
+    /// The wiring `setUp` gives the fixture sink, for a sink built later in a test.
+    function _configure(BuybackBurnSink s) internal {
+        vm.startPrank(TIMELOCK);
+        s.setBuybackPool(pool);
+        s.setLockers(_one(address(locker)));
+        s.setGuards(1 ether, 500, INTERVAL);
+        vm.stopPrank();
     }
 
     function _freshSink() internal returns (BuybackBurnSink) {

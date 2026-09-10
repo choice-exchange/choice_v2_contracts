@@ -53,8 +53,11 @@ contract DeployBuybackBurnSink is BaseScript {
     /// repoint `PositionLocker.launchpadTreasury` at the new address on EVERY live locker - the
     /// old sink keeps whatever is parked in it until it is swept.
     ///
-    /// 1.4.0 carries plan **B2's numbers** rather than testnet's legacy pair - see below.
-    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.4.0");
+    /// 1.4.0 carried plan **B2's numbers** rather than testnet's legacy pair - see below.
+/// 1.5.0 adds DERIVED quote hops: a launch paired against any asset with a standard-tier
+/// `{asset, QUOTE}` pool converts with NOTHING registered, so listing a quote asset is no
+/// longer half an operation. `setQuoteRoute` survives as the override for exotic pools.
+    bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.5.0");
 
     /// 🎯 **B2's values, and they are now the same on both networks — deliberately.** The floor is
     /// immutable and one shot, so the single figure in the whole plan that must be right first
@@ -88,7 +91,7 @@ contract DeployBuybackBurnSink is BaseScript {
         requireCode("clPositionManager", positionManager);
 
         address sink = factory.computeAddress(SINK_SALT);
-        console.log("BuybackBurnSink 1.4.0 ->", sink);
+        console.log("BuybackBurnSink 1.5.0 ->", sink);
 
         if (sink.code.length == 0) {
             // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments
