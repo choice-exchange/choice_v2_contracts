@@ -17,6 +17,20 @@ import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 contract MockPositionManager {
     mapping(uint256 tokenId => PoolKey) internal _keys;
 
+    /// @dev The sink asks for this ONCE, in its constructor, to build derived quote hops from.
+    /// It defaults to zero so every test written before derivation existed keeps the pre-1.5.0
+    /// behaviour — a zero manager disables derivation and leaves `setQuoteRoute` as the only
+    /// source of a hop. A test that wants derivation opts in with `setPoolManager`.
+    address internal _poolManager;
+
+    function setPoolManager(address m) external {
+        _poolManager = m;
+    }
+
+    function clPoolManager() external view returns (address) {
+        return _poolManager;
+    }
+
     function setPool(uint256 tokenId, PoolKey memory key) external {
         _keys[tokenId] = key;
     }

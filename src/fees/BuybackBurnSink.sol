@@ -12,7 +12,9 @@ import {ILockCallback} from "infinity-core/src/interfaces/ILockCallback.sol";
 import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
+import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {FullMath} from "infinity-core/src/pool-cl/libraries/FullMath.sol";
+import {CLPoolParametersHelper} from "infinity-core/src/pool-cl/libraries/CLPoolParametersHelper.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
@@ -151,6 +153,7 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 /// that looks like housekeeping.
 contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     using CurrencyLibrary for Currency;
+    using CLPoolParametersHelper for bytes32;
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
 
@@ -175,6 +178,20 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// Two is the most any deployment has ever needed - one live locker and one superseded one
     /// still holding older launches.
     uint256 public constant MAX_LOCKERS = 8;
+
+    /// @notice The CL pool manager derived hops are built against, read once at construction.
+    /// @dev Immutable and cached rather than fetched per call, for two reasons. It is on the
+    /// conversion path, so a staticcall per `burn` is pure cost; and `POSITION_MANAGER` is
+    /// itself immutable, so the answer cannot change - caching it removes a moving part rather
+    /// than pinning one down. Zero when the position manager cannot answer, which disables
+    /// derivation and leaves `setQuoteRoute` as the only source of a hop.
+    ICLPoolManager public immutable CL_POOL_MANAGER;
+
+    /// @notice How many standard fee tiers a derived quote hop searches.
+    /// @dev A gas cost on the conversion path - two staticcalls per tier - so it is a constant
+    /// rather than owner-settable, and small. An asset whose only market is off this table is
+    /// still reachable through `setQuoteRoute`, which is checked first.
+    uint256 public constant DERIVED_TIER_COUNT = 5;
 
     /// @notice The token bought and burnt. Immutable: a sink that could be repointed at another
     /// token is a sink whose burn is a promise again.
@@ -422,6 +439,12 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         QUOTE = _quote;
         VAULT = _vault;
         POSITION_MANAGER = _positionManager;
+        // 🔑 Asked once, and tolerated when unanswerable. A position manager that does not
+        // expose its pool manager leaves derivation off rather than making the sink
+        // undeployable - `setQuoteRoute` still works, which is exactly the pre-1.5.0 behaviour.
+        try _positionManager.clPoolManager() returns (ICLPoolManager m) {
+            CL_POOL_MANAGER = m;
+        } catch {}
         MIN_BURN_BPS = _minBurnBps;
         burnBps = _burnBps;
         treasury = _treasury;
@@ -447,17 +470,22 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         } else if (isHeld[currency]) {
             // D32 first, so a held token reports the POLICY rather than the condition below it.
             emit Parked(currency, currency.balanceOfSelf(), PARK_HELD);
-        } else if (address(_quoteRoutes[currency].poolManager) != address(0)) {
-            // 🔑 A REGISTERED QUOTE ASSET needs no hint, because the route IS the lookup.
+        } else if (_isQuoteAsset(currency)) {
+            // 🔑 A QUOTE ASSET needs no hint, because the route IS the lookup.
             //
             // This arm exists because a graduate's fees arrive in BOTH of its pool's currencies:
             // a SAI-paired launch pays the launchpad part launch-token and part SAI, and the SAI
             // half is not a launch token at all - no launch id would resolve it, and before the
             // routes it parked here for ever with reason 6. Now it is one swap to `QUOTE` and on
             // into the buyback, on a permissionless call with nothing passed in.
+            //
+            // ⚠️ "Quote asset" now means REGISTERED OR DERIVABLE, not registered. That widening
+            // is the point: a pad that lists quote assets faster than it runs timelock batches
+            // used to accrue unburnt revenue by default.
             Route memory r;
-            (r.first, r.firstZeroForOne) = _routeFor(currency);
-            r.legs = 1;
+            bool ok;
+            (r.first, r.firstZeroForOne, ok) = _hopFor(currency);
+            r.legs = ok ? 1 : 0;
             _tryConvert(currency, r);
         } else {
             // A launch token. It PARKS here, and that is a deliberate consequence of A5.
@@ -697,26 +725,123 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
                 route.legs = 1;
                 return route;
             }
-            PoolKey memory hop = _quoteRoutes[other];
-            if (address(hop.poolManager) != address(0)) {
+            (PoolKey memory hop, bool hopZeroForOne, bool hopFound) = _hopFor(other);
+            if (hopFound) {
                 route.first = launchKey;
                 route.firstZeroForOne = zeroForOne;
-                (route.second, route.secondZeroForOne) = _routeFor(other);
+                route.second = hop;
+                route.secondZeroForOne = hopZeroForOne;
                 route.legs = 2;
                 return route;
             }
         }
 
-        if (address(_quoteRoutes[currency].poolManager) != address(0)) {
-            (route.first, route.firstZeroForOne) = _routeFor(currency);
+        (PoolKey memory direct, bool directZeroForOne, bool directFound) = _hopFor(currency);
+        if (directFound) {
+            route.first = direct;
+            route.firstZeroForOne = directZeroForOne;
             route.legs = 1;
         }
     }
 
-    /// @dev The registered hop for `asset`, and which way round it sells. Assumes it exists.
-    function _routeFor(Currency asset) private view returns (PoolKey memory key, bool zeroForOne) {
+    /// @dev Whether `asset` can reach `QUOTE` in one swap, by override or by derivation.
+    function _isQuoteAsset(Currency asset) internal view returns (bool ok) {
+        (,, ok) = _hopFor(asset);
+    }
+
+    /// @dev The hop that sells `asset` for `QUOTE`: the REGISTERED override if the owner set one,
+    /// otherwise one DERIVED from the standard tiers.
+    ///
+    /// 🔑 Derivation is what makes "any quote asset" true. Before it, the second leg of a
+    /// conversion existed only if the timelock had registered a pool for that exact asset - so a
+    /// launch paired against anything but `QUOTE` collected its fee, claimed it, and then had
+    /// both halves refused, for ever, until somebody noticed and ran a governance batch. A pad
+    /// that lists quote assets faster than it runs timelock batches accrues unburnt revenue by
+    /// default, which is the opposite of what `MIN_BURN_BPS` promises.
+    ///
+    /// ⚠️ Deriving is not trusting. Every candidate is CHECKED against the chain before it is
+    /// used - the pool must be initialised and must hold liquidity - and the search is confined
+    /// to keys this contract builds itself: the two currencies sorted, `hooks` ZERO, and the
+    /// pool manager taken from `POSITION_MANAGER`, which is immutable. So a derived hop can
+    /// never route through an attacker's hook, an attacker's manager or an attacker's pair.
+    /// This is the same shape as `_launchPoolFor`: derive a candidate, then let the chain say
+    /// whether it is real.
+    ///
+    /// 🔑 The DEEPEST candidate wins, not the first. Several tiers may hold the same pair, and
+    /// picking by tier order would send a conversion through a tier somebody opened with dust
+    /// while the real book sat one tier away.
+    function _hopFor(Currency asset) internal view returns (PoolKey memory key, bool zeroForOne, bool found) {
         key = _quoteRoutes[asset];
-        zeroForOne = key.currency0 == asset;
+        if (address(key.poolManager) != address(0)) {
+            found = true;
+        } else {
+            (key, found) = _deriveQuoteHop(asset);
+        }
+        if (found) zeroForOne = key.currency0 == asset;
+    }
+
+    /// @dev The deepest initialised `{asset, QUOTE}` pool across the standard tiers, or nothing.
+    function _deriveQuoteHop(Currency asset) internal view returns (PoolKey memory best, bool found) {
+        if (Currency.unwrap(asset) == address(BURN_TOKEN) || asset == QUOTE) return (best, false);
+
+        ICLPoolManager mgr = CL_POOL_MANAGER;
+        if (address(mgr) == address(0)) return (best, false);
+        (Currency c0, Currency c1) = asset < QUOTE ? (asset, QUOTE) : (QUOTE, asset);
+
+        uint128 deepest;
+        for (uint256 i; i < DERIVED_TIER_COUNT; ++i) {
+            (uint24 fee, int24 spacing) = _derivedTier(i);
+            PoolKey memory candidate = PoolKey({
+                currency0: c0,
+                currency1: c1,
+                hooks: IHooks(address(0)),
+                poolManager: mgr,
+                fee: fee,
+                parameters: bytes32(0).setTickSpacing(spacing)
+            });
+
+            // ⛔ try/catch, not a plain call, and it is load-bearing rather than defensive
+            // habit. `_hopFor` is reached from `burn`, whose ONE guarantee is that it never
+            // reverts - a harvest must not be brickable by anything downstream of it. A pool
+            // manager that reverts on an unknown id, or is paused, or is simply not the
+            // contract this sink thinks it is, would otherwise turn "there is no route" into
+            // "the harvest failed". The fuzz test testFuzz_burnNeverRevertsWhateverTheState is
+            // what caught this: the first version called straight through and took the
+            // guarantee down with it.
+            uint160 sqrtPriceX96;
+            try mgr.getSlot0(candidate.toId()) returns (uint160 p, int24, uint24, uint24) {
+                sqrtPriceX96 = p;
+            } catch {
+                continue;
+            }
+            if (sqrtPriceX96 == 0) continue;
+
+            uint128 liquidity;
+            try mgr.getLiquidity(candidate.toId()) returns (uint128 l) {
+                liquidity = l;
+            } catch {
+                continue;
+            }
+            if (liquidity == 0 || liquidity <= deepest) continue;
+
+            deepest = liquidity;
+            best = candidate;
+            found = true;
+        }
+    }
+
+    /// @dev The standard tier table, as `(lpFee, tickSpacing)`.
+    ///
+    /// 🔴 `fee` here is the LP leg, NOT the tier's headline percentage - the 0.05% tier is 335,
+    /// not 500, because upstream's split truncates twice. Both 1% entries are deliberate: 6722
+    /// is the LP leg when a protocol fee is charged alongside it, 10000 when it is not, and both
+    /// exist on a live chain at once because plan A0 zeroed the protocol fee for graduates only.
+    function _derivedTier(uint256 i) private pure returns (uint24 fee, int24 spacing) {
+        if (i == 0) return (335, 10);
+        if (i == 1) return (67, 1);
+        if (i == 2) return (2011, 60);
+        if (i == 3) return (6722, 200);
+        return (10000, 200);
     }
 
     /// @dev The launch's own graduation pool, read off its locked position and then CHECKED.
@@ -981,7 +1106,24 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @return key The pool; zero when nothing is registered.
     /// @return assetIsCurrency0 True when `asset` is that pool's `currency0`.
     /// @return found Whether a route exists at all.
+    /// @notice The hop this sink would ACTUALLY use to sell `asset` for `QUOTE`.
+    /// @dev 🔴 This reports the EFFECTIVE route, so it answers `found` for an asset nobody has
+    /// registered but whose `{asset, QUOTE}` pool exists on a standard tier. That is the whole
+    /// point of derivation and it is what operational tooling should read: "can this asset's
+    /// revenue be burnt?" is the question, and a registered override is only one way to yes.
+    /// Use `registeredQuoteRoute` for the narrower question of what governance has pinned.
     function quoteRoute(Currency asset) external view returns (PoolKey memory key, bool assetIsCurrency0, bool found) {
+        (key, assetIsCurrency0, found) = _hopFor(asset);
+    }
+
+    /// @notice The hop the owner PINNED for `asset`, ignoring anything derivable.
+    /// @dev The pair to `quoteRoute` above: this one answers "is there an override", which is
+    /// what a governance review wants, while `quoteRoute` answers "will it convert".
+    function registeredQuoteRoute(Currency asset)
+        external
+        view
+        returns (PoolKey memory key, bool assetIsCurrency0, bool found)
+    {
         key = _quoteRoutes[asset];
         found = address(key.poolManager) != address(0);
         assetIsCurrency0 = found && key.currency0 == asset;
