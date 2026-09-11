@@ -36,27 +36,37 @@ import {BaseScript} from "./BaseScript.sol";
  * No --resume, ever. Re-run instead; every step below is idempotent.
  */
 contract DeployLaunchpadSettler is BaseScript {
-    // 1.2.0 is the TESTNET CORE CUTOVER (2026-09-08), and the bump is forced by the LAUNCH ID
-    // SPACE rather than by any change to this contract - which is a reason a salt can move that
-    // is worth naming, because nothing in the source diff shows it. `_positions` is keyed by
-    // `launchId` ALONE, so a second `LaunchpadCore` numbering from 0 re-registers ids the 1.1.0
-    // locker already holds (19, 20) and `register` reverts `AlreadyRegistered` INSIDE `settle` -
-    // mid-graduation, after every gate has passed. ⇒ ONE LOCKER GENERATION PER CORE GENERATION.
+    // 1.3.0 is the TESTNET CORE CUTOVER of 2026-09-11, onto the launchpad's ATOMIC core (the one
+    // that issues and binds a launch's token inside `createLaunch`, numbering from 1000). The
+    // code is unchanged; the bump is ONE LOCKER GENERATION PER CORE GENERATION applied again,
+    // and this time the launch-id argument below is not what forces it - id 1000 collides with
+    // nothing. What forces it is that a locker has ONE `settler`, and the settler holds its core
+    // immutably: the 1.2.0 locker must keep registering for the 2026-09-08 core's settler for as
+    // long as that core still graduates, so it cannot be repointed at this one.
     //
-    // Earlier generations, both still live and both still holding positions: 1.1.0 (plan A3, the
-    // PULL `collect`+`claim` and a `register` that binds the position to its pool) and 1.0.0,
-    // which predates `2cf25cc`, PUSHES on `collect` and whose `register` takes FOUR arguments
-    // with no `PoolKey` - see `_requireLockerSpeaksOurAbi` for why that is checked, not assumed.
-    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.2.0");
-    // 1.3.0 is the same cutover, and it had no choice: the settler holds BOTH `CORE` and `LOCKER`
-    // as immutables, so a new core forces a new settler and so does a new locker. This salt can
-    // never lag either of them.
+    // 1.2.0 was the 2026-09-08 cutover, and THAT bump was forced by the LAUNCH ID SPACE rather
+    // than by any change to this contract - a reason a salt can move that is worth naming,
+    // because nothing in the source diff shows it. `_positions` is keyed by `launchId` ALONE, so
+    // a second `LaunchpadCore` numbering from 0 re-registers ids the 1.1.0 locker already holds
+    // (19, 20) and `register` reverts `AlreadyRegistered` INSIDE `settle` - mid-graduation, after
+    // every gate has passed.
     //
-    // What the previous generations carried: 1.2.0 was plan A0 - the LP fee is the WHOLE 1.00%
-    // tier (10000, not the 6722 that composited to 1% alongside a protocol fee) and `settle`
-    // calls `ChoiceFeeController.zeroLaunchPoolProtocolFee`, so a graduate never pays Choice's
-    // protocol fee for even one block. 1.1.0 is DEAD - same code, wrong locker.
-    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.3.0");
+    // Earlier generations, all still live and all still holding positions: 1.2.0 (the 2026-09-08
+    // core), 1.1.0 (plan A3, the PULL `collect`+`claim` and a `register` that binds the position
+    // to its pool) and 1.0.0, which predates `2cf25cc`, PUSHES on `collect` and whose `register`
+    // takes FOUR arguments with no `PoolKey` - see `_requireLockerSpeaksOurAbi` for why that is
+    // checked, not assumed.
+    bytes32 internal constant LOCKER_SALT = keccak256("CHOICE-V2/PositionLocker/1.3.0");
+    // 1.4.0 is the same 2026-09-11 cutover, and it had no choice: the settler holds BOTH `CORE`
+    // and `LOCKER` as immutables, so a new core forces a new settler and so does a new locker.
+    // This salt can never lag either of them. 1.3.0 was the 2026-09-08 cutover for the same
+    // reason, and stays live as that core's settler.
+    //
+    // What the generations before those carried: 1.2.0 was plan A0 - the LP fee is the WHOLE
+    // 1.00% tier (10000, not the 6722 that composited to 1% alongside a protocol fee) and
+    // `settle` calls `ChoiceFeeController.zeroLaunchPoolProtocolFee`, so a graduate never pays
+    // Choice's protocol fee for even one block. 1.1.0 is DEAD - same code, wrong locker.
+    bytes32 internal constant SETTLER_SALT = keccak256("CHOICE-V2/InfinitySettler/1.4.0");
     bytes32 internal constant GUARD_HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolGuardHook/1.0.0");
 
     Create3Factory internal factory;

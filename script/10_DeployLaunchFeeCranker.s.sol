@@ -65,15 +65,21 @@ contract DeployLaunchFeeCranker is BaseScript {
     string internal constant LIVE_LOCKER_KEY = "choice.positionLocker";
     string internal constant LEGACY_LOCKER_KEY = "choice.positionLockerLegacy";
 
-    /// 2.0.0 adds the timelock-owned `setSink` / `setLocker`, so the constructor takes an owner
-    /// and the creation code changed - a CREATE3 salt MUST move with it, or `factory.deploy`
-    /// lands on an address that already has code and reverts.
+    /// 2.1.0 is the 2026-09-11 core cutover: the SAME bytecode as 2.0.0 with a new `LOCKER`
+    /// constructor argument (locker 1.3.0). A cranker's locker is immutable, so a new locker
+    /// generation forces a new cranker instance (the A9 rule) even when nothing in this file
+    /// changes - and a CREATE3 salt hashes the whole payload, arguments included, so it MUST move
+    /// with the arguments or `factory.deploy` lands on 2.0.0's address and reverts. 2.0.0 stays
+    /// live, bound to locker 1.2.0, and the keeper drives exactly one of them at a time.
     ///
-    /// ✅ **And this is the LAST time the salt has to move for a sink swap.** Bumping it used to
+    /// 2.0.0 added the timelock-owned `setSink` / `setLocker`, so the constructor took an owner
+    /// and the creation code changed.
+    ///
+    /// ✅ **And 2.0.0 was the LAST time the salt has to move for a sink swap.** Bumping it used to
     /// be mandatory whenever the sink's own salt moved, because `SINK` was immutable; from 2.0.0
-    /// that is a `setSink` call behind the timelock. Bump this only when THIS contract's code
-    /// changes.
-    bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/2.0.0");
+    /// that is a `setSink` call behind the timelock. Bump this only when THIS contract's code or
+    /// its constructor arguments change.
+    bytes32 internal constant CRANKER_SALT = keccak256("CHOICE-V2/LaunchFeeCranker/2.1.0");
 
     /// The A9 instance, bound to the 1.0.0 PUSH locker. A DISTINCT salt, deliberately spelled
     /// out rather than derived from the locker key: the live instance is already deployed at the
