@@ -221,20 +221,31 @@ contract DeployBuybackBurnSink is BaseScript {
     /// and ORDER matters twice over: `_requireLockers` compares it element-wise against what is
     /// installed, and `launchPool(id)` returns the FIRST locker holding an id, so the oldest
     /// generations must come after the live one for a fresh launch to win an id collision.
-    /// Both optional keys are skipped when absent, so a fresh deployment still gets a list of one.
+    /// Every optional key is skipped when absent, so a fresh deployment still gets a list of one.
+    ///
+    /// 🔴 FOUR generations since the 2026-09-11 cutover: the 1.2.0 locker moved to
+    /// `positionLocker120` when 1.3.0 became `positionLocker`, and it holds every graduate of the
+    /// 2026-09-08 core. The same read-straight-past-it mistake as above was one key away from
+    /// repeating, so it is read here explicitly rather than by renaming `Previous` under it.
     function _wantedLockers() internal view returns (address[] memory wanted) {
         address live = readAddress("choice.positionLocker");
+        address gen120 = readAddressOrZero("choice.positionLocker120");
         address previous = readAddressOrZero("choice.positionLockerPrevious");
         address legacy = readAddressOrZero("choice.positionLockerLegacy");
         requireCode("positionLocker", live);
 
         uint256 n = 1;
+        if (gen120 != address(0)) n++;
         if (previous != address(0)) n++;
         if (legacy != address(0)) n++;
 
         wanted = new address[](n);
         uint256 i;
         wanted[i++] = live;
+        if (gen120 != address(0)) {
+            requireCode("positionLocker120", gen120);
+            wanted[i++] = gen120;
+        }
         if (previous != address(0)) {
             requireCode("positionLockerPrevious", previous);
             wanted[i++] = previous;

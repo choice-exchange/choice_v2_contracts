@@ -38,20 +38,24 @@ CLQ=0xb7a4f84508c36255Bc29cc4dECaD6cBabd651a60
 BNQ=0x0e41128C6Eb88E1DDc97683d78Cf58035eeabD46
 DESC=0xd5817F090C8F9939e086861d6EEAB95004072956
 POSM=0x823F6dBB3e92f15FdA79A6b0e11e47dB1f3FEd54
-# 🔴 THREE GENERATIONS NOW. The 2026-09-08 cutover deployed a new core, and because the settler
+# 🔴 FOUR GENERATIONS NOW. The 2026-09-08 cutover deployed a new core, and because the settler
 # holds its core AND its locker as immutables, that dragged a new locker and a new settler with
-# it. Every generation stays here: verification hashes CONSTRUCTOR ARGUMENTS, so a superseded
-# contract can only ever be verified against the arguments it was actually born with.
-CORE=0xE7f90bF233e817a157acBc9BEac99926d7c5a679
+# it; the 2026-09-11 cutover onto the launchpad's ATOMIC core did it again. Every generation
+# stays here: verification hashes CONSTRUCTOR ARGUMENTS, so a superseded contract can only ever
+# be verified against the arguments it was actually born with.
+CORE=0x54a9bC5300b483eD202333Cd1bDa1f886CdB10C0
+CORE_0908=0xE7f90bF233e817a157acBc9BEac99926d7c5a679
 CORE_PREV=0xb03fb1c05f7853601ae05ba7e3700a59dc14a71d
 PADT=0xBf08c09Fe227ada4A86d279e98E695344848d33D
-# 🔴 The LIVE settler and locker, A0/A3's replacements. This list named the 1.0.0 pair until
-# 2026-09-06, so for a whole day it verified two dead contracts and left the two the pad
-# actually uses unverified - which is how three CREATE3 contracts sat unverified without
+# 🔴 The LIVE settler and locker (1.4.0 / 1.3.0, the atomic core's). This list named the 1.0.0
+# pair until 2026-09-06, so for a whole day it verified two dead contracts and left the two the
+# pad actually used unverified - which is how three CREATE3 contracts sat unverified without
 # anything reporting a failure. That is the drift the header below warns about, caught.
-SETTLER=0x4D21e3f398a1Fa3bF3c957Fa775F4C2851634437
+SETTLER=0xa53e2c2D01A91EE92aEd79B3df1BEfd98Ed1Fb27
+SETTLER_13=0x4D21e3f398a1Fa3bF3c957Fa775F4C2851634437
 SETTLER_12=0xe06aFC826Aa2d7C86b6C1f17ef4C8A8173756182
-LOCKER=0xB7999fa35085F106d0E021260F1253a085D8cDea
+LOCKER=0x59aF6364F1aC80c452Bb68ED8F83804D31caa67f
+LOCKER_12=0xB7999fa35085F106d0E021260F1253a085D8cDea
 LOCKER_11=0x0f0Df7bDa12Bea99A5A514b11f7cF6314C038bF5
 # The 1.0.0 PUSH locker. Not verified from here - it predates this repo's source, which is
 # exactly why it is not in the manifest - but it IS a constructor argument of the A9 cranker.
@@ -79,10 +83,17 @@ BURN_TOKEN=0xD21C10dCb94cD049f9544cc35D2bE6A76fD8D835
 BBSINK=0x4435DD1a7f61FEfFc00d9283855c9Cc42D29c96D
 BBSINK_120=0xd8aDFa9E13d9116914837A381392EE2EEf595d4B
 BBSINK_110=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
+# 🔴 Sink 1.5.0 is the live one (`choice.buybackBurnSink` since 2026-09-10) and the 2026-09-11
+# locker and cranker were CONSTRUCTED against it, so their rows hash this address. ⚠️ The sink
+# itself (and 1.4.0, 0xeC9f701C…) has NO ROW here and reads unverified on Blockscout: its
+# constructor changed shape again for the derived quote hop, and nobody has encoded it. Add it.
+BBSINK_150=0x061b6e7056d7Ec8B271BfC77cFEDDfaf30916748
 # 🔴 The cranker moves in LOCKSTEP with the sink: its `SINK` is immutable and it calls functions
 # that only exist from a given sink version, so 1.3.0's sink forced cranker 1.1.0. 1.0.0 stays
 # listed for the same reason the old sinks do - it is deployed, and it drives the 1.2.0 sink.
-CRANKER=0x8454d7022E2cF7B26DB1B296a40a67c147f0d193
+# 2.1.0 (2026-09-11) is 2.0.0's bytecode bound to locker 1.3.0 - one cranker per locker.
+CRANKER=0x67c9E0feC2E5109A164f254D8FDd86C4d2471Dab
+CRANKER_200=0x8454d7022E2cF7B26DB1B296a40a67c147f0d193
 CRANKER_11=0x5A1702665EFF2C6A94053518cc26d3c2D1c6f576
 CRANKER_100=0x4Ffcd7a35A041A4a776C38417cde2CAb80f9c15d
 # 🔴 The A9 instance: the SAME bytecode against the LEGACY (1.0.0, push) locker, so its
@@ -131,10 +142,12 @@ MANIFEST=(
 # `setLaunchpadTreasury` afterwards. The 1.1.0 row below still hashes `$PADT` because that IS
 # what its constructor took — the field was repointed later, and a setter does not change the
 # creation code verification checks against.
-"$LOCKER|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $BBSINK $TL $SETTLER)"
+"$LOCKER|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $BBSINK_150 $TL $SETTLER)"
+"$LOCKER_12|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $BBSINK $TL $SETTLER_13)"
 "$LOCKER_11|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $PADT $TL $SETTLER_12)"
 "$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER_10)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
+"$SETTLER_13|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE_0908 $CLPM $POSM $P2 $LOCKER_12 $GUARD $TL)"
 "$SETTLER_12|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE_PREV $CLPM $POSM $P2 $LOCKER_11 $GUARD $TL)"
 "0x3C6724629A341958a1Faf147aA3dC12C5C3A8E98|contracts|src/router/ChoiceRouter.sol:ChoiceRouter|$(CA 'address,address,address[]' $TL $P2 "[$VAULT]")"
 # 🔴 The 1.2.0 constructor gained the CL position manager - the contract the sink asks for a
@@ -146,7 +159,8 @@ MANIFEST=(
 "$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $SAFE $TL 8000 8000)"
 # 🔴 2.0.0 takes THREE arguments, not two: `setSink`/`setLocker` moved behind the timelock, so
 # the constructor gained an owner. A 1.x row cannot be reused for it and vice versa.
-"$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address,address $LOCKER $BBSINK $TL)"
+"$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address,address $LOCKER $BBSINK_150 $TL)"
+"$CRANKER_200|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address,address $LOCKER_12 $BBSINK $TL)"
 "$CRANKER_11|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER_11 $BBSINK)"
 "$CRANKER_LEGACY|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER_LEGACY $BBSINK)"
 "$CRANKER_100|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address $LOCKER $BBSINK_120)"
