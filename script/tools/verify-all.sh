@@ -84,10 +84,32 @@ BBSINK=0x4435DD1a7f61FEfFc00d9283855c9Cc42D29c96D
 BBSINK_120=0xd8aDFa9E13d9116914837A381392EE2EEf595d4B
 BBSINK_110=0xcC707724b5B91b17ef398E11257E1a61b10bdF20
 # 🔴 Sink 1.5.0 is the live one (`choice.buybackBurnSink` since 2026-09-10) and the 2026-09-11
-# locker and cranker were CONSTRUCTED against it, so their rows hash this address. ⚠️ The sink
-# itself (and 1.4.0, 0xeC9f701C…) has NO ROW here and reads unverified on Blockscout: its
-# constructor changed shape again for the derived quote hop, and nobody has encoded it. Add it.
+# locker and cranker were CONSTRUCTED against it, so their rows hash this address.
+#
+# ✅ Both 1.5.0 and 1.4.0 are verified as of 2026-09-12, and 1.5.0 has a row below.
+# 🔴 The note that used to sit here — "its constructor changed shape again for the derived quote
+# hop" — was WRONG, and believing it is what kept the row unwritten. The shape is IDENTICAL to
+# 1.2.0/1.3.0's eight arguments. What changed is two VALUES, and both are why a copied row fails:
+#   - the burn token is $BURN_TOKEN_S, not $BURN_TOKEN (a different, later test SPROUT), and
+#   - the bps pair is 5000/7000, not 8000/8000 (the B2 numbers, whose floor is an IMMUTABLE).
+# Read off the bytes actually deployed rather than from any of that:
+# `broadcast/09_DeployBuybackBurnSink.s.sol/1439/run-1789026244612.json`, last 256 bytes of the
+# CREATE3 payload's `creationCode` argument — confirmed byte-identical to the row below.
 BBSINK_150=0x061b6e7056d7Ec8B271BfC77cFEDDfaf30916748
+# The burn token 1.4.0 and 1.5.0 were constructed against. NOT $BURN_TOKEN above, which is the
+# earlier test token the 1.1.0-1.3.0 sinks burn — they are both live, and a row that crosses them
+# fails with a bytecode mismatch that reads like a compiler-settings problem.
+BURN_TOKEN_S=0xEDF52618Cf3C61Be2a721d964C5064c87970331E
+# ⛔ Sink 1.4.0 (0xeC9f701C…) deliberately has NO ROW, and this is not an oversight to fix.
+# It was built from commit ee3289b, BEFORE 88293f3 added the derived quote hop, so its creation
+# code is 19,173 bytes against this tree's 20,405 — the whole 1.4.0 payload is SMALLER than
+# today's code alone. This manifest compiles from the WORKING TREE, so a row for it could never
+# pass from `main`; it would turn a green gate red for ever and teach a reader to ignore it.
+# It IS verified (2026-09-12) — from its own revision, which is the recipe if it is ever lost:
+#   git worktree add --detach /tmp/sink140 ee3289b && ln -s "$PWD/lib" /tmp/sink140/lib
+#   ./script/tools/verify-blockscout.sh /tmp/sink140 0xeC9f701C3b514274f872a05Cf20fE81e8E474910 \
+#       src/fees/BuybackBurnSink.sol:BuybackBurnSink <the same ctor hex as the 1.5.0 row>
+# (The arguments are identical to 1.5.0's — only the code differs.)
 # 🔴 The cranker moves in LOCKSTEP with the sink: its `SINK` is immutable and it calls functions
 # that only exist from a given sink version, so 1.3.0's sink forced cranker 1.1.0. 1.0.0 stays
 # listed for the same reason the old sinks do - it is deployed, and it drives the 1.2.0 sink.
@@ -157,6 +179,10 @@ MANIFEST=(
 "$BBSINK|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
 "$BBSINK_120|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $POSM $SAFE $TL 8000 8000)"
 "$BBSINK_110|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,uint16,uint16 $BURN_TOKEN $WETH $VAULT $SAFE $TL 8000 8000)"
+# 1.5.0 — the LIVE sink. Same eight-argument shape as 1.2.0/1.3.0 above; the later burn token and
+# the 5000/7000 bps are what make it a separate row rather than a re-verify. See the block above
+# for why 1.4.0 has none.
+"$BBSINK_150|contracts|src/fees/BuybackBurnSink.sol:BuybackBurnSink|$(CA address,address,address,address,address,address,uint16,uint16 $BURN_TOKEN_S $WETH $VAULT $POSM $SAFE $TL 5000 7000)"
 # 🔴 2.0.0 takes THREE arguments, not two: `setSink`/`setLocker` moved behind the timelock, so
 # the constructor gained an owner. A 1.x row cannot be reused for it and vice versa.
 "$CRANKER|contracts|src/launchpad/LaunchFeeCranker.sol:LaunchFeeCranker|$(CA address,address,address $LOCKER $BBSINK_150 $TL)"
