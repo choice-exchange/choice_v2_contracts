@@ -127,4 +127,17 @@ abstract contract BaseScript is Script {
     function deployerKey() internal view returns (uint256) {
         return vm.envUint("PRIVATE_KEY");
     }
+
+    /// @notice Refuse, readably, to broadcast a `factory.deploy` the CREATE3 factory will reject.
+    /// @dev Once the factory is locked down (E5) it is owned by the timelock and NO key is
+    /// whitelisted, so a deploy script run the old way would die on the factory's bare
+    /// `NotWhitelisted()` in simulation. This says what happened and where to go instead.
+    function requireWhitelistedDeployer(address factory) internal view {
+        (bool ok, bytes memory ret) =
+            factory.staticcall(abi.encodeWithSignature("isUserWhitelisted(address)", vm.addr(deployerKey())));
+        require(
+            ok && ret.length == 32 && abi.decode(ret, (bool)),
+            "the deploy key is not whitelisted on the CREATE3 factory - it is locked down (E5); deploy through the timelock with script 13"
+        );
+    }
 }
