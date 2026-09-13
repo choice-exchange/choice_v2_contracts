@@ -195,7 +195,13 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         }
 
         if (sink.code.length == 0) {
-            address burnToken = readAddress("launchpad.burnToken");
+            // The sink's payload carries the burn token, so this batch cannot exist before it does.
+            // `readAddress` dies on a null entry with a bare JSON parse error; say why instead.
+            address burnToken = readAddressOrZero("launchpad.burnToken");
+            require(
+                burnToken != address(0),
+                "launchpad.burnToken is not in the book yet - the sink's payload carries it, so this batch cannot be built until the burn token exists"
+            );
             address quote = readAddress("external.wINJ");
             address vault = readAddress("infinity.vault");
             address positionManager = readAddress("infinity.clPositionManager");
