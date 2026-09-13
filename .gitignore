@@ -9,3 +9,11 @@ node_modules/
 # broadcast/<script>/<chainId>/run-latest.json with `cast send`, never with --resume.
 !broadcast/
 broadcast/**/dry-run/
+
+# 🔴 Safe proposals and collected signatures. SAFE_TX_DIR in the workspace's
+# scripts/safe/safe-tx.sh DEFAULTS to `contracts/safe` — here, in the PUBLIC repo — so without
+# this rule a `git add -A` publishes governance proposals and owner signatures. The workspace
+# .gitignore carries a comment claiming its own `/contracts/` rule covers this; it does not,
+# because that only stops the WORKSPACE repo tracking them. This is the rule that stops this one.
+# Point SAFE_TX_DIR at the private workspace's own /safe/ instead.
+/safe/
