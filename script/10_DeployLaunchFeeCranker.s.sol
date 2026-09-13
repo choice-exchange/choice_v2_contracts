@@ -87,7 +87,7 @@ contract DeployLaunchFeeCranker is BaseScript {
     /// away from moving it.
     bytes32 internal constant CRANKER_LEGACY_SALT = keccak256("CHOICE-V2/LaunchFeeCrankerLegacy/2.0.0");
 
-    function run() public {
+    function run() public virtual {
         string memory lockerKey = vm.envOr("CRANKER_LOCKER_KEY", LIVE_LOCKER_KEY);
         (bytes32 salt, string memory bookKey) = _instanceFor(lockerKey);
 
@@ -108,13 +108,9 @@ contract DeployLaunchFeeCranker is BaseScript {
         console.log("LaunchFeeCranker ->", cranker);
 
         if (cranker.code.length == 0) {
-            // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments
-            // included - hashing the bare `creationCode` fails with `CreationCodeHashMismatch`.
-            bytes memory payload = abi.encodePacked(
-                type(LaunchFeeCranker).creationCode,
-                abi.encode(ILaunchPositionLocker(locker), BuybackBurnSink(payable(sink)), timelock)
-            );
+            bytes memory payload = _crankerPayload(locker, sink, timelock);
 
+            requireWhitelistedDeployer(address(factory));
             vm.startBroadcast(deployerKey());
             address deployed = factory.deploy(salt, payload, keccak256(payload), 0, "", 0);
             vm.stopBroadcast();
@@ -165,6 +161,20 @@ contract DeployLaunchFeeCranker is BaseScript {
         console.log("     instance exists and still nothing calls it.");
     }
 
+    /// @dev The cranker's CREATE3 payload. The one place it is built, shared with script 13 for
+    /// the same reason as 09's `_sinkPayload`.
+    ///
+    /// 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments included -
+    /// hashing the bare `creationCode` fails with `CreationCodeHashMismatch`. And the constructor
+    /// READS `QUOTE()` and `BURN_TOKEN()` off the sink, so the sink must have code when this runs:
+    /// in a timelock batch, that is an ordering rule - the sink's deploy comes first.
+    function _crankerPayload(address locker, address sink, address timelock) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            type(LaunchFeeCranker).creationCode,
+            abi.encode(ILaunchPositionLocker(locker), BuybackBurnSink(payable(sink)), timelock)
+        );
+    }
+
     /// @dev The book key -> (salt, book entry) table. Deliberately exhaustive and deliberately
     /// reverting: see the header. Compared by hash because Solidity cannot compare strings.
     function _instanceFor(string memory lockerKey) internal pure returns (bytes32 salt, string memory bookKey) {
@@ -186,7 +196,7 @@ contract DeployLaunchFeeCranker is BaseScript {
 
     /// @dev Both halves, because matching `execute`'s arguments to the `schedule` they came
     /// from is the whole trick with a `TimelockController`.
-    function _printTimelockPayloads(address target, bytes memory payload) internal view {
+    function _printTimelockPayloads(address target, bytes memory payload) internal view virtual {
         uint256 delay = readUint("governance.timelockMinDelay");
         console.log(
             string.concat(

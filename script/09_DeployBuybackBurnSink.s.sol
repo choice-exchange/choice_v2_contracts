@@ -75,7 +75,7 @@ contract DeployBuybackBurnSink is BaseScript {
 
     uint256 internal outstanding;
 
-    function run() public {
+    function run() public virtual {
         Create3Factory factory = Create3Factory(readAddress("governance.create3Factory"));
         address timelock = readAddress("governance.timelock");
         address treasury = readAddress("choice.treasury");
@@ -94,22 +94,9 @@ contract DeployBuybackBurnSink is BaseScript {
         console.log("BuybackBurnSink 1.5.0 ->", sink);
 
         if (sink.code.length == 0) {
-            // 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments
-            // included - hashing the bare `creationCode` fails with `CreationCodeHashMismatch`.
-            bytes memory payload = abi.encodePacked(
-                type(BuybackBurnSink).creationCode,
-                abi.encode(
-                    IBurnableERC20(burnToken),
-                    Currency.wrap(quote),
-                    IVault(vault),
-                    ICLPositionManager(positionManager),
-                    treasury,
-                    timelock,
-                    MIN_BURN_BPS,
-                    BURN_BPS
-                )
-            );
+            bytes memory payload = _sinkPayload(burnToken, quote, vault, positionManager, treasury, timelock);
 
+            requireWhitelistedDeployer(address(factory));
             vm.startBroadcast(deployerKey());
             address deployed = factory.deploy(SINK_SALT, payload, keccak256(payload), 0, "", 0);
             vm.stopBroadcast();
@@ -141,6 +128,35 @@ contract DeployBuybackBurnSink is BaseScript {
             console.log(string.concat("  ", vm.toString(outstanding), " timelock step(s) OUTSTANDING - see above."));
             console.log("  Re-run this script after they land; it is idempotent and will confirm them.");
         }
+    }
+
+    /// @dev The sink's CREATE3 payload. The one place it is built: script 13 deploys it through
+    /// the timelock, and a batch that encoded its own copy could drift from what this script
+    /// would have broadcast.
+    ///
+    /// 🔴 The hash the factory checks is of the WHOLE payload, constructor arguments included -
+    /// hashing the bare `creationCode` fails with `CreationCodeHashMismatch`.
+    function _sinkPayload(
+        address burnToken,
+        address quote,
+        address vault,
+        address positionManager,
+        address treasury,
+        address timelock
+    ) internal pure returns (bytes memory) {
+        return abi.encodePacked(
+            type(BuybackBurnSink).creationCode,
+            abi.encode(
+                IBurnableERC20(burnToken),
+                Currency.wrap(quote),
+                IVault(vault),
+                ICLPositionManager(positionManager),
+                treasury,
+                timelock,
+                MIN_BURN_BPS,
+                BURN_BPS
+            )
+        );
     }
 
     /// @dev A5. The position lockers a conversion may read a graduate's pool key out of.
@@ -314,7 +330,7 @@ contract DeployBuybackBurnSink is BaseScript {
 
     /// @dev Both halves, because matching `execute`'s arguments to the `schedule` they came
     /// from is the whole trick with a `TimelockController`.
-    function _printTimelockPayloads(address target, bytes memory payload) internal view {
+    function _printTimelockPayloads(address target, bytes memory payload) internal view virtual {
         uint256 delay = readUint("governance.timelockMinDelay");
         console.log(
             string.concat(
