@@ -638,9 +638,20 @@ contract VerifyOwnership is BaseScript {
     /// somebody still has to take, not a pass.
     function _requireOwnedBy(string memory key, address expected, string memory expectedName) internal {
         address at = readAddressOrZero(key);
-        if (at == address(0) || at.code.length == 0) {
+        if (at == address(0)) {
             skipped++;
             console.log(string.concat("  [skip] ", key, " is not in the book yet"));
+            return;
+        }
+        // 🔑 In the book but codeless is a DIFFERENT state, and saying "not in the book yet"
+        // about it invites somebody to helpfully fill in an address that is already there.
+        // A RESERVED entry is deliberate: `choice.buybackBurnSink` is written as a CREATE3
+        // prediction before the contract exists, to break the sink circularity (locker needs
+        // the sink, sink needs SPROUT, SPROUT needs the locker). With the SPROUT launch held
+        // back this state now lasts weeks rather than minutes, so it has to read correctly.
+        if (at.code.length == 0) {
+            skipped++;
+            console.log(string.concat("  [skip] ", key, " is RESERVED (no code yet) at ", vm.toString(at)));
             return;
         }
         checked++;
