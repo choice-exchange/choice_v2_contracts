@@ -44,6 +44,11 @@ BNFC=$(b .choice.binFeeController)
 DSINK=$(b .choice.directTransferBurnSink)
 ESINK=$(b .choice.exchangeSubaccountBurnSink)
 CROUTER=$(b .choice.choiceRouter)
+SETTLER=$(b .choice.infinitySettler)
+LOCKER=$(b .choice.positionLocker)
+GUARD=$(b .choice.launchPoolGuardHook)
+PADCORE=$(b .launchpad.core)
+SINK=$(b .choice.buybackBurnSink)
 TL=$(b .governance.timelock)
 TREASURY=$(b .choice.treasury)
 SAFE=$(b .governance.safe)
@@ -102,6 +107,23 @@ run_pass() {
        "$(CA 'address,address,address,uint256,uint24' "$BPM" "$TREASURY" "$DSINK" "$SPLIT" "$DYN")"
   "$V" contracts "$CROUTER" src/router/ChoiceRouter.sol:ChoiceRouter \
        "$(CA 'address,address,address[]' "$TL" "$P2" "[$VAULT]")"
+
+  # The launchpad graduation path (script 05). All three are CREATE3, so the compat endpoint can
+  # never match them and verify-blockscout.sh falls through to the v2 runtime matcher - see the
+  # note in that file. Their constructor arguments are the circle CREATE3 exists to cut: the
+  # locker and the hook are born holding the settler's PREDICTED address, and the settler is born
+  # holding both of theirs plus the pad core.
+  #
+  # ⚠️ $SINK is the locker's launchpadTreasury and it is CODELESS on purpose - the sprout sink is
+  # weeks away (script 09) and the address is reserved so fees accrue there from block one. That
+  # is a deliberate reservation, not a missing deploy; nothing here verifies it.
+  "$V" contracts "$LOCKER"  src/launchpad/PositionLocker.sol:PositionLocker \
+       "$(CA 'address,address,address,address' "$CLPOSM" "$SINK" "$TL" "$SETTLER")"
+  "$V" contracts "$GUARD"   src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook \
+       "$(CA 'address,address' "$TL" "$SETTLER")"
+  "$V" contracts "$SETTLER" src/launchpad/InfinitySettler.sol:InfinitySettler \
+       "$(CA 'address,address,address,address,address,address,address' \
+            "$PADCORE" "$CLPM" "$CLPOSM" "$P2" "$LOCKER" "$GUARD" "$TL")"
 
   # OpenZeppelin's TimelockController, deployed by script 01 from this repo's lib.
   # proposers = [safe]; executors = [address(0)] (open role); admin = address(0).
