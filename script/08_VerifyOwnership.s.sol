@@ -143,13 +143,16 @@ contract VerifyOwnership is BaseScript {
         // `Ownable` - `setBaseTokenURI` and `setTokenURIContract` decide what every position
         // NFT renders as - it is correctly timelock-owned on testnet, and nothing would have
         // noticed if mainnet's was not.
-        string[14] memory timelockOwned = [
+        // 🔑 `choice.launchPoolFeeHook100` is 1.0.0, superseded on testnet by 1.1.0 and absent on
+        // mainnet. It keeps charging the pools it bound for life, so its owner still matters.
+        string[15] memory timelockOwned = [
             "choice.clFeeController",
             "choice.binFeeController",
             "choice.infinitySettler",
             "choice.positionLocker",
             "choice.launchPoolGuardHook",
             "choice.launchPoolFeeHook",
+            "choice.launchPoolFeeHook100",
             "choice.choiceRouter",
             "choice.exchangeSubaccountBurnSink",
             "choice.buybackBurnSink",

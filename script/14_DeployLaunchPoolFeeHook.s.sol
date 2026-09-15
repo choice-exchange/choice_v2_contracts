@@ -14,7 +14,13 @@ import {ISafe} from "./interfaces/ISafe.sol";
 import {ITimelockBatch, ISafeApproveHash} from "./13_DeploySinkAndCrankerViaTimelock.s.sol";
 
 /**
- * `LaunchPoolFeeHook` 1.0.0, and the switch that points graduations at it.
+ * `LaunchPoolFeeHook` 1.1.0, and the switch that points graduations at it.
+ *
+ * 1.1.0 charges each pool its launch's own trade fee, read when the pool is created and fixed for
+ * life, where 1.0.0 charged every pool a constant 1%. Nothing else differs, the switch included.
+ * 1.0.0 exists on testnet only, and it keeps the pools it bound for good: a run that moves the
+ * book's `choice.launchPoolFeeHook` off 1.0.0 records it as `choice.launchPoolFeeHook100` first.
+ * ⛔ 1.0.0's two salts are never reused, on either network.
  *
  * The switch is three calls, and they only work together:
  *
@@ -26,10 +32,10 @@ import {ITimelockBatch, ISafeApproveHash} from "./13_DeploySinkAndCrankerViaTime
  *
  * 🔴 Steps 2 and 3 must land in ONE timelock operation. `setPoolConfig` alone makes every
  * graduation revert `NotALaunchPool` in the settler's protocol-fee zeroing; the repoint alone does
- * the same to every graduation into a guard-hook pool. Both refuse a hook with no code, so 1 runs
- * first. The settler reads its config at graduation, so EVERY graduation after the operation -
- * launches already created included - gets the hook, and every one before it keeps the guard hook
- * and its 1% LP fee for good.
+ * the same to every graduation into a pool keyed to the settler's current hook. Both refuse a hook
+ * with no code, so 1 runs first. The settler reads its config at graduation, so EVERY graduation
+ * after the operation - launches already created included - gets the hook, and every one before it
+ * keeps the pool it opened, on the hook that pool was keyed to, for good.
  *
  * Where the CREATE3 factory is owned by the timelock (mainnet since E5) all of it is ONE batch,
  * bracketed by whitelisting the timelock on the factory and removing it again - script 13's
@@ -56,10 +62,12 @@ import {ITimelockBatch, ISafeApproveHash} from "./13_DeploySinkAndCrankerViaTime
  * No --slow, no --resume: re-run instead. Every step is idempotent.
  */
 contract DeployLaunchPoolFeeHook is BaseScript {
-    bytes32 internal constant HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolFeeHook/1.0.0");
+    bytes32 internal constant HOOK_SALT = keccak256("CHOICE-V2/LaunchPoolFeeHook/1.1.0");
     /// An operation id is `hash(targets, values, payloads, predecessor, salt)`; a fixed salt makes
     /// the batch recognisable, and a re-run over unchanged state prints the same id.
-    bytes32 internal constant BATCH_SALT = keccak256("CHOICE-V2/LaunchPoolFeeHookBatch/1.0.0");
+    bytes32 internal constant BATCH_SALT = keccak256("CHOICE-V2/LaunchPoolFeeHookBatch/1.1.0");
+    /// Where a superseded 1.0.0 is kept, in the book's version-keyed style (`infinitySettler130`).
+    string internal constant HOOK_100_KEY = "choice.launchPoolFeeHook100";
 
     uint256 internal constant MAINNET_CHAIN_ID = 1776;
     /// Injective's per-transaction gas cap. The hook's creation code rides in the Safe's
@@ -86,7 +94,7 @@ contract DeployLaunchPoolFeeHook is BaseScript {
 
         address hook = b.factory.computeAddress(HOOK_SALT);
         bool hadCode = hook.code.length != 0;
-        console.log("LaunchPoolFeeHook 1.0.0 ->", hook, hadCode ? "(has code)" : "(no code yet)");
+        console.log("LaunchPoolFeeHook 1.1.0 ->", hook, hadCode ? "(has code)" : "(no code yet)");
 
         bytes memory creation = abi.encodePacked(
             type(LaunchPoolFeeHook).creationCode, abi.encode(b.core, b.clPoolManager, b.timelock, b.settler, b.treasury)
@@ -160,6 +168,7 @@ contract DeployLaunchPoolFeeHook is BaseScript {
         _check(hook, b, factoryOwner, whitelistedBefore);
 
         if (hadCode) {
+            _recordSuperseded(hook);
             writeAddress("choice.launchPoolFeeHook", hook);
         } else {
             console.log("");
@@ -206,8 +215,25 @@ contract DeployLaunchPoolFeeHook is BaseScript {
         require(h.pendingOwner() == address(0), "the hook at the salt has an ownership transfer pending");
         require(h.isInitializer(b.settler), "the hook at the salt does not allow the settler");
         require(h.treasury() == b.treasury, "the hook at the salt pays another treasury");
-        require(h.FEE_PIPS() == 10_000, "the hook at the salt charges another fee");
+        require(h.MAX_FEE_PIPS() == 100_000, "the hook at the salt caps its fee at another level");
         require(h.getHooksRegistrationBitmap() == h.BITMAP(), "the hook at the salt registers another bitmap");
+    }
+
+    /// @dev `writeAddress` overwrites `choice.launchPoolFeeHook` in place, and a superseded hook
+    /// still charges every pool it bound, for life. So its address moves to its own key first, the
+    /// way `buybackBurnSinkPrevious` was kept. Only 1.0.0 can precede this version, and it is known
+    /// by the one read it has and 1.1.0 lacks: a constant `FEE_PIPS()` of 1%.
+    function _recordSuperseded(address hook) internal {
+        address previous = readAddressOrZero("choice.launchPoolFeeHook");
+        if (previous == address(0) || previous == hook) return;
+        (bool ok, bytes memory data) = previous.staticcall(abi.encodeWithSignature("FEE_PIPS()"));
+        require(
+            ok && data.length == 32 && abi.decode(data, (uint256)) == 10_000,
+            "the book's choice.launchPoolFeeHook is not 1.0.0: record it under its own key by hand first"
+        );
+        address recorded = readAddressOrZero(HOOK_100_KEY);
+        require(recorded == address(0) || recorded == previous, "choice.launchPoolFeeHook100 names another hook");
+        writeAddress(HOOK_100_KEY, previous);
     }
 
     /// @dev What a graduation after the batch will actually meet.
@@ -231,7 +257,7 @@ contract DeployLaunchPoolFeeHook is BaseScript {
         );
 
         console.log("");
-        console.log("  [ok]   hook: core, pool manager, owner, settler allowlisted, treasury, fee, bitmap");
+        console.log("  [ok]   hook: core, pool manager, owner, settler allowlisted, treasury, fee cap, bitmap");
         console.log("  [ok]   settler: LP fee 0, keyed to the hook and its bitmap");
         console.log("  [ok]   fee controller: the launch-pool gate is the hook");
         console.log("  [ok]   factory: owner and the timelock's whitelist exactly as before");
@@ -287,9 +313,7 @@ contract DeployLaunchPoolFeeHook is BaseScript {
         console.log(string.concat("EXECUTE_BATCH_CALLDATA=", vm.toString(executeData)));
         console.log("3. Re-run this script WITHOUT --broadcast: it finds the hook, checks the wiring, writes the book.");
         console.log("");
-        console.log(
-            "Until step 2 executes, every graduation still lands on the guard hook and its 1% LP fee, for good."
-        );
+        console.log("Until step 2 executes, every graduation still lands on the hook the settler keys today, for good.");
     }
 
     /// @dev The real `execTransaction`, on the lowest `threshold` owners' pre-approved hashes -

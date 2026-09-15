@@ -65,9 +65,12 @@ LOCKER_LEGACY=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
 # CONSTRUCTED - `setInitializer` since then does not change them.
 SETTLER_10=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
-# LaunchPoolFeeHook 1.0.0, deployed 2026-09-15. The live settler keys graduation pools to it since
-# the same day's switch (settler.setPoolConfig(0, 200, hook) + the fee controller's gate).
-FEEHOOK=0xC31C00D65eB0118F99F32d4fce33E32Cbfe4A92c
+# LaunchPoolFeeHook 1.1.0: each pool charges its launch's own trade fee. The live settler keys
+# graduation pools to it since the 2026-09-16 switch (settler.setPoolConfig(0, 200, hook) + the fee
+# controller's gate). 🔴 1.0.0 (0xC31C00D65eB0118F99F32d4fce33E32Cbfe4A92c, verified 2026-09-15) is
+# NOT in this manifest: it still charges the pools it bound, but its source is no longer in this
+# tree (it is at 16648f0), so a row here would hash the wrong code - LOCKER_LEGACY's rule.
+FEEHOOK=0xe01268eCeb0deA48Fe1F17DF956D1df991Be712f
 # The buyback sink and the TEST burn token it destroys. 🔴 `BBSINK` is 1.2.0, the A5 sink deployed
 # 2026-09-06; 1.1.0 is kept below because it is still deployed and still timelock-owned, while
 # the two IT superseded, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent — nothing points
