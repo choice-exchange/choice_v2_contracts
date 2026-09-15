@@ -94,14 +94,10 @@ contract ReenteringCreator is IReenterHook {
     }
 }
 
-/// @notice M4: a launchpad launch graduates onto a Choice v2 CL pool in one transaction, the
-/// seed position is locked forever, and the fees it earns split three ways - creator and
-/// launchpad through `PositionLocker.collect`, Choice through `ChoiceFeeController.harvest`.
-///
-/// The whole Infinity stack is real here (Vault, CLPoolManager, CLPositionManager, Permit2,
-/// the deployed fee controller); only `LaunchpadCore` is a stand-in, and that one is
-/// layout-faithful on purpose - see `MockLaunchpadCore`.
-contract LaunchpadGraduationTest is Test, DeployPermit2 {
+/// @notice The M4 fixture, shared by every suite that graduates a launch: the whole Infinity stack
+/// is real (Vault, CLPoolManager, CLPositionManager, Permit2, the deployed fee controller), and only
+/// `LaunchpadCore` is a stand-in - a layout-faithful one, see `MockLaunchpadCore`.
+abstract contract LaunchpadGraduationHarness is Test, DeployPermit2 {
     using CLPoolParametersHelper for bytes32;
     using Planner for Plan;
 
@@ -141,7 +137,7 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
     uint24 internal constant LP_FEE_BESIDE_A_PROTOCOL_FEE = 6722;
     int24 internal constant TICK_SPACING = 200;
 
-    function setUp() public {
+    function setUp() public virtual {
         vault = new Vault();
         clPoolManager = new CLPoolManager(vault);
         vault.registerApp(address(clPoolManager));
@@ -185,6 +181,216 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
 
         (launchToken, pairToken) = _orderedPair({launchIsCurrency0: true, launchDecimals: 18, pairDecimals: 18});
     }
+
+    // =====================================================================================
+    // Helpers
+    // =====================================================================================
+
+    function _prepareLaunch(uint256 seedToken, uint256 seedPair, uint16 creatorBps) internal {
+        core.seedLaunch(
+            LAUNCH_ID, CREATOR, address(launchToken), IERC20(address(pairToken)), address(settler), seedPair, creatorBps
+        );
+        launchToken.mint(address(core), seedToken);
+        pairToken.mint(address(core), seedPair);
+    }
+
+    function _currencies() internal view returns (Currency currency0, Currency currency1) {
+        return address(launchToken) < address(pairToken)
+            ? (Currency.wrap(address(launchToken)), Currency.wrap(address(pairToken)))
+            : (Currency.wrap(address(pairToken)), Currency.wrap(address(launchToken)));
+    }
+
+    function _key() internal view returns (PoolKey memory) {
+        (Currency currency0, Currency currency1) = _currencies();
+        return PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            hooks: settler.hooks(),
+            poolManager: IPoolManager(address(clPoolManager)),
+            fee: settler.lpFee(),
+            parameters: settler.poolParameters()
+        });
+    }
+
+    /// @dev Mirrors the settler's own price derivation so the assertions do not simply
+    /// re-run its arithmetic on the numbers it produced.
+    function _sqrtPriceX96(uint256 seedToken, uint256 seedPair) internal view returns (uint160) {
+        (uint256 amount0, uint256 amount1) =
+            address(launchToken) < address(pairToken) ? (seedToken, seedPair) : (seedPair, seedToken);
+        return uint160(_sqrt(FullMath.mulDiv(amount1, uint256(1) << 192, amount0)));
+    }
+
+    function _assertPoolPriceMatchesRatio(PoolKey memory key, uint256 seedToken, uint256 seedPair) internal view {
+        (uint160 sqrtPriceX96,,,) = clPoolManager.getSlot0(key.toId());
+        assertGt(sqrtPriceX96, 0, "pool was never initialised");
+
+        (uint256 amount0, uint256 amount1) =
+            address(launchToken) < address(pairToken) ? (seedToken, seedPair) : (seedPair, seedToken);
+
+        // price = (sqrtP / 2**96)**2, so amount0 * price should come back to amount1.
+        uint256 priceX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, FixedPoint96.Q96);
+        uint256 implied = FullMath.mulDiv(amount0, priceX96, FixedPoint96.Q96);
+
+        uint256 diff = implied > amount1 ? implied - amount1 : amount1 - implied;
+        assertLt(diff * 1e9, amount1, "pool price is not the curve ratio");
+    }
+
+    /// @dev A one-directional swap earns fees in one currency only, so a zero credit is a
+    /// legitimate outcome rather than something to assert against.
+    function _claimIfAny(Currency currency, address who) internal {
+        if (locker.owed(currency, who) > 0) locker.claim(currency, who);
+    }
+
+    /// @dev Asserts the credit `collect` wrote AND that `claim` delivers exactly it, so the
+    /// two halves of the pull cannot drift apart.
+    function _assertSplit(Currency currency, uint256 amount, uint16 creatorBps) internal {
+        uint256 expectedCreator = amount * creatorBps / 10_000;
+        uint256 expectedTreasury = amount - expectedCreator;
+
+        assertEq(locker.owed(currency, CREATOR), expectedCreator, "creator's credit is wrong");
+        assertEq(locker.owed(currency, PAD_TREASURY), expectedTreasury, "launchpad's credit is wrong");
+        assertEq(locker.totalOwed(currency), amount, "totalOwed does not match what was collected");
+
+        uint256 creatorBefore = IERC20(Currency.unwrap(currency)).balanceOf(CREATOR);
+        uint256 treasuryBefore = IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY);
+        if (expectedCreator > 0) locker.claim(currency, CREATOR);
+        if (expectedTreasury > 0) locker.claim(currency, PAD_TREASURY);
+
+        assertEq(
+            IERC20(Currency.unwrap(currency)).balanceOf(CREATOR) - creatorBefore,
+            expectedCreator,
+            "creator's share is wrong"
+        );
+        assertEq(
+            IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY) - treasuryBefore,
+            expectedTreasury,
+            "launchpad's share is wrong"
+        );
+        assertEq(locker.totalOwed(currency), 0, "totalOwed did not clear");
+    }
+
+    /// @dev A plain Choice pool on the same 1.00% tier: same currencies, NO guard hook, and
+    /// the LP leg 6722 that the tier carries when it is shared with a protocol fee. This is
+    /// what the launch pool has to stay distinguishable from.
+    function _openOrdinaryPool() internal returns (PoolKey memory key) {
+        (Currency currency0, Currency currency1) = _currencies();
+        int24 spacing = settler.tickSpacing();
+        key = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            hooks: IHooks(address(0)),
+            poolManager: IPoolManager(address(clPoolManager)),
+            fee: LP_FEE_BESIDE_A_PROTOCOL_FEE,
+            parameters: bytes32(0).setTickSpacing(spacing)
+        });
+        clPoolManager.initialize(key, uint160(FixedPoint96.Q96));
+
+        int24 tickLower = (TickMath.MIN_TICK / spacing) * spacing;
+        int24 tickUpper = (TickMath.MAX_TICK / spacing) * spacing;
+        MockERC20(Currency.unwrap(currency0)).mint(address(this), 1_000e18);
+        MockERC20(Currency.unwrap(currency1)).mint(address(this), 1_000e18);
+        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
+        MockERC20(Currency.unwrap(currency1)).approve(address(swapRouter), type(uint256).max);
+        swapRouter.modifyPosition(
+            key,
+            ICLPoolManager.ModifyLiquidityParams({
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 100e18, salt: bytes32(0)
+            }),
+            ""
+        );
+    }
+
+    function _swap(PoolKey memory key, bool zeroForOne, uint256 amountIn) internal {
+        MockERC20 tokenIn = MockERC20(Currency.unwrap(zeroForOne ? key.currency0 : key.currency1));
+        tokenIn.mint(TRADER, amountIn);
+        vm.startPrank(TRADER);
+        tokenIn.approve(address(swapRouter), amountIn);
+        swapRouter.swap(
+            key,
+            ICLPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1
+            }),
+            CLPoolManagerRouter.SwapTestSettings({withdrawTokens: true, settleUsingTransfer: true}),
+            ""
+        );
+        vm.stopPrank();
+    }
+
+    /// @dev Deploy a pair whose ADDRESS ordering is the one the test wants. Which of the two
+    /// tokens is currency0 is decided by the addresses the chain hands out, so both cases
+    /// have to be constructible.
+    function _orderedPair(bool launchIsCurrency0, uint8 launchDecimals, uint8 pairDecimals)
+        internal
+        returns (MockERC20 launch, MockERC20 pair)
+    {
+        for (uint256 i; i < 64; ++i) {
+            launch = new MockERC20("LAUNCH", "LAUNCH", launchDecimals);
+            pair = new MockERC20("PAIR", "PAIR", pairDecimals);
+            if ((address(launch) < address(pair)) == launchIsCurrency0) return (launch, pair);
+        }
+        revert("could not order the pair");
+    }
+
+    /// @dev An ordinary full-range mint into the graduated pool, owned by `owner`. Also the
+    /// proof that the pool the settler opened is a normal pool anyone can LP into.
+    function _mintPositionTo(address owner) internal returns (uint256 tokenId) {
+        PoolKey memory key = _key();
+        uint256 amount0 = 1e18;
+        uint256 amount1 = 1e18;
+        MockERC20(Currency.unwrap(key.currency0)).mint(owner, amount0);
+        MockERC20(Currency.unwrap(key.currency1)).mint(owner, amount1);
+
+        int24 tickLower = (TickMath.MIN_TICK / key.parameters.getTickSpacing()) * key.parameters.getTickSpacing();
+        int24 tickUpper = (TickMath.MAX_TICK / key.parameters.getTickSpacing()) * key.parameters.getTickSpacing();
+        (uint160 sqrtPriceX96,,,) = clPoolManager.getSlot0(key.toId());
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtRatioAtTick(tickLower),
+            TickMath.getSqrtRatioAtTick(tickUpper),
+            amount0,
+            amount1
+        );
+
+        tokenId = posm.nextTokenId();
+        vm.startPrank(owner);
+        MockERC20(Currency.unwrap(key.currency0)).approve(address(permit2), type(uint256).max);
+        MockERC20(Currency.unwrap(key.currency1)).approve(address(permit2), type(uint256).max);
+        permit2.approve(Currency.unwrap(key.currency0), address(posm), type(uint160).max, type(uint48).max);
+        permit2.approve(Currency.unwrap(key.currency1), address(posm), type(uint160).max, type(uint48).max);
+
+        Plan memory plan = Planner.init();
+        plan = plan.add(
+            Actions.CL_MINT_POSITION,
+            abi.encode(
+                key, tickLower, tickUpper, uint256(liquidity), uint128(amount0), uint128(amount1), owner, bytes("")
+            )
+        );
+        posm.modifyLiquidities(plan.finalizeModifyLiquidityWithSettlePair(key), block.timestamp);
+        vm.stopPrank();
+    }
+
+    function _sqrt(uint256 x) private pure returns (uint256 y) {
+        if (x == 0) return 0;
+        y = x;
+        uint256 z = (x + 1) / 2;
+        while (z < y) {
+            y = z;
+            z = (x / z + z) / 2;
+        }
+    }
+}
+
+/// @notice M4: a launchpad launch graduates onto a Choice v2 CL pool in one transaction, the
+/// seed position is locked forever, and the fees it earns split three ways - creator and
+/// launchpad through `PositionLocker.collect`, Choice through `ChoiceFeeController.harvest`.
+///
+/// The whole Infinity stack is real here (Vault, CLPoolManager, CLPositionManager, Permit2,
+/// the deployed fee controller); only `LaunchpadCore` is a stand-in, and that one is
+/// layout-faithful on purpose - see `MockLaunchpadCore`.
+contract LaunchpadGraduationTest is LaunchpadGraduationHarness {
+    using CLPoolParametersHelper for bytes32;
 
     // =====================================================================================
     // Graduation
@@ -872,204 +1078,5 @@ contract LaunchpadGraduationTest is Test, DeployPermit2 {
         vm.prank(RANDOM);
         vm.expectRevert(abi.encodeWithSelector(PositionLocker.UnexpectedNFT.selector, RANDOM));
         locker.onERC721Received(RANDOM, RANDOM, 1, "");
-    }
-
-    // =====================================================================================
-    // Helpers
-    // =====================================================================================
-
-    function _prepareLaunch(uint256 seedToken, uint256 seedPair, uint16 creatorBps) internal {
-        core.seedLaunch(
-            LAUNCH_ID, CREATOR, address(launchToken), IERC20(address(pairToken)), address(settler), seedPair, creatorBps
-        );
-        launchToken.mint(address(core), seedToken);
-        pairToken.mint(address(core), seedPair);
-    }
-
-    function _currencies() internal view returns (Currency currency0, Currency currency1) {
-        return address(launchToken) < address(pairToken)
-            ? (Currency.wrap(address(launchToken)), Currency.wrap(address(pairToken)))
-            : (Currency.wrap(address(pairToken)), Currency.wrap(address(launchToken)));
-    }
-
-    function _key() internal view returns (PoolKey memory) {
-        (Currency currency0, Currency currency1) = _currencies();
-        return PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            hooks: settler.hooks(),
-            poolManager: IPoolManager(address(clPoolManager)),
-            fee: settler.lpFee(),
-            parameters: settler.poolParameters()
-        });
-    }
-
-    /// @dev Mirrors the settler's own price derivation so the assertions do not simply
-    /// re-run its arithmetic on the numbers it produced.
-    function _sqrtPriceX96(uint256 seedToken, uint256 seedPair) internal view returns (uint160) {
-        (uint256 amount0, uint256 amount1) =
-            address(launchToken) < address(pairToken) ? (seedToken, seedPair) : (seedPair, seedToken);
-        return uint160(_sqrt(FullMath.mulDiv(amount1, uint256(1) << 192, amount0)));
-    }
-
-    function _assertPoolPriceMatchesRatio(PoolKey memory key, uint256 seedToken, uint256 seedPair) internal view {
-        (uint160 sqrtPriceX96,,,) = clPoolManager.getSlot0(key.toId());
-        assertGt(sqrtPriceX96, 0, "pool was never initialised");
-
-        (uint256 amount0, uint256 amount1) =
-            address(launchToken) < address(pairToken) ? (seedToken, seedPair) : (seedPair, seedToken);
-
-        // price = (sqrtP / 2**96)**2, so amount0 * price should come back to amount1.
-        uint256 priceX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, FixedPoint96.Q96);
-        uint256 implied = FullMath.mulDiv(amount0, priceX96, FixedPoint96.Q96);
-
-        uint256 diff = implied > amount1 ? implied - amount1 : amount1 - implied;
-        assertLt(diff * 1e9, amount1, "pool price is not the curve ratio");
-    }
-
-    /// @dev A one-directional swap earns fees in one currency only, so a zero credit is a
-    /// legitimate outcome rather than something to assert against.
-    function _claimIfAny(Currency currency, address who) internal {
-        if (locker.owed(currency, who) > 0) locker.claim(currency, who);
-    }
-
-    /// @dev Asserts the credit `collect` wrote AND that `claim` delivers exactly it, so the
-    /// two halves of the pull cannot drift apart.
-    function _assertSplit(Currency currency, uint256 amount, uint16 creatorBps) internal {
-        uint256 expectedCreator = amount * creatorBps / 10_000;
-        uint256 expectedTreasury = amount - expectedCreator;
-
-        assertEq(locker.owed(currency, CREATOR), expectedCreator, "creator's credit is wrong");
-        assertEq(locker.owed(currency, PAD_TREASURY), expectedTreasury, "launchpad's credit is wrong");
-        assertEq(locker.totalOwed(currency), amount, "totalOwed does not match what was collected");
-
-        uint256 creatorBefore = IERC20(Currency.unwrap(currency)).balanceOf(CREATOR);
-        uint256 treasuryBefore = IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY);
-        if (expectedCreator > 0) locker.claim(currency, CREATOR);
-        if (expectedTreasury > 0) locker.claim(currency, PAD_TREASURY);
-
-        assertEq(
-            IERC20(Currency.unwrap(currency)).balanceOf(CREATOR) - creatorBefore,
-            expectedCreator,
-            "creator's share is wrong"
-        );
-        assertEq(
-            IERC20(Currency.unwrap(currency)).balanceOf(PAD_TREASURY) - treasuryBefore,
-            expectedTreasury,
-            "launchpad's share is wrong"
-        );
-        assertEq(locker.totalOwed(currency), 0, "totalOwed did not clear");
-    }
-
-    /// @dev A plain Choice pool on the same 1.00% tier: same currencies, NO guard hook, and
-    /// the LP leg 6722 that the tier carries when it is shared with a protocol fee. This is
-    /// what the launch pool has to stay distinguishable from.
-    function _openOrdinaryPool() internal returns (PoolKey memory key) {
-        (Currency currency0, Currency currency1) = _currencies();
-        int24 spacing = settler.tickSpacing();
-        key = PoolKey({
-            currency0: currency0,
-            currency1: currency1,
-            hooks: IHooks(address(0)),
-            poolManager: IPoolManager(address(clPoolManager)),
-            fee: LP_FEE_BESIDE_A_PROTOCOL_FEE,
-            parameters: bytes32(0).setTickSpacing(spacing)
-        });
-        clPoolManager.initialize(key, uint160(FixedPoint96.Q96));
-
-        int24 tickLower = (TickMath.MIN_TICK / spacing) * spacing;
-        int24 tickUpper = (TickMath.MAX_TICK / spacing) * spacing;
-        MockERC20(Currency.unwrap(currency0)).mint(address(this), 1_000e18);
-        MockERC20(Currency.unwrap(currency1)).mint(address(this), 1_000e18);
-        MockERC20(Currency.unwrap(currency0)).approve(address(swapRouter), type(uint256).max);
-        MockERC20(Currency.unwrap(currency1)).approve(address(swapRouter), type(uint256).max);
-        swapRouter.modifyPosition(
-            key,
-            ICLPoolManager.ModifyLiquidityParams({
-                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: 100e18, salt: bytes32(0)
-            }),
-            ""
-        );
-    }
-
-    function _swap(PoolKey memory key, bool zeroForOne, uint256 amountIn) internal {
-        MockERC20 tokenIn = MockERC20(Currency.unwrap(zeroForOne ? key.currency0 : key.currency1));
-        tokenIn.mint(TRADER, amountIn);
-        vm.startPrank(TRADER);
-        tokenIn.approve(address(swapRouter), amountIn);
-        swapRouter.swap(
-            key,
-            ICLPoolManager.SwapParams({
-                zeroForOne: zeroForOne,
-                amountSpecified: -int256(amountIn),
-                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1
-            }),
-            CLPoolManagerRouter.SwapTestSettings({withdrawTokens: true, settleUsingTransfer: true}),
-            ""
-        );
-        vm.stopPrank();
-    }
-
-    /// @dev Deploy a pair whose ADDRESS ordering is the one the test wants. Which of the two
-    /// tokens is currency0 is decided by the addresses the chain hands out, so both cases
-    /// have to be constructible.
-    function _orderedPair(bool launchIsCurrency0, uint8 launchDecimals, uint8 pairDecimals)
-        internal
-        returns (MockERC20 launch, MockERC20 pair)
-    {
-        for (uint256 i; i < 64; ++i) {
-            launch = new MockERC20("LAUNCH", "LAUNCH", launchDecimals);
-            pair = new MockERC20("PAIR", "PAIR", pairDecimals);
-            if ((address(launch) < address(pair)) == launchIsCurrency0) return (launch, pair);
-        }
-        revert("could not order the pair");
-    }
-
-    /// @dev An ordinary full-range mint into the graduated pool, owned by `owner`. Also the
-    /// proof that the pool the settler opened is a normal pool anyone can LP into.
-    function _mintPositionTo(address owner) internal returns (uint256 tokenId) {
-        PoolKey memory key = _key();
-        uint256 amount0 = 1e18;
-        uint256 amount1 = 1e18;
-        MockERC20(Currency.unwrap(key.currency0)).mint(owner, amount0);
-        MockERC20(Currency.unwrap(key.currency1)).mint(owner, amount1);
-
-        int24 tickLower = (TickMath.MIN_TICK / key.parameters.getTickSpacing()) * key.parameters.getTickSpacing();
-        int24 tickUpper = (TickMath.MAX_TICK / key.parameters.getTickSpacing()) * key.parameters.getTickSpacing();
-        (uint160 sqrtPriceX96,,,) = clPoolManager.getSlot0(key.toId());
-        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-            sqrtPriceX96,
-            TickMath.getSqrtRatioAtTick(tickLower),
-            TickMath.getSqrtRatioAtTick(tickUpper),
-            amount0,
-            amount1
-        );
-
-        tokenId = posm.nextTokenId();
-        vm.startPrank(owner);
-        MockERC20(Currency.unwrap(key.currency0)).approve(address(permit2), type(uint256).max);
-        MockERC20(Currency.unwrap(key.currency1)).approve(address(permit2), type(uint256).max);
-        permit2.approve(Currency.unwrap(key.currency0), address(posm), type(uint160).max, type(uint48).max);
-        permit2.approve(Currency.unwrap(key.currency1), address(posm), type(uint160).max, type(uint48).max);
-
-        Plan memory plan = Planner.init();
-        plan = plan.add(
-            Actions.CL_MINT_POSITION,
-            abi.encode(
-                key, tickLower, tickUpper, uint256(liquidity), uint128(amount0), uint128(amount1), owner, bytes("")
-            )
-        );
-        posm.modifyLiquidities(plan.finalizeModifyLiquidityWithSettlePair(key), block.timestamp);
-        vm.stopPrank();
-    }
-
-    function _sqrt(uint256 x) private pure returns (uint256 y) {
-        if (x == 0) return 0;
-        y = x;
-        uint256 z = (x + 1) / 2;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
     }
 }
