@@ -49,8 +49,8 @@ contract RevertingSink is IBurnSink {
 
 /// @notice `LaunchPoolFeeHook` on the real Infinity stack: the UNCHANGED `InfinitySettler`
 /// graduates into a hooked pool after the two calls the switch is made of, and every swap shape
-/// pays 1% of the gross quote, to the wei, through the router the frontend uses and the quoter
-/// that prices it.
+/// pays the launch's own fee (1% and 3% here) of the gross quote, to the wei, through the router
+/// the frontend uses and the quoter that prices it.
 ///
 /// "To the wei" is proven against a TWIN: a hookless pool with the same currencies, price and
 /// liquidity and no fee at all, which is exactly the pool the hook wraps. Whatever the twin does
@@ -73,7 +73,13 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     address internal constant NEW_CREATOR = address(0xC0FFEE);
     address internal constant OPS = address(0x0B5);
     uint16 internal constant HOOK_CREATOR_BPS = 7_000;
+    /// @dev The tiers under test, as a launch's curve fee in bps and as its pool's fee in pips.
+    uint16 internal constant ONE_PERCENT_BPS = 100;
+    uint16 internal constant THREE_PERCENT_BPS = 300;
     uint256 internal constant FEE_PIPS = 10_000;
+    uint256 internal constant FEE_PIPS_3 = 30_000;
+    /// @dev The core's cap on a launch's trade fee, 1000 bps, in pips.
+    uint256 internal constant MAX_FEE_PIPS = 100_000;
     uint256 internal constant PIPS = 1_000_000;
     /// @dev beforeInitialize (0) | beforeSwap (6) | afterSwap (7) | both return deltas (10, 11).
     uint16 internal constant BITMAP = 0x0CC1;
@@ -116,11 +122,50 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         _assertHookedGraduate(key, true);
     }
 
+    /// @dev A 3% launch graduates through the same settler, config and hook as a 1% one, into a
+    /// pool that charges 3% for life. Nothing in the switch knows there is more than one fee.
+    function test_aThreePercentLaunchGraduatesIntoAThreePercentPool() public {
+        PoolKey memory key = _graduateWithFee(false, THREE_PERCENT_BPS);
+        _assertHookedGraduate(key, false);
+        assertEq(feeHook.poolFeePips(key.toId()), FEE_PIPS_3, "the pool does not charge its launch's 3%");
+    }
+
+    function test_aThreePercentLaunchGraduatesIntoAThreePercentPool_quoteIsCurrency0() public {
+        PoolKey memory key = _graduateWithFee(true, THREE_PERCENT_BPS);
+        _assertHookedGraduate(key, true);
+        assertEq(feeHook.poolFeePips(key.toId()), FEE_PIPS_3, "the pool does not charge its launch's 3%");
+    }
+
+    function test_aOnePercentLaunchGraduatesIntoAOnePercentPool() public {
+        PoolKey memory key = _graduate(false);
+        assertEq(feeHook.poolFeePips(key.toId()), FEE_PIPS, "a 1% launch's pool does not charge 1%");
+    }
+
+    /// @dev The registration event carries the fee, so an indexer never has to call back for it.
+    function test_theRegistrationEventCarriesTheFee() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, HOOK_CREATOR_BPS);
+        core.setTradeFeeBps(LAUNCH_ID, THREE_PERCENT_BPS);
+        PoolKey memory key = _key();
+
+        vm.expectEmit(true, true, false, true, address(feeHook));
+        emit LaunchPoolFeeHook.PoolRegistered(
+            key.toId(), LAUNCH_ID, key.currency1, HOOK_CREATOR_BPS, uint24(FEE_PIPS_3)
+        );
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+    }
+
+    function test_poolFeePipsRevertsForAPoolThisHookNeverBound() public {
+        PoolKey memory key = _graduate(false);
+        PoolKey memory stranger = _openTwin(key, 0);
+        vm.expectRevert(abi.encodeWithSelector(LaunchPoolFeeHook.UnknownPool.selector, stranger.toId()));
+        feeHook.poolFeePips(stranger.toId());
+    }
+
     function test_theBitmapIsTheWholePermissionSet() public view {
         assertEq(feeHook.getHooksRegistrationBitmap(), BITMAP, "the hook registers a different permission set");
         assertEq(feeHook.BITMAP(), BITMAP);
         assertEq(uint16(uint256(settler.poolParameters())), BITMAP, "the settler keys pools to another bitmap");
-        assertEq(feeHook.FEE_PIPS(), FEE_PIPS);
+        assertEq(feeHook.MAX_FEE_PIPS(), MAX_FEE_PIPS, "the hook's cap is not the core's 10%");
     }
 
     /// @dev What graduation costs with the hook resolving the launch in `beforeInitialize`. The
@@ -234,6 +279,45 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         clPoolManager.initialize(key, price);
     }
 
+    /// @dev The core caps a launch's fee at 1000 bps. A fee word above that is not one the core
+    /// could have written, so the hook reads it as a layout it does not know, and the graduation
+    /// waits in `CurveFilled` rather than opening a pool at a fee nobody set.
+    function test_aFeeAboveTheCoresCapIsALayoutMismatch() public {
+        _prepareLaunch(SEED_TOKEN, SEED_PAIR, HOOK_CREATOR_BPS);
+        core.setTradeFeeBps(LAUNCH_ID, 1_001);
+        bytes memory expected =
+            _wrapped(abi.encodeWithSelector(LaunchPoolFeeHook.LayoutMismatch.selector, _launchWord(LAUNCH_ID, 21)));
+
+        vm.expectRevert(expected);
+        core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
+        assertEq(uint8(core.getLaunchState(LAUNCH_ID)), uint8(ILaunchpadCore.LaunchState.CurveFilled));
+    }
+
+    /// @dev The cap itself is a fee the core allows, so it opens a pool: a 10% launch, a 10% pool.
+    function test_theCoresCapIsALegalFee() public {
+        PoolKey memory key = _graduateWithFee(false, 1_000);
+        assertEq(feeHook.poolFeePips(key.toId()), MAX_FEE_PIPS);
+
+        _buy(key, address(pairToken), BUY_QUOTE);
+        assertEq(vault.balanceOf(address(feeHook), key.currency1), BUY_QUOTE / 10, "a 10% pool did not take 10%");
+    }
+
+    /// @dev The core allows a zero fee, so the hook does too: refusing one would strand that launch
+    /// in `CurveFilled` for good. Its pool charges nothing and swaps exactly as the bare pool does.
+    function test_aZeroFeeLaunchOpensAPoolThatChargesNothing() public {
+        PoolKey memory key = _graduateWithFee(false, 0);
+        PoolKey memory bare = _openTwin(key, 0);
+        assertEq(feeHook.poolFeePips(key.toId()), 0);
+
+        BalanceDelta bareSwap = _twinSwap(bare, false, -int256(BUY_QUOTE));
+        (uint256 paid, uint256 received) = _routerSwap(key, false, true, BUY_QUOTE);
+
+        assertEq(paid, BUY_QUOTE);
+        assertEq(received, _received(bareSwap, false), "a zero-fee pool does not swap like the bare pool");
+        assertEq(vault.balanceOf(address(feeHook), key.currency1), 0, "a zero-fee pool took a fee");
+        assertEq(feeHook.creatorOwed(LAUNCH_ID), 0);
+    }
+
     /// @dev One launch, one pool: a second pool for a launch already bound is refused, so its
     /// creator credit can only ever be in one currency.
     function test_aLaunchIsBoundToOnePoolOnly() public {
@@ -292,6 +376,40 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         _assertShape(true, Shape.SellExactOut);
     }
 
+    // The same eight at 3%: the pool charges its launch's fee, whatever that fee is.
+
+    function test_fee3_buyExactInput() public {
+        _assertShape(false, Shape.BuyExactIn, FEE_PIPS_3);
+    }
+
+    function test_fee3_buyExactInput_quoteIsCurrency0() public {
+        _assertShape(true, Shape.BuyExactIn, FEE_PIPS_3);
+    }
+
+    function test_fee3_buyExactOutput() public {
+        _assertShape(false, Shape.BuyExactOut, FEE_PIPS_3);
+    }
+
+    function test_fee3_buyExactOutput_quoteIsCurrency0() public {
+        _assertShape(true, Shape.BuyExactOut, FEE_PIPS_3);
+    }
+
+    function test_fee3_sellExactInput() public {
+        _assertShape(false, Shape.SellExactIn, FEE_PIPS_3);
+    }
+
+    function test_fee3_sellExactInput_quoteIsCurrency0() public {
+        _assertShape(true, Shape.SellExactIn, FEE_PIPS_3);
+    }
+
+    function test_fee3_sellExactOutput() public {
+        _assertShape(false, Shape.SellExactOut, FEE_PIPS_3);
+    }
+
+    function test_fee3_sellExactOutput_quoteIsCurrency0() public {
+        _assertShape(true, Shape.SellExactOut, FEE_PIPS_3);
+    }
+
     /// @dev A buy costs exactly what today's graduate - LP fee 10000, no hook - charges.
     function test_anExactInputBuyCostsWhatTodaysLpFeeCosts() public {
         PoolKey memory key = _graduate(false);
@@ -318,6 +436,19 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         assertEq(received, BUY_TOKENS);
         assertLe(paid, _paid(todays, zeroForOne), "a hooked exact-output buy costs more than today's");
         assertApproxEqAbs(paid, _paid(todays, zeroForOne), 1, "a hooked exact-output buy drifted from today's 1%");
+    }
+
+    /// @dev And at 3%: a hooked 3% buy costs what a pool with a 3% LP fee charges, to the wei.
+    function test_anExactInputBuyAtThreePercentCostsWhatAThreePercentLpFeeCosts() public {
+        PoolKey memory key = _graduateWithFee(false, THREE_PERCENT_BPS);
+        PoolKey memory lpFeePool = _openTwin(key, uint24(FEE_PIPS_3));
+        bool zeroForOne = false;
+
+        BalanceDelta lp = _twinSwap(lpFeePool, zeroForOne, -int256(BUY_QUOTE));
+        (uint256 paid, uint256 received) = _routerSwap(key, zeroForOne, true, BUY_QUOTE);
+
+        assertEq(paid, _paid(lp, zeroForOne), "a hooked 3% buy spent a different amount");
+        assertEq(received, _received(lp, zeroForOne), "a hooked 3% buy does not match a 3% LP fee to the wei");
     }
 
     /// @dev A sell pays 1% of the quote out instead of 1% of the tokens in. The two differ by the
@@ -401,14 +532,50 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         assertEq(Currency.unwrap(feeHook.launchQuote(LAUNCH_ID + 2)), address(quoteC));
     }
 
-    /// @dev The invariant the payouts rest on, over any sequence of trades: the vault claims the
-    /// hook holds are exactly what it has credited, and both pots drain to nothing.
+    /// @dev The fee is per pool, not per hook: a 1% and a 3% graduate on one quote each charge
+    /// their own, and the treasury's credit in that quote is both remainders together.
+    function test_poolsAtDifferentFeesShareOneHookAndOneQuote() public {
+        PoolKey memory keyA = _graduate(false);
+        MockERC20 tokenB = new MockERC20("B", "B", 18);
+        PoolKey memory keyB = _graduateAtWithFee(LAUNCH_ID + 1, tokenB, pairToken, HOOK_CREATOR_BPS, THREE_PERCENT_BPS);
+
+        _buy(keyA, address(pairToken), BUY_QUOTE);
+        _buy(keyB, address(pairToken), BUY_QUOTE);
+
+        uint256 feeA = BUY_QUOTE * FEE_PIPS / PIPS;
+        uint256 feeB = BUY_QUOTE * FEE_PIPS_3 / PIPS;
+        uint256 creatorA = feeA * HOOK_CREATOR_BPS / 10_000;
+        uint256 creatorB = feeB * HOOK_CREATOR_BPS / 10_000;
+        Currency quote = Currency.wrap(address(pairToken));
+        assertEq(feeHook.poolFeePips(keyA.toId()), FEE_PIPS);
+        assertEq(feeHook.poolFeePips(keyB.toId()), FEE_PIPS_3);
+        assertEq(feeHook.creatorOwed(LAUNCH_ID), creatorA, "the 1% launch's creator credit");
+        assertEq(feeHook.creatorOwed(LAUNCH_ID + 1), creatorB, "the 3% launch's creator credit");
+        assertEq(feeHook.treasuryOwed(quote), feeA - creatorA + feeB - creatorB, "the treasury's credit");
+        assertEq(vault.balanceOf(address(feeHook), quote), feeA + feeB, "the hook's claims");
+    }
+
+    /// @dev A pool keeps the fee it was created with. The real core never changes a launch's fee
+    /// after `createLaunch`; this changes it anyway, to prove the pool would not follow.
+    function test_aPoolKeepsItsFeeForLife() public {
+        PoolKey memory key = _graduateWithFee(false, THREE_PERCENT_BPS);
+        core.setTradeFeeBps(LAUNCH_ID, ONE_PERCENT_BPS);
+
+        _buy(key, address(pairToken), BUY_QUOTE);
+        assertEq(feeHook.poolFeePips(key.toId()), FEE_PIPS_3, "the pool's fee followed the core");
+        assertEq(vault.balanceOf(address(feeHook), key.currency1), BUY_QUOTE * FEE_PIPS_3 / PIPS, "the fee moved");
+    }
+
+    /// @dev The invariant the payouts rest on, over any sequence of trades at any fee the core
+    /// allows: the vault claims the hook holds are exactly what it has credited, and both pots
+    /// drain to nothing.
     function testFuzz_theHooksClaimsAreAlwaysExactlyItsCredits(
         uint8[4] memory shapes,
         uint64[4] memory amounts,
-        bool quoteIsCurrency0
+        bool quoteIsCurrency0,
+        uint16 tradeFeeBps
     ) public {
-        PoolKey memory key = _graduate(quoteIsCurrency0);
+        PoolKey memory key = _graduateWithFee(quoteIsCurrency0, uint16(bound(tradeFeeBps, 0, 1_000)));
         Currency quote = Currency.wrap(address(pairToken));
         for (uint256 i; i < 4; ++i) {
             Shape shape = Shape(shapes[i] % 4);
@@ -711,11 +878,19 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     // Helpers
     // =====================================================================================
 
-    /// @dev Graduate `LAUNCH_ID` through the unchanged settler, with the quote on the given side.
+    /// @dev Graduate `LAUNCH_ID` through the unchanged settler at a 1% curve fee, with the quote on
+    /// the given side.
     function _graduate(bool quoteIsCurrency0) internal returns (PoolKey memory key) {
+        return _graduateWithFee(quoteIsCurrency0, ONE_PERCENT_BPS);
+    }
+
+    /// @dev The same at a curve fee of `tradeFeeBps`: what the core copies onto a launch from its
+    /// quote slot, and so what the hook reads when the launch graduates.
+    function _graduateWithFee(bool quoteIsCurrency0, uint16 tradeFeeBps) internal returns (PoolKey memory key) {
         (launchToken, pairToken) =
             _orderedPair({launchIsCurrency0: !quoteIsCurrency0, launchDecimals: 18, pairDecimals: 18});
         _prepareLaunch(SEED_TOKEN, SEED_PAIR, HOOK_CREATOR_BPS);
+        core.setTradeFeeBps(LAUNCH_ID, tradeFeeBps);
         core.triggerGraduation(LAUNCH_ID, SEED_TOKEN);
         key = _key();
     }
@@ -724,9 +899,20 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         internal
         returns (PoolKey memory key)
     {
+        return _graduateAtWithFee(launchId, token, pair, creatorBps, ONE_PERCENT_BPS);
+    }
+
+    function _graduateAtWithFee(
+        uint256 launchId,
+        MockERC20 token,
+        MockERC20 pair,
+        uint16 creatorBps,
+        uint16 tradeFeeBps
+    ) internal returns (PoolKey memory key) {
         core.seedLaunch(
             launchId, CREATOR, address(token), IERC20(address(pair)), address(settler), SEED_PAIR, creatorBps
         );
+        core.setTradeFeeBps(launchId, tradeFeeBps);
         token.mint(address(core), SEED_TOKEN);
         pair.mint(address(core), SEED_PAIR);
         core.triggerGraduation(launchId, SEED_TOKEN);
@@ -780,9 +966,14 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     }
 
     function _assertShape(bool quoteIsCurrency0, Shape shape) internal {
-        PoolKey memory key = _graduate(quoteIsCurrency0);
+        _assertShape(quoteIsCurrency0, shape, FEE_PIPS);
+    }
+
+    /// @dev One swap shape on a pool charging `feePips`, against its fee-free twin. The creator's
+    /// share is recomputed rather than held, to keep the frame under the legacy stack limit.
+    function _assertShape(bool quoteIsCurrency0, Shape shape, uint256 feePips) internal {
+        PoolKey memory key = _graduateWithFee(quoteIsCurrency0, uint16(feePips / 100));
         PoolKey memory twin = _openTwin(key, 0);
-        Currency quote = Currency.wrap(address(pairToken));
         (bool zeroForOne, bool exactInput) = _direction(shape, quoteIsCurrency0);
 
         // What the twin does with the fee-adjusted amount is what the hooked pool must do.
@@ -792,28 +983,29 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         uint256 expectedReceived;
         if (shape == Shape.BuyExactIn) {
             amount = BUY_QUOTE;
-            fee = amount * FEE_PIPS / PIPS;
+            fee = amount * feePips / PIPS;
             expectedPaid = amount;
             expectedReceived = _received(_twinSwap(twin, zeroForOne, -int256(amount - fee)), zeroForOne);
         } else if (shape == Shape.BuyExactOut) {
             amount = BUY_TOKENS;
             uint256 poolIn = _paid(_twinSwap(twin, zeroForOne, int256(amount)), zeroForOne);
-            fee = poolIn * FEE_PIPS / (PIPS - FEE_PIPS);
+            fee = poolIn * feePips / (PIPS - feePips);
             expectedPaid = poolIn + fee;
             expectedReceived = amount;
         } else if (shape == Shape.SellExactIn) {
             amount = SELL_TOKENS;
             uint256 poolOut = _received(_twinSwap(twin, zeroForOne, -int256(amount)), zeroForOne);
-            fee = poolOut * FEE_PIPS / PIPS;
+            fee = poolOut * feePips / PIPS;
             expectedPaid = amount;
             expectedReceived = poolOut - fee;
         } else {
             amount = SELL_QUOTE;
-            fee = amount * FEE_PIPS / (PIPS - FEE_PIPS);
+            fee = amount * feePips / (PIPS - feePips);
             expectedPaid = _paid(_twinSwap(twin, zeroForOne, int256(amount + fee)), zeroForOne);
             expectedReceived = amount;
         }
         assertGt(fee, 0, "the case takes no fee - it proves nothing");
+        assertEq(feeHook.poolFeePips(key.toId()), feePips, "the pool charges another fee than its launch's");
 
         uint256 quoted = _quoteSwap(key, zeroForOne, exactInput, amount);
         (uint256 paid, uint256 received) = _routerSwap(key, zeroForOne, exactInput, amount);
@@ -822,10 +1014,10 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         assertEq(received, expectedReceived, "the trader received the wrong amount");
         assertEq(quoted, exactInput ? received : paid, "the quoter disagrees with the executed swap");
 
-        uint256 toCreator = fee * HOOK_CREATOR_BPS / 10_000;
+        Currency quote = Currency.wrap(address(pairToken));
         assertEq(vault.balanceOf(address(feeHook), quote), fee, "the hook's claims are not the fee");
-        assertEq(feeHook.creatorOwed(LAUNCH_ID), toCreator, "the creator's credit");
-        assertEq(feeHook.treasuryOwed(quote), fee - toCreator, "the treasury's credit");
+        assertEq(feeHook.creatorOwed(LAUNCH_ID), fee * HOOK_CREATOR_BPS / 10_000, "the creator's credit");
+        assertEq(feeHook.treasuryOwed(quote), fee - fee * HOOK_CREATOR_BPS / 10_000, "the treasury's credit");
         assertEq(vault.balanceOf(address(feeHook), Currency.wrap(address(launchToken))), 0, "a launch-token fee");
     }
 

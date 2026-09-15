@@ -30,21 +30,26 @@ import {ILaunchpadCore} from "../interfaces/ILaunchpadCore.sol";
 /// the pool's QUOTE asset, and credits it to that launch's creator and to the launchpad treasury.
 ///
 /// **The shape.** A pool keyed to this hook carries LP fee 0, and the fee controller zeroes its
-/// protocol fee at graduation, so the pool itself charges nothing. The hook takes `FEE_PIPS` (1%)
-/// from the quote side of every swap: in `beforeSwap` when the quote is the swap's specified
+/// protocol fee at graduation, so the pool itself charges nothing. The hook takes the pool's fee
+/// `f` from the quote side of every swap: in `beforeSwap` when the quote is the swap's specified
 /// currency, and in `afterSwap` when it is not. Between them that is every swap shape:
 ///
-/// | swap            | the quote is | taken in     | the hook sees                     | fee      |
-/// | --------------- | ------------ | ------------ | --------------------------------- | -------- |
-/// | buy, exact in   | specified    | `beforeSwap` | the gross `X` the trader pays     | `X * 1%` |
-/// | buy, exact out  | unspecified  | `afterSwap`  | the net `P` the pool took         | `P / 99` |
-/// | sell, exact in  | unspecified  | `afterSwap`  | the gross `Q` the pool pays out   | `Q * 1%` |
-/// | sell, exact out | specified    | `beforeSwap` | the net `R` the trader asked for  | `R / 99` |
+/// | swap            | the quote is | taken in     | the hook sees                     | fee               |
+/// | --------------- | ------------ | ------------ | --------------------------------- | ----------------- |
+/// | buy, exact in   | specified    | `beforeSwap` | the gross `X` the trader pays     | `X * f`           |
+/// | buy, exact out  | unspecified  | `afterSwap`  | the net `P` the pool took         | `P * f / (1 - f)` |
+/// | sell, exact in  | unspecified  | `afterSwap`  | the gross `Q` the pool pays out   | `Q * f`           |
+/// | sell, exact out | specified    | `beforeSwap` | the net `R` the trader asked for  | `R * f / (1 - f)` |
 ///
-/// So the fee is always 1% of the GROSS quote - all of what a buyer pays, or all of what the pool
+/// So the fee is always `f` of the GROSS quote - all of what a buyer pays, or all of what the pool
 /// pays out on a sell - and exact input costs the same as exact output. Every fee rounds down, so
-/// a trader never pays more than 1% and a fee never exceeds the amount it is taken from, which is
+/// a trader never pays more than `f` and a fee never exceeds the amount it is taken from, which is
 /// what keeps `HookDeltaExceedsSwapAmount` out of reach.
+///
+/// **The fee is the launch's own.** `f` is the trade fee the launch charged on its bonding curve,
+/// read off the core when the pool is created and kept in the pool's config for life: a launch
+/// that traded at 1% before graduation trades at 1% after it, and one that traded at 3% trades at
+/// 3%. `poolFeePips` reports it. The core caps a launch's trade fee at 10%, and so does this hook.
 ///
 /// 🔴 **A price-limited swap that fills only partly pays the fee on what it ASKED for** when the
 /// quote is the specified side. That fee is fixed in `beforeSwap`, before the pool has swapped
@@ -62,12 +67,13 @@ import {ILaunchpadCore} from "../interfaces/ILaunchpadCore.sol";
 ///
 /// **Binding a pool to its launch.** `initialize` carries no hook data, so `beforeInitialize` asks
 /// the core instead. The launch token is the currency `getLaunchByToken` recognises, the other
-/// currency must be that launch's pair asset, and the creator's share is read through `extsload`
-/// with the settler's own three canaries: the launch must be `PendingSettlement`, its recorded
-/// settler must be `sender`, and the share must be a legal bps. A pool whose launch cannot be
-/// resolved fails its own initialization - which reverts the graduation, leaving the launch in
-/// `CurveFilled`, rather than opening a pool that pays nobody. One launch binds one pool, and one
-/// hook serves one core, as one settler does.
+/// currency must be that launch's pair asset, and the creator's share and the trade fee are read
+/// through `extsload` with the settler's own three canaries: the launch must be
+/// `PendingSettlement`, its recorded settler must be `sender`, and its fee word must hold a legal
+/// share and a fee within the core's cap. A pool whose launch cannot be resolved fails its own
+/// initialization - which reverts the graduation, leaving the launch in `CurveFilled`, rather than
+/// opening a pool that pays nobody. One launch binds one pool, and one hook serves one core, as one
+/// settler does.
 ///
 /// **It keeps the guard's job too.** Only an allowlisted initializer may create a pool keyed to
 /// this hook, for the same reason `LaunchPoolGuardHook` exists: initialising a pool is free and a
@@ -81,18 +87,21 @@ import {ILaunchpadCore} from "../interfaces/ILaunchpadCore.sol";
 /// other balance. `harvest` is permissionless: it pays the treasury's whole credit in one quote
 /// asset, then notifies the treasury as an `IBurnSink` if it has code.
 ///
-/// **What the owner cannot do.** The fee is a constant and a pool's split is fixed when it is
-/// created. There is no pause and no exemption, so no owner action can make a live pool's swap
-/// revert or change what it charges. The owner (the timelock) can allowlist initializers, move the
-/// treasury, and sweep tokens sent here by mistake - the hook never holds a token of its own, only
-/// vault claims, so a sweep cannot reach anything owed.
+/// **What the owner cannot do.** A pool's fee and its split are fixed when it is created, from the
+/// launch's own terms. There is no pause and no exemption, so no owner action can make a live
+/// pool's swap revert or change what it charges. The owner (the timelock) can allowlist
+/// initializers, move the treasury, and sweep tokens sent here by mistake - the hook never holds a
+/// token of its own, only vault claims, so a sweep cannot reach anything owed.
 contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
     using SafeCast for uint256;
 
-    /// @notice The fee, in pips of the gross quote: 1%. A constant, so every pool keyed to this
-    /// hook charges it for life. A different fee is a new hook plus one `setPoolConfig`.
-    uint24 public constant FEE_PIPS = 10_000;
+    /// @notice The most a pool keyed to this hook can charge, in pips of the gross quote: 10%, the
+    /// launchpad core's own cap on a launch's trade fee. A fee word above it is not one the core
+    /// could have written, so pool creation refuses it as a layout mismatch.
+    uint24 public constant MAX_FEE_PIPS = 100_000;
     uint24 internal constant PIPS_DENOMINATOR = 1_000_000;
+    /// @dev The core keeps a launch's trade fee in bps; the pool manager counts in pips.
+    uint24 internal constant PIPS_PER_BPS = 100;
     uint256 public constant BPS_DENOMINATOR = 10_000;
 
     /// @notice `beforeInitialize`, `beforeSwap`, `afterSwap` and both swap return deltas. The
@@ -103,8 +112,8 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
 
     // -------------------------------------------------------------------------------------
     // `LaunchpadCore` storage layout: the same words `InfinitySettler._readLaunchSplit` reads,
-    // for the same reason. `creator` and `creatorFeeShareBps` live in the core's internal
-    // `launches` mapping and are reachable only through `extsload`.
+    // for the same reason. `creator`, `creatorFeeShareBps` and `tradeFeeBps` live in the core's
+    // internal `launches` mapping and are reachable only through `extsload`.
     // -------------------------------------------------------------------------------------
 
     /// @dev Slot of `mapping(uint256 => Launch) launches` in `LaunchpadCore`.
@@ -123,6 +132,7 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
     struct PoolConfig {
         uint64 launchId;
         uint16 creatorBps;
+        uint24 feePips;
         bool quoteIsCurrency0;
         bool registered;
     }
@@ -165,7 +175,9 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
     error NothingToHarvest(Currency quote);
     error UnexpectedLock();
 
-    event PoolRegistered(PoolId indexed poolId, uint256 indexed launchId, Currency quote, uint16 creatorBps);
+    event PoolRegistered(
+        PoolId indexed poolId, uint256 indexed launchId, Currency quote, uint16 creatorBps, uint24 feePips
+    );
     event FeeTaken(PoolId indexed poolId, uint256 indexed launchId, Currency quote, uint256 fee);
     event CreatorClaimed(uint256 indexed launchId, address indexed creator, Currency quote, uint256 amount);
     event Harvested(Currency indexed quote, address indexed treasury, uint256 amount, bool notified);
@@ -209,7 +221,8 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
     // Pool creation
     // -------------------------------------------------------------------------------------
 
-    /// @notice Bind a new pool to the launch that is graduating into it, or refuse it.
+    /// @notice Bind a new pool to the launch that is graduating into it, at that launch's fee and
+    /// creator share, or refuse it.
     /// @param sender `msg.sender` of `CLPoolManager.initialize`: the settler, which is why a
     /// settler must call the pool manager directly and never through the position manager.
     function beforeInitialize(address sender, PoolKey calldata key, uint160) external returns (bytes4) {
@@ -222,16 +235,20 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
         (uint256 launchId, bool quoteIsCurrency0) = _resolveLaunch(key.currency0, key.currency1);
         if (PoolId.unwrap(launchPool[launchId]) != bytes32(0)) revert LaunchAlreadyBound(launchId);
         if (launchId > type(uint64).max) revert LaunchIdTooLarge(launchId);
-        uint16 creatorBps = _readCreatorBps(launchId, sender);
+        (uint16 creatorBps, uint24 feePips) = _readLaunchTerms(launchId, sender);
 
         PoolId poolId = key.toId();
         Currency quote = quoteIsCurrency0 ? key.currency0 : key.currency1;
         _pools[poolId] = PoolConfig({
-            launchId: uint64(launchId), creatorBps: creatorBps, quoteIsCurrency0: quoteIsCurrency0, registered: true
+            launchId: uint64(launchId),
+            creatorBps: creatorBps,
+            feePips: feePips,
+            quoteIsCurrency0: quoteIsCurrency0,
+            registered: true
         });
         launchPool[launchId] = poolId;
         launchQuote[launchId] = quote;
-        emit PoolRegistered(poolId, launchId, quote, creatorBps);
+        emit PoolRegistered(poolId, launchId, quote, creatorBps, feePips);
         return ICLHooks.beforeInitialize.selector;
     }
 
@@ -257,7 +274,7 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
         // receive, net of the fee the pool now has to pay out on top.
         // forge-lint: disable-next-line(unsafe-typecast) - each branch casts a value its sign test made non-negative.
         uint256 amount = exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified);
-        uint256 fee = _feeOn(amount, exactInput);
+        uint256 fee = _feeOn(amount, exactInput, pool.feePips);
         if (fee != 0) _accrue(key, poolId, pool, fee);
         return (ICLHooks.beforeSwap.selector, toBeforeSwapDelta(fee.toInt128(), 0), 0);
     }
@@ -281,7 +298,7 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
         int128 quoteDelta = pool.quoteIsCurrency0 ? delta.amount0() : delta.amount1();
         // forge-lint: disable-next-line(unsafe-typecast) - magnitude of a delta whose sign is tested first.
         uint256 amount = quoteDelta < 0 ? uint256(-int256(quoteDelta)) : uint256(int256(quoteDelta));
-        uint256 fee = _feeOn(amount, exactInput);
+        uint256 fee = _feeOn(amount, exactInput, pool.feePips);
         if (fee != 0) _accrue(key, poolId, pool, fee);
         return (ICLHooks.afterSwap.selector, fee.toInt128());
     }
@@ -380,7 +397,7 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
     // -------------------------------------------------------------------------------------
 
     /// @notice What a pool was bound to when it was created. `registered` is false for a pool
-    /// this hook never saw.
+    /// this hook never saw. The pool's fee is `poolFeePips`.
     function poolInfo(PoolId poolId)
         external
         view
@@ -389,6 +406,16 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
         PoolConfig memory pool = _pools[poolId];
         if (!pool.registered) return (false, 0, Currency.wrap(address(0)), 0);
         return (true, pool.launchId, launchQuote[pool.launchId], pool.creatorBps);
+    }
+
+    /// @notice What a pool charges, in pips of the gross quote: its launch's trade fee, read when
+    /// the pool was created and fixed for life (10,000 is 1%). Reverts `UnknownPool` for a pool
+    /// this hook never bound, so a zero is always a pool that charges nothing, never one it does
+    /// not know.
+    function poolFeePips(PoolId poolId) external view returns (uint24) {
+        PoolConfig memory pool = _pools[poolId];
+        if (!pool.registered) revert UnknownPool(poolId);
+        return pool.feePips;
     }
 
     /// @notice Who may call `claimCreator(launchId)` right now, and so who it pays: the launch's
@@ -415,9 +442,11 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
         if (!pool.registered) revert UnknownPool(poolId);
     }
 
-    /// @dev 1% of a gross amount, or the 1/99 of a net amount that is the same 1% of its gross.
-    function _feeOn(uint256 amount, bool amountIsGross) private pure returns (uint256) {
-        return amountIsGross ? amount * FEE_PIPS / PIPS_DENOMINATOR : amount * FEE_PIPS / (PIPS_DENOMINATOR - FEE_PIPS);
+    /// @dev `feePips` of a gross amount, or the `feePips / (1 - feePips)` of a net amount that is
+    /// the same share of its gross. `feePips` is at most `MAX_FEE_PIPS`, so the net denominator is
+    /// never zero.
+    function _feeOn(uint256 amount, bool amountIsGross, uint24 feePips) private pure returns (uint256) {
+        return amountIsGross ? amount * feePips / PIPS_DENOMINATOR : amount * feePips / (PIPS_DENOMINATOR - feePips);
     }
 
     function _accrue(PoolKey calldata key, PoolId poolId, PoolConfig memory pool, uint256 fee) private {
@@ -453,8 +482,14 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
 
     /// @dev `InfinitySettler._readLaunchSplit`'s three canaries, with `sender` in place of the
     /// settler's own address: the launch is mid-graduation, through the settler creating this
-    /// pool, and its creator share is a legal bps.
-    function _readCreatorBps(uint256 launchId, address sender) private view returns (uint16 creatorBps) {
+    /// pool, and its fee word holds a legal creator share and a trade fee the core could have set.
+    /// A zero fee is legal: the core allows one, and its pool simply charges nothing. Refusing it
+    /// would strand that launch in `CurveFilled`, since its graduation could never succeed.
+    function _readLaunchTerms(uint256 launchId, address sender)
+        private
+        view
+        returns (uint16 creatorBps, uint24 feePips)
+    {
         bytes32 stateAndCreator = _word(launchId, WORD_STATE_CREATOR);
         if (uint8(uint256(stateAndCreator)) != uint8(ILaunchpadCore.LaunchState.PendingSettlement)) {
             revert LayoutMismatch(stateAndCreator);
@@ -462,8 +497,11 @@ contract LaunchPoolFeeHook is Ownable2Step, IHooks, ILockCallback {
         bytes32 settlerWord = _word(launchId, WORD_SETTLER);
         if (address(uint160(uint256(settlerWord))) != sender) revert LayoutMismatch(settlerWord);
         bytes32 feeWord = _word(launchId, WORD_FEE_BPS);
+        uint256 tradeFeePips = uint256(uint16(uint256(feeWord))) * PIPS_PER_BPS;
         creatorBps = uint16(uint256(feeWord) >> 16);
-        if (creatorBps > BPS_DENOMINATOR) revert LayoutMismatch(feeWord);
+        if (creatorBps > BPS_DENOMINATOR || tradeFeePips > MAX_FEE_PIPS) revert LayoutMismatch(feeWord);
+        // forge-lint: disable-next-line(unsafe-typecast) - bounded by MAX_FEE_PIPS on the line above.
+        feePips = uint24(tradeFeePips);
     }
 
     function _word(uint256 launchId, uint256 offset) private view returns (bytes32) {
