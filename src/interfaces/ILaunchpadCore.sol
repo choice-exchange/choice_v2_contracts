@@ -33,6 +33,10 @@ interface ILaunchpadCore {
     function getLaunchPairAsset(uint256 launchId) external view returns (IERC20);
     function getLaunchToken(uint256 launchId) external view returns (address);
 
+    /// @notice The launch whose token is `token`. Reverts for a token the core never bound, which is
+    /// how a caller tells a launch token from a quote asset.
+    function getLaunchByToken(address token) external view returns (uint256 launchId);
+
     /// @notice Total launches ever reserved - ids are dense over `[0, launchCount)`.
     function launchCount() external view returns (uint256);
 

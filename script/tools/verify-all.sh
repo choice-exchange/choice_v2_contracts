@@ -65,6 +65,9 @@ LOCKER_LEGACY=0x9b28F31B8AB8ED488B4E8bc7cb432ceaFe60E3Fe
 # CONSTRUCTED - `setInitializer` since then does not change them.
 SETTLER_10=0xC3ED6d3f97D85B243108446a17ed53d896331ac9
 GUARD=0xdbe06EC41E59ad95E9Ade80f8c3eAb34c812512B
+# LaunchPoolFeeHook 1.0.0, deployed 2026-09-15. The live settler keys graduation pools to it since
+# the same day's switch (settler.setPoolConfig(0, 200, hook) + the fee controller's gate).
+FEEHOOK=0xC31C00D65eB0118F99F32d4fce33E32Cbfe4A92c
 # The buyback sink and the TEST burn token it destroys. 🔴 `BBSINK` is 1.2.0, the A5 sink deployed
 # 2026-09-06; 1.1.0 is kept below because it is still deployed and still timelock-owned, while
 # the two IT superseded, 0xe0248Ebc… and 0x498b0ABd…, are intentionally absent — nothing points
@@ -168,6 +171,8 @@ MANIFEST=(
 "$LOCKER_12|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $BBSINK $TL $SETTLER_13)"
 "$LOCKER_11|contracts|src/launchpad/PositionLocker.sol:PositionLocker|$(CA address,address,address,address $POSM $PADT $TL $SETTLER_12)"
 "$GUARD|contracts|src/launchpad/LaunchPoolGuardHook.sol:LaunchPoolGuardHook|$(CA address,address $TL $SETTLER_10)"
+# Its treasury argument is the LIVE sink 1.5.0, which is what the constructor took.
+"$FEEHOOK|contracts|src/launchpad/LaunchPoolFeeHook.sol:LaunchPoolFeeHook|$(CA address,address,address,address,address $CORE $CLPM $TL $SETTLER $BBSINK_150)"
 "$SETTLER|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE $CLPM $POSM $P2 $LOCKER $GUARD $TL)"
 "$SETTLER_13|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE_0908 $CLPM $POSM $P2 $LOCKER_12 $GUARD $TL)"
 "$SETTLER_12|contracts|src/launchpad/InfinitySettler.sol:InfinitySettler|$(CA address,address,address,address,address,address,address $CORE_PREV $CLPM $POSM $P2 $LOCKER_11 $GUARD $TL)"

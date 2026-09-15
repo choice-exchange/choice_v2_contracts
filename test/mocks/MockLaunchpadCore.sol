@@ -79,8 +79,18 @@ contract MockLaunchpadCore {
     /// @notice Set by `onSettled`, so a test can tell an atomic graduation from a silent one.
     mapping(uint256 => bool) public settledCallbackFired;
 
+    /// @dev The real core's `tokenToLaunchId`: stored as id + 1, so that 0 means unknown. Declared
+    /// after `launches`, so the layout under test is untouched.
+    mapping(address => uint256) internal tokenToLaunchId;
+
+    /// @dev The real core's two-step creator handoff, which works after graduation.
+    mapping(uint256 => address) public pendingCreator;
+
     error NotSettler(address expected);
     error WrongState();
+    error UnknownToken(address token);
+    error NotCreator();
+    error NotPendingCreator();
 
     event Graduated(uint256 indexed launchId);
 
@@ -110,6 +120,25 @@ contract MockLaunchpadCore {
 
     function getLaunchToken(uint256 launchId) external view returns (address) {
         return launches[launchId].token;
+    }
+
+    /// @dev Same semantics as the real core: `UnknownToken` for a token it never bound, which is
+    /// how a caller tells a launch token from a quote asset.
+    function getLaunchByToken(address token) external view returns (uint256) {
+        uint256 stored = tokenToLaunchId[token];
+        if (stored == 0) revert UnknownToken(token);
+        return stored - 1;
+    }
+
+    function transferCreator(uint256 launchId, address newCreator) external {
+        if (msg.sender != launches[launchId].creator) revert NotCreator();
+        pendingCreator[launchId] = newCreator;
+    }
+
+    function acceptCreator(uint256 launchId) external {
+        if (msg.sender != pendingCreator[launchId]) revert NotPendingCreator();
+        launches[launchId].creator = msg.sender;
+        delete pendingCreator[launchId];
     }
 
     /// @dev Same access control as the real core: the caller must be the settler snapshotted
@@ -144,6 +173,7 @@ contract MockLaunchpadCore {
         l.settler = settler;
         l.realPair = realPair;
         l.creatorFeeShareBps = creatorFeeShareBps;
+        tokenToLaunchId[token] = launchId + 1;
         // Written so a correct decode cannot be an accident: the settler has to pick
         // `creatorFeeShareBps` out of the middle of a populated slot, not out of zeros.
         l.tradeFeeBps = 100;

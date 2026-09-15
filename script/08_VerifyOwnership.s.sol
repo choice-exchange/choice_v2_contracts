@@ -17,6 +17,10 @@ interface ILaunchPoolGuardHookView {
     function isInitializer(address) external view returns (bool);
 }
 
+interface IInfinitySettlerView {
+    function hooks() external view returns (address);
+}
+
 /// @dev The role ids are read FROM THE DEPLOYED CONTRACT rather than recomputed here. A local
 /// `keccak256("PROPOSER_ROLE")` would agree with a contract that is not an OpenZeppelin
 /// `TimelockController` at all; asking the timelock for its own constants means anything else
@@ -139,12 +143,13 @@ contract VerifyOwnership is BaseScript {
         // `Ownable` - `setBaseTokenURI` and `setTokenURIContract` decide what every position
         // NFT renders as - it is correctly timelock-owned on testnet, and nothing would have
         // noticed if mainnet's was not.
-        string[13] memory timelockOwned = [
+        string[14] memory timelockOwned = [
             "choice.clFeeController",
             "choice.binFeeController",
             "choice.infinitySettler",
             "choice.positionLocker",
             "choice.launchPoolGuardHook",
+            "choice.launchPoolFeeHook",
             "choice.choiceRouter",
             "choice.exchangeSubaccountBurnSink",
             "choice.buybackBurnSink",
@@ -545,6 +550,7 @@ contract VerifyOwnership is BaseScript {
         address clPoolManager = readAddressOrZero("infinity.clPoolManager");
         address clFeeController = readAddressOrZero("choice.clFeeController");
         address guardHook = readAddressOrZero("choice.launchPoolGuardHook");
+        address feeHook = readAddressOrZero("choice.launchPoolFeeHook");
         address settler = readAddressOrZero("choice.infinitySettler");
         address locker = readAddressOrZero("choice.positionLocker");
 
@@ -569,11 +575,15 @@ contract VerifyOwnership is BaseScript {
             (bool answered, bytes memory data) =
                 clFeeController.staticcall(abi.encodeWithSignature("launchPoolGuardHook()"));
             address gate = (answered && data.length == 32) ? abi.decode(data, (address)) : address(0);
+            // The gate follows whichever hook the settler keys graduation pools to: the guard hook
+            // until the fee-hook switch (script 14), the fee hook after it. The two move in one
+            // timelock operation, so a gate naming the other one is a half-done switch.
+            address expected = _launchPoolHook(settler, guardHook, feeHook);
             _wiring(
-                answered && gate == guardHook,
+                answered && gate == expected,
                 answered ? "clFeeController.launchPoolGuardHook" : "clFeeController has no launch-pool gate (pre-A0)",
                 gate,
-                guardHook,
+                expected,
                 "choice.clFeeController -> setLaunchPoolGuardHook"
             );
         } else {
@@ -604,6 +614,27 @@ contract VerifyOwnership is BaseScript {
             skipped++;
             console.log("  [skip] launchPoolGuardHook or infinitySettler is not in the book yet");
         }
+
+        if (feeHook != address(0) && settler != address(0)) {
+            bool allowed = ILaunchPoolGuardHookView(feeHook).isInitializer(settler);
+            _wiring(
+                allowed,
+                "launchPoolFeeHook.isInitializer(settler)",
+                allowed ? settler : address(0),
+                settler,
+                "choice.launchPoolFeeHook -> setInitializer(settler, true)"
+            );
+        } else {
+            skipped++;
+            console.log("  [skip] launchPoolFeeHook or infinitySettler is not in the book yet");
+        }
+    }
+
+    /// @dev Which hook the fee controller's launch-pool gate has to name: the fee hook once the
+    /// settler keys graduation pools to it, the guard hook until then.
+    function _launchPoolHook(address settler, address guardHook, address feeHook) internal view returns (address) {
+        if (feeHook == address(0) || settler == address(0) || settler.code.length == 0) return guardHook;
+        return IInfinitySettlerView(settler).hooks() == feeHook ? feeHook : guardHook;
     }
 
     function _wiring(bool ok, string memory what, address current, address expected, string memory fix) internal {
