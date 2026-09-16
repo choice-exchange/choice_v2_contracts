@@ -12,9 +12,7 @@ import {ILockCallback} from "infinity-core/src/interfaces/ILockCallback.sol";
 import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
-import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {FullMath} from "infinity-core/src/pool-cl/libraries/FullMath.sol";
-import {CLPoolParametersHelper} from "infinity-core/src/pool-cl/libraries/CLPoolParametersHelper.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
@@ -23,6 +21,22 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
 /// @title BuybackBurnSink
 /// @notice Burn sink C: turn protocol revenue into the launchpad token and destroy it.
+///
+/// **VERSION 1.6.0** - quote hops are REGISTERED ONLY. 1.5.0 DERIVED one when nothing was
+/// registered, taking the deepest initialised hookless `{asset, QUOTE}` pool across five standard
+/// tiers; `CLPoolManager.initialize` is permissionless with no liquidity floor, so that is the one
+/// pool anybody can open and price, and the sink swapped its whole balance through it. Found by
+/// the 2026-09-16 security review, HIGH, fixed before any mainnet deploy. See `_hopFor`.
+///
+/// ⛔ **1.6.0 SHIPS UNDER THE `1.5.0` CREATE3 SALT ON MAINNET, DELIBERATELY.** A CREATE3 salt is
+/// an ADDRESS, not a version: `keccak256("CHOICE-V2/BuybackBurnSink/1.5.0")` predicts
+/// `0x65Dc46Ee554A27bC790710f9fAee74B427c1C57D`, which the live `LaunchPoolFeeHook.treasury()` and
+/// `PositionLocker.launchpadTreasury()` BOTH already point at and which already holds accrued wINJ.
+/// Moving the address would mean two repoint calls in the deploy batch and would strand that
+/// balance, since only code AT that salt can move it and `sweep` refuses `QUOTE`. So the salt stays
+/// and the version moves - which is why testnet's `1.5.0` address runs DIFFERENT code from
+/// mainnet's. Testnet rehearsals are unaffected: script 13 deploys those under its own
+/// `CHOICE-V2-REHEARSAL/` salt. Decided with Dan, 2026-09-16.
 ///
 /// Sinks A and B (`DirectTransferBurnSink`, `ExchangeSubaccountBurnSink`) feed Injective's burn
 /// auction, which burns INJ. This one buys the LAUNCHPAD's own token on Choice's own pools and
@@ -153,7 +167,6 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 /// that looks like housekeeping.
 contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     using CurrencyLibrary for Currency;
-    using CLPoolParametersHelper for bytes32;
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
 
@@ -178,20 +191,6 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// Two is the most any deployment has ever needed - one live locker and one superseded one
     /// still holding older launches.
     uint256 public constant MAX_LOCKERS = 8;
-
-    /// @notice The CL pool manager derived hops are built against, read once at construction.
-    /// @dev Immutable and cached rather than fetched per call, for two reasons. It is on the
-    /// conversion path, so a staticcall per `burn` is pure cost; and `POSITION_MANAGER` is
-    /// itself immutable, so the answer cannot change - caching it removes a moving part rather
-    /// than pinning one down. Zero when the position manager cannot answer, which disables
-    /// derivation and leaves `setQuoteRoute` as the only source of a hop.
-    ICLPoolManager public immutable CL_POOL_MANAGER;
-
-    /// @notice How many standard fee tiers a derived quote hop searches.
-    /// @dev A gas cost on the conversion path - two staticcalls per tier - so it is a constant
-    /// rather than owner-settable, and small. An asset whose only market is off this table is
-    /// still reachable through `setQuoteRoute`, which is checked first.
-    uint256 public constant DERIVED_TIER_COUNT = 5;
 
     /// @notice The token bought and burnt. Immutable: a sink that could be repointed at another
     /// token is a sink whose burn is a promise again.
@@ -439,12 +438,6 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         QUOTE = _quote;
         VAULT = _vault;
         POSITION_MANAGER = _positionManager;
-        // 🔑 Asked once, and tolerated when unanswerable. A position manager that does not
-        // expose its pool manager leaves derivation off rather than making the sink
-        // undeployable - `setQuoteRoute` still works, which is exactly the pre-1.5.0 behaviour.
-        try _positionManager.clPoolManager() returns (ICLPoolManager m) {
-            CL_POOL_MANAGER = m;
-        } catch {}
         MIN_BURN_BPS = _minBurnBps;
         burnBps = _burnBps;
         treasury = _treasury;
@@ -479,9 +472,14 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             // routes it parked here for ever with reason 6. Now it is one swap to `QUOTE` and on
             // into the buyback, on a permissionless call with nothing passed in.
             //
-            // ⚠️ "Quote asset" now means REGISTERED OR DERIVABLE, not registered. That widening
-            // is the point: a pad that lists quote assets faster than it runs timelock batches
-            // used to accrue unburnt revenue by default.
+            // ⛔ "Quote asset" means REGISTERED, and only registered. 1.5.0 widened it to
+            // "registered or derivable" so a pad listing quote assets faster than it runs
+            // timelock batches would not accrue unburnt revenue - and that widening was the
+            // HIGH-severity hole, because the derivable key is the one anyone can open and
+            // price. See `_hopFor`. An asset nobody has registered never reaches this arm at
+            // all - it falls through to `PARK_NEEDS_HINT` below, which is terminal for it until
+            // governance registers a route: a visible, reversible delay in place of an
+            // irreversible loss.
             Route memory r;
             bool ok;
             (r.first, r.firstZeroForOne, ok) = _hopFor(currency);
@@ -536,10 +534,11 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// `LaunchDoesNotTrade` - there is no id that routes this swap through a pool of the caller's
     /// choosing, because the caller does not choose the pool, the settler did at graduation.
     ///
-    /// ⚠️ A launch that graduated against a quote asset OTHER than `QUOTE` is refused here rather
-    /// than parked: its pool trades `{launchToken, thatAsset}` and this sink has no second leg to
-    /// get from `thatAsset` to `QUOTE`. That is D28's open edge, not a regression - the derived
-    /// tier could not reach those launches either, it just failed quietly instead.
+    /// ⚠️ A launch that graduated against a quote asset OTHER than `QUOTE` resolves only once
+    /// that asset has a REGISTERED route: its pool trades `{launchToken, thatAsset}`, so the
+    /// second leg has to come from `setQuoteRoute`. Without one it is refused here rather than
+    /// parked. That is D28's open edge, and it is deliberately still open - 1.5.0 closed it by
+    /// deriving the second leg, which meant deriving it from a pool anyone could open and price.
     ///
     /// Unlike `burn`, this one is allowed to revert. It is not on the harvest path, and a named
     /// error says what is wrong while somebody is looking at it.
@@ -744,104 +743,38 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         }
     }
 
-    /// @dev Whether `asset` can reach `QUOTE` in one swap, by override or by derivation.
+    /// @dev Whether `asset` can reach `QUOTE` in one swap. Registered, or not at all.
     function _isQuoteAsset(Currency asset) internal view returns (bool ok) {
         (,, ok) = _hopFor(asset);
     }
 
-    /// @dev The hop that sells `asset` for `QUOTE`: the REGISTERED override if the owner set one,
-    /// otherwise one DERIVED from the standard tiers.
+    /// @dev The hop that sells `asset` for `QUOTE`: the route the owner REGISTERED, or nothing.
     ///
-    /// 🔑 Derivation is what makes "any quote asset" true. Before it, the second leg of a
-    /// conversion existed only if the timelock had registered a pool for that exact asset - so a
-    /// launch paired against anything but `QUOTE` collected its fee, claimed it, and then had
-    /// both halves refused, for ever, until somebody noticed and ran a governance batch. A pad
-    /// that lists quote assets faster than it runs timelock batches accrues unburnt revenue by
-    /// default, which is the opposite of what `MIN_BURN_BPS` promises.
+    /// ⛔ **1.5.0 derived this, and deriving it was a HIGH-severity hole.** The search took the
+    /// deepest initialised `{asset, QUOTE}` pool across the standard tiers with `hooks` hardcoded
+    /// `address(0)` - and a hookless key is precisely the one ANYBODY can open, at any price,
+    /// because `CLPoolManager.initialize` is permissionless with no liquidity floor. Selection
+    /// was by raw in-range `getLiquidity`, so a one-tick JIT position beat a real book for
+    /// pocket change, and `maxImpactBps` did not bound it: the bound is measured against the
+    /// attacker's own spot. `setQuoteRoute`'s doc block said all of this, in this file, while the
+    /// code below it derived anyway.
     ///
-    /// ⚠️ Deriving is not trusting. Every candidate is CHECKED against the chain before it is
-    /// used - the pool must be initialised and must hold liquidity - and the search is confined
-    /// to keys this contract builds itself: the two currencies sorted, `hooks` ZERO, and the
-    /// pool manager taken from `POSITION_MANAGER`, which is immutable. So a derived hop can
-    /// never route through an attacker's hook, an attacker's manager or an attacker's pair.
-    /// This is the same shape as `_launchPoolFor`: derive a candidate, then let the chain say
-    /// whether it is real.
+    /// 🔑 **Checking a derived key is not the same as trusting its price.** The old code verified
+    /// that each candidate was initialised and held liquidity, and read that as safety - but
+    /// "this pool is real" was never the question. Nothing an attacker opens is unreal. What a
+    /// graduation pool has and an ordinary pair does not is `LaunchPoolGuardHook`, which makes
+    /// the key un-createable by anyone but an allowlisted settler; that is why `_launchPoolFor`
+    /// may derive and this may not.
     ///
-    /// 🔑 The DEEPEST candidate wins, not the first. Several tiers may hold the same pair, and
-    /// picking by tier order would send a conversion through a tier somebody opened with dust
-    /// while the real book sat one tier away.
+    /// ⚠️ The cost is the D28 edge reopening: a launch paired against an asset with no registered
+    /// route collects its fee, claims it, and parks - visibly, with `PARK_NO_ROUTE` or
+    /// `PARK_NEEDS_HINT` - until governance registers the route. That is a known, bounded,
+    /// REVERSIBLE delay. Selling the sink's whole balance into a pool the buyer priced is none of
+    /// those things. Parked revenue is still here; revenue sold at an attacker's price is gone.
     function _hopFor(Currency asset) internal view returns (PoolKey memory key, bool zeroForOne, bool found) {
         key = _quoteRoutes[asset];
-        if (address(key.poolManager) != address(0)) {
-            found = true;
-        } else {
-            (key, found) = _deriveQuoteHop(asset);
-        }
+        found = address(key.poolManager) != address(0);
         if (found) zeroForOne = key.currency0 == asset;
-    }
-
-    /// @dev The deepest initialised `{asset, QUOTE}` pool across the standard tiers, or nothing.
-    function _deriveQuoteHop(Currency asset) internal view returns (PoolKey memory best, bool found) {
-        if (Currency.unwrap(asset) == address(BURN_TOKEN) || asset == QUOTE) return (best, false);
-
-        ICLPoolManager mgr = CL_POOL_MANAGER;
-        if (address(mgr) == address(0)) return (best, false);
-        (Currency c0, Currency c1) = asset < QUOTE ? (asset, QUOTE) : (QUOTE, asset);
-
-        uint128 deepest;
-        for (uint256 i; i < DERIVED_TIER_COUNT; ++i) {
-            (uint24 fee, int24 spacing) = _derivedTier(i);
-            PoolKey memory candidate = PoolKey({
-                currency0: c0,
-                currency1: c1,
-                hooks: IHooks(address(0)),
-                poolManager: mgr,
-                fee: fee,
-                parameters: bytes32(0).setTickSpacing(spacing)
-            });
-
-            // ⛔ try/catch, not a plain call, and it is load-bearing rather than defensive
-            // habit. `_hopFor` is reached from `burn`, whose ONE guarantee is that it never
-            // reverts - a harvest must not be brickable by anything downstream of it. A pool
-            // manager that reverts on an unknown id, or is paused, or is simply not the
-            // contract this sink thinks it is, would otherwise turn "there is no route" into
-            // "the harvest failed". The fuzz test testFuzz_burnNeverRevertsWhateverTheState is
-            // what caught this: the first version called straight through and took the
-            // guarantee down with it.
-            uint160 sqrtPriceX96;
-            try mgr.getSlot0(candidate.toId()) returns (uint160 p, int24, uint24, uint24) {
-                sqrtPriceX96 = p;
-            } catch {
-                continue;
-            }
-            if (sqrtPriceX96 == 0) continue;
-
-            uint128 liquidity;
-            try mgr.getLiquidity(candidate.toId()) returns (uint128 l) {
-                liquidity = l;
-            } catch {
-                continue;
-            }
-            if (liquidity == 0 || liquidity <= deepest) continue;
-
-            deepest = liquidity;
-            best = candidate;
-            found = true;
-        }
-    }
-
-    /// @dev The standard tier table, as `(lpFee, tickSpacing)`.
-    ///
-    /// 🔴 `fee` here is the LP leg, NOT the tier's headline percentage - the 0.05% tier is 335,
-    /// not 500, because upstream's split truncates twice. Both 1% entries are deliberate: 6722
-    /// is the LP leg when a protocol fee is charged alongside it, 10000 when it is not, and both
-    /// exist on a live chain at once because plan A0 zeroed the protocol fee for graduates only.
-    function _derivedTier(uint256 i) private pure returns (uint24 fee, int24 spacing) {
-        if (i == 0) return (335, 10);
-        if (i == 1) return (67, 1);
-        if (i == 2) return (2011, 60);
-        if (i == 3) return (6722, 200);
-        return (10000, 200);
     }
 
     /// @dev The launch's own graduation pool, read off its locked position and then CHECKED.
@@ -1097,28 +1030,23 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             && address(buybackPool.poolManager) != address(0);
     }
 
-    /// @notice Whether a `convert(currency, launchId)` right now would actually trade.
-    /// @dev For keepers and dashboards deciding whether a call is worth its gas. It answers false
-    /// for a held currency, which is the point: holding is meant to be visible from outside, not
-    /// inferred from nothing happening. It also answers false for a hint that would revert, so a
-    /// caller can tell a bad launch id from an empty balance without spending a transaction.
-    /// @notice The registered second leg for a quote asset, if it has one.
+    /// @notice The hop this sink would ACTUALLY use to sell `asset` for `QUOTE`.
+    /// @dev "Can this asset's revenue be burnt?" - the question operational tooling asks.
     /// @return key The pool; zero when nothing is registered.
     /// @return assetIsCurrency0 True when `asset` is that pool's `currency0`.
     /// @return found Whether a route exists at all.
-    /// @notice The hop this sink would ACTUALLY use to sell `asset` for `QUOTE`.
-    /// @dev 🔴 This reports the EFFECTIVE route, so it answers `found` for an asset nobody has
-    /// registered but whose `{asset, QUOTE}` pool exists on a standard tier. That is the whole
-    /// point of derivation and it is what operational tooling should read: "can this asset's
-    /// revenue be burnt?" is the question, and a registered override is only one way to yes.
-    /// Use `registeredQuoteRoute` for the narrower question of what governance has pinned.
     function quoteRoute(Currency asset) external view returns (PoolKey memory key, bool assetIsCurrency0, bool found) {
         (key, assetIsCurrency0, found) = _hopFor(asset);
     }
 
-    /// @notice The hop the owner PINNED for `asset`, ignoring anything derivable.
-    /// @dev The pair to `quoteRoute` above: this one answers "is there an override", which is
-    /// what a governance review wants, while `quoteRoute` answers "will it convert".
+    /// @notice The hop the owner PINNED for `asset`.
+    /// @dev 🔑 **This now answers exactly what `quoteRoute` answers, and that identity is the
+    /// security property rather than an oversight.** The pair existed because 1.5.0 derived a hop
+    /// when none was registered, so "what will convert" and "what governance pinned" could
+    /// differ; removing derivation collapsed the two. Both are kept because tooling reads both,
+    /// and because the day they disagree again is the day an unregistered asset has become
+    /// routable - which is the hole this contract closed. `test_theTwoRouteViewsCannotDisagree`
+    /// is what holds them together.
     function registeredQuoteRoute(Currency asset)
         external
         view
@@ -1129,6 +1057,11 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         assetIsCurrency0 = found && key.currency0 == asset;
     }
 
+    /// @notice Whether a `convert(currency, launchId)` right now would actually trade.
+    /// @dev For keepers and dashboards deciding whether a call is worth its gas. It answers false
+    /// for a held currency, which is the point: holding is meant to be visible from outside, not
+    /// inferred from nothing happening. It also answers false for a hint that would revert, so a
+    /// caller can tell a bad launch id from an empty balance without spending a transaction.
     function canConvert(Currency currency, uint256 launchId) external view returns (bool) {
         if (Currency.unwrap(currency) == address(BURN_TOKEN) || currency == QUOTE) return false;
         if (isHeld[currency]) return false;
