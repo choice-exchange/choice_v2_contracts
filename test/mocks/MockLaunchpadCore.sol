@@ -181,6 +181,13 @@ contract MockLaunchpadCore {
         l.poolKind = PoolKind.Clmm;
     }
 
+    /// @dev A launch's curve fee, which `seedLaunch` sets to 100 bps. The real core copies it
+    /// from the launch's quote slot at `createLaunch` and never changes it; a test that changes
+    /// it after graduation is proving a pool does not follow it.
+    function setTradeFeeBps(uint256 launchId, uint16 tradeFeeBps) external {
+        launches[launchId].tradeFeeBps = tradeFeeBps;
+    }
+
     /// @notice Mirrors the real `triggerGraduation`: flip to `PendingSettlement`, push both
     /// legs to the settler, then dispatch. Any revert inside `settle` unwinds all of it.
     function triggerGraduation(uint256 launchId, uint256 poolTokenAmount) external {
