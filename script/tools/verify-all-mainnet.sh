@@ -47,6 +47,7 @@ CROUTER=$(b .choice.choiceRouter)
 SETTLER=$(b .choice.infinitySettler)
 LOCKER=$(b .choice.positionLocker)
 GUARD=$(b .choice.launchPoolGuardHook)
+FEEHOOK=$(b .choice.launchPoolFeeHook)
 PADCORE=$(b .launchpad.core)
 SINK=$(b .choice.buybackBurnSink)
 TL=$(b .governance.timelock)
@@ -124,6 +125,11 @@ run_pass() {
   "$V" contracts "$SETTLER" src/launchpad/InfinitySettler.sol:InfinitySettler \
        "$(CA 'address,address,address,address,address,address,address' \
             "$PADCORE" "$CLPM" "$CLPOSM" "$P2" "$LOCKER" "$GUARD" "$TL")"
+  # LaunchPoolFeeHook 1.1.0, deployed by the timelock batch on 2026-09-16. CREATE3, so it can only
+  # verify through the v2 endpoint - there is no creation transaction for the compat one to decode.
+  "$V" contracts "$FEEHOOK" src/launchpad/LaunchPoolFeeHook.sol:LaunchPoolFeeHook \
+       "$(CA 'address,address,address,address,address' \
+            "$PADCORE" "$CLPM" "$TL" "$SETTLER" "$SINK")"
 
   # OpenZeppelin's TimelockController, deployed by script 01 from this repo's lib.
   # proposers = [safe]; executors = [address(0)] (open role); admin = address(0).
