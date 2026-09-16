@@ -54,9 +54,21 @@ contract DeployBuybackBurnSink is BaseScript {
     /// old sink keeps whatever is parked in it until it is swept.
     ///
     /// 1.4.0 carried plan **B2's numbers** rather than testnet's legacy pair - see below.
-    /// 1.5.0 adds DERIVED quote hops: a launch paired against any asset with a standard-tier
-    /// `{asset, QUOTE}` pool converts with NOTHING registered, so listing a quote asset is no
-    /// longer half an operation. `setQuoteRoute` survives as the override for exotic pools.
+    /// 1.5.0 added DERIVED quote hops, and that was a HIGH-severity hole: the search took the
+    /// deepest initialised HOOKLESS `{asset, QUOTE}` pool, which is precisely the pool anybody
+    /// can open at a price of their choosing. 1.6.0 removes derivation - `setQuoteRoute` is the
+    /// only source of a hop again.
+    ///
+    /// ⛔ **THE SALT STILL SAYS 1.5.0, AND THAT IS ON PURPOSE. DO NOT "FIX" IT.** A CREATE3
+    /// salt is an ADDRESS, not a version string. On mainnet this one computes
+    /// `0x65Dc46Ee554A27bC790710f9fAee74B427c1C57D`, which is already
+    /// `LaunchPoolFeeHook.treasury()` AND `PositionLocker.launchpadTreasury()`, and which already
+    /// holds accrued wINJ that only code deployed at this salt can ever move. Bumping the string
+    /// would move the address, add two repoint calls to the timelock batch, and strand that
+    /// balance behind a second batch and a rescue contract. The version lives in the contract's
+    /// VERSION line instead. On TESTNET this salt is already spent by the real 1.5.0, so the
+    /// fixed sink rehearses there under script 13's `CHOICE-V2-REHEARSAL/` salt, as it already
+    /// did. Decided with Dan, 2026-09-16.
     bytes32 internal constant SINK_SALT = keccak256("CHOICE-V2/BuybackBurnSink/1.5.0");
 
     /// 🎯 **B2's values, and they are now the same on both networks — deliberately.** The floor is

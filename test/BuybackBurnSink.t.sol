@@ -41,6 +41,13 @@ contract BuybackBurnSinkTest is Test {
     int24 internal constant SPACING = 200;
     uint160 internal constant SQRT_1_1 = 79228162514264337593543950336;
 
+    /// An attacker's price: ~1e-6 of 1:1, i.e. the sink's asset valued at a millionth of what a
+    /// real book would pay. The band is the spacing-aligned pair straddling the tick that price
+    /// sits at (~-138163), so the position is in range and the pool is a live candidate.
+    uint160 internal constant JIT_SQRT_PRICE = SQRT_1_1 / 1000;
+    int24 internal constant JIT_TICK_LOWER = -138400;
+    int24 internal constant JIT_TICK_UPPER = -138000;
+
     uint16 internal constant FLOOR = 8000;
     uint32 internal constant INTERVAL = 30 minutes;
 
@@ -1263,70 +1270,140 @@ contract BuybackBurnSinkTest is Test {
     // ── helpers ───────────────────────────────────────────────────────────
 
     // ---------------------------------------------------------------------------------------
-    // 1.5.0 — DERIVED quote hops. A launch paired against anything but QUOTE used to need a
-    // governance transaction before its fee could ever burn; these prove it no longer does,
-    // and that derivation cannot be used to point the sink anywhere it should not go.
+    // Quote hops are REGISTERED, never derived.
+    //
+    // 1.5.0 derived a hop when nothing was registered: the deepest initialised hookless
+    // `{asset, QUOTE}` pool across five standard tiers. `CLPoolManager.initialize` is
+    // permissionless with no liquidity floor, so a hookless key is exactly the one anybody can
+    // open at any price - and the sink swapped its WHOLE balance through whatever it found.
+    // These pin the closure: a route the owner did not register does not exist.
 
-    /// The item itself: a quote asset nobody registered, whose `{asset, QUOTE}` pool exists on a
-    /// standard tier, converts. Before 1.5.0 this parked for ever with nothing failing.
-    function test_aQuoteAssetWithAStandardTierPoolConvertsWithNothingRegistered() public {
+    /// ⛔ The item itself. `sai` has a real, deep, hookless `{sai, QUOTE}` pool on a standard
+    /// tier - the very thing 1.5.0 searched for and found. Nothing is registered for it, so it
+    /// must be unroutable, and `burn` must park rather than sell.
+    function test_anUnregisteredQuoteAssetIsUnroutableEvenWithADeepStandardTierPool() public {
         posm.setPoolManager(address(manager));
         BuybackBurnSink fresh = _freshSink();
 
-        (,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
-        assertTrue(found, "a standard-tier pool should be derivable with nothing registered");
+        // The pool 1.5.0 would have chosen really is there, and really is deep.
+        assertTrue(_sqrtPrice(saiQuotePool) != 0, "the standard-tier pool should exist");
 
-        (,, bool pinned) = fresh.registeredQuoteRoute(Currency.wrap(address(sai)));
-        assertFalse(pinned, "and it should be derived, not pinned");
+        (,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
+        assertFalse(found, "an unregistered asset must have no route, however deep its pool");
 
         _configure(fresh);
         sai.mint(address(fresh), 500 ether);
+
+        vm.expectEmit(true, false, false, true, address(fresh));
+        emit BuybackBurnSink.Parked(Currency.wrap(address(sai)), 500 ether, 6);
         fresh.burn(Currency.wrap(address(sai)), 0);
-        assertEq(sai.balanceOf(address(fresh)), 0, "the pair asset should have converted");
+
+        assertEq(sai.balanceOf(address(fresh)), 500 ether, "an unregistered asset must not be sold");
     }
 
-    /// Governance still wins. A pinned route is checked BEFORE the tier search, so an operator
-    /// can always move a conversion off a pool derivation would have picked.
-    function test_aRegisteredRouteOverridesTheDerivedOne() public {
+    /// ⛔ The attack 1.5.0 was open to, planted in full. `stray` has no legitimate market, so an
+    /// attacker's hookless pool would have been the ONLY candidate and would have won outright -
+    /// at a price they chose, with a position they could pull. `maxImpactBps` is no help: it is
+    /// measured against this pool's own spot.
+    ///
+    /// The invariant is not "the derived key carries no hook" - that was never the threat, and
+    /// the key below has no hook. It is that an UNREGISTERED asset routes NOWHERE.
+    function test_theSinkRefusesAJitPricedHooklessPoolAnAttackerOpened() public {
         posm.setPoolManager(address(manager));
         BuybackBurnSink fresh = _freshSink();
+        _configure(fresh);
 
-        PoolKey memory override_ = _key(sai, quote, OLD_FEE);
-        _seed(override_, 5_000 ether);
+        // The attacker opens the pool the sink would have derived: currencies sorted, hooks
+        // ZERO, this manager, a standard tier - a key the old `_deriveQuoteHop` built itself.
+        PoolKey memory jit = _key(stray, quote, FEE);
+        _seedAt(jit, JIT_SQRT_PRICE, JIT_TICK_LOWER, JIT_TICK_UPPER, 1e18);
 
-        vm.prank(TIMELOCK);
-        fresh.setQuoteRoute(Currency.wrap(address(sai)), override_);
+        (,, bool found) = fresh.quoteRoute(Currency.wrap(address(stray)));
+        assertFalse(found, "a pool anyone can open must never become a route");
 
-        (PoolKey memory used,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
-        assertTrue(found, "the pinned route should resolve");
-        assertEq(used.fee, OLD_FEE, "the pinned route must win over the derived one");
+        uint160 attackerSpotBefore = _sqrtPrice(jit);
+
+        stray.mint(address(fresh), 100_000 ether);
+        fresh.burn(Currency.wrap(address(stray)), 0);
+
+        assertEq(stray.balanceOf(address(fresh)), 100_000 ether, "the balance must stay in the sink");
+        assertEq(_sqrtPrice(jit), attackerSpotBefore, "not one wei may reach the attacker's pool");
     }
 
-    /// Several tiers may hold the same pair. Taking the first would send a conversion through a
-    /// tier somebody opened with dust while the real book sat one tier away.
-    function test_derivationPrefersTheDeepestTier() public {
+    /// ⛔ The second half of the finding. `convert` takes a launch id as a HINT, and an unknown
+    /// id resolves to "not found" rather than reverting - so under 1.5.0 `convert(anything, 0)`
+    /// fell through to the derived hop and reached the LAUNCH-TOKEN revenue stream, bypassing
+    /// both the hint and the `PARK_NEEDS_HINT` park. With no derivation there is nothing to fall
+    /// through to, and the bad hint is reported as one.
+    function test_convertWithAnUnknownLaunchIdCannotBypassTheHint() public {
         posm.setPoolManager(address(manager));
+        BuybackBurnSink fresh = _freshSink();
+        _configure(fresh);
+
+        // A hookless pool for the launch token, exactly as an attacker would leave it.
+        PoolKey memory planted = _key(meme, quote, FEE);
+        _seedAt(planted, JIT_SQRT_PRICE, JIT_TICK_LOWER, JIT_TICK_UPPER, 1e18);
+
+        meme.mint(address(fresh), 1_000 ether);
+
+        uint256 unknownLaunch = 0;
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BuybackBurnSink.LaunchDoesNotTrade.selector, unknownLaunch, Currency.wrap(address(meme))
+            )
+        );
+        fresh.convert(Currency.wrap(address(meme)), unknownLaunch);
+
+        assertEq(meme.balanceOf(address(fresh)), 1_000 ether, "a bad hint must move nothing");
+    }
+
+    /// Governance names the VENUE, and depth does not argue with it. A registered route on a
+    /// thin tier is used even though a deeper pool for the same pair sits one tier away - the
+    /// opposite of 1.5.0, which picked by liquidity and so could be outbid.
+    function test_aRegisteredRouteIsTheOnlyRouteEvenWhenAnotherTierIsDeeper() public {
+        posm.setPoolManager(address(manager));
+        BuybackBurnSink fresh = _freshSink();
 
         PoolKey memory thin = _key(sai, quote, OLD_FEE);
-        _seed(thin, 1_000 ether);
+        _seed(thin, 5_000 ether); // saiQuotePool at FEE is seeded 500_000 - a hundredfold deeper
 
-        BuybackBurnSink fresh = _freshSink();
+        vm.prank(TIMELOCK);
+        fresh.setQuoteRoute(Currency.wrap(address(sai)), thin);
+
         (PoolKey memory used,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
-        assertTrue(found, "both tiers exist, one must be chosen");
-        assertEq(used.fee, FEE, "the deeper tier should win");
+        assertTrue(found, "the registered route should resolve");
+        assertEq(used.fee, OLD_FEE, "the registered route must win, not the deeper pool");
     }
 
-    /// ⛔ The safety property. A derived key is built by this contract — currencies sorted,
-    /// `hooks` ZERO, manager taken from the immutable position manager — so no pool anyone else
-    /// created with a hook can ever be routed through, however deep it is.
-    function test_derivationNeverRoutesThroughAHookedPool() public {
+    /// 🔑 `quoteRoute` and `registeredQuoteRoute` now answer identically, by construction. The
+    /// day they disagree is the day an unregistered asset has become routable again, which is
+    /// the whole of this fix - so the identity is asserted rather than assumed.
+    function test_theTwoRouteViewsCannotDisagree() public {
         posm.setPoolManager(address(manager));
         BuybackBurnSink fresh = _freshSink();
 
-        (PoolKey memory used,, bool found) = fresh.quoteRoute(Currency.wrap(address(sai)));
-        assertTrue(found, "the hookless pool is still derivable");
-        assertEq(address(used.hooks), address(0), "a derived hop must never carry a hook");
-        assertEq(address(used.poolManager), address(manager), "and never another manager");
+        Currency[] memory assets = new Currency[](3);
+        assets[0] = Currency.wrap(address(sai)); // deep standard-tier pool, unregistered
+        assets[1] = Currency.wrap(address(stray)); // no pool at all
+        assets[2] = Currency.wrap(address(meme)); // a launch token
+
+        for (uint256 i; i < assets.length; ++i) {
+            _assertViewsAgree(fresh, assets[i]);
+        }
+
+        vm.prank(TIMELOCK);
+        fresh.setQuoteRoute(Currency.wrap(address(sai)), saiQuotePool);
+        for (uint256 i; i < assets.length; ++i) {
+            _assertViewsAgree(fresh, assets[i]);
+        }
+    }
+
+    function _assertViewsAgree(BuybackBurnSink s, Currency asset) internal view {
+        (PoolKey memory effective, bool effectiveFirst, bool effectiveFound) = s.quoteRoute(asset);
+        (PoolKey memory pinned, bool pinnedFirst, bool pinnedFound) = s.registeredQuoteRoute(asset);
+        assertEq(effectiveFound, pinnedFound, "effective and pinned must agree on existence");
+        assertEq(effectiveFirst, pinnedFirst, "and on direction");
+        assertEq(PoolId.unwrap(effective.toId()), PoolId.unwrap(pinned.toId()), "and on the pool");
     }
 
     /// An asset with no pool at all stays unroutable, and `burn` still parks rather than reverts.
@@ -1335,7 +1412,7 @@ contract BuybackBurnSinkTest is Test {
         BuybackBurnSink fresh = _freshSink();
 
         (,, bool found) = fresh.quoteRoute(Currency.wrap(address(stray)));
-        assertFalse(found, "nothing should be derivable for a currency with no pool");
+        assertFalse(found, "a currency with no pool and no route is unroutable");
 
         _configure(fresh);
         stray.mint(address(fresh), 100 ether);
@@ -1423,6 +1500,31 @@ contract BuybackBurnSinkTest is Test {
     function _moveBps(uint160 before, uint160 present) internal pure returns (uint256) {
         uint256 diff = present > before ? present - before : before - present;
         return diff * 10_000 / uint256(before);
+    }
+
+    /// A pool opened at a price of the opener's choosing, with a NARROW position behind it -
+    /// the shape of the attack `_deriveQuoteHop` was open to. `CLPoolManager.initialize` is
+    /// permissionless and has no liquidity floor, so the price, the range and the depth are all
+    /// the opener's to pick, and a one-band position is cheap to place and cheap to pull.
+    ///
+    /// 🔑 Narrow rather than full-range because at a price this far from 1:1 a full-range
+    /// position would demand an absurd amount of one side - which is the honest reason an
+    /// attacker would place exactly this shape.
+    function _seedAt(PoolKey memory key, uint160 sqrtPriceX96, int24 tickLower, int24 tickUpper, uint128 liquidity)
+        internal
+    {
+        manager.initialize(key, sqrtPriceX96);
+        MockERC20(Currency.unwrap(key.currency0)).mint(address(this), type(uint128).max);
+        MockERC20(Currency.unwrap(key.currency1)).mint(address(this), type(uint128).max);
+        MockERC20(Currency.unwrap(key.currency0)).approve(address(seeder), type(uint256).max);
+        MockERC20(Currency.unwrap(key.currency1)).approve(address(seeder), type(uint256).max);
+        seeder.modifyPosition(
+            key,
+            ICLPoolManager.ModifyLiquidityParams({
+                tickLower: tickLower, tickUpper: tickUpper, liquidityDelta: int256(uint256(liquidity)), salt: bytes32(0)
+            }),
+            ""
+        );
     }
 
     function _seed(PoolKey memory key, uint256 amount) internal {
