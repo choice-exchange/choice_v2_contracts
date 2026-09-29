@@ -17,6 +17,7 @@ import {IPoolManager} from "infinity-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {CLPoolManagerRouter} from "infinity-core/test/pool-cl/helpers/CLPoolManagerRouter.sol";
 import {PoolId} from "infinity-core/src/types/PoolId.sol";
+import {TickMath} from "infinity-core/src/pool-cl/libraries/TickMath.sol";
 
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
@@ -36,6 +37,7 @@ contract BuybackBurnSinkTest is Test {
     address internal constant TIMELOCK = address(0x71E);
     address internal constant TREASURY = address(0x7EA);
     address internal constant STRANGER = address(0xBEEF);
+    address internal constant OPERATOR = address(0x0FE8);
 
     uint24 internal constant FEE = 10_000; // the launchpad's 1% graduation tier
     int24 internal constant SPACING = 200;
@@ -135,22 +137,24 @@ contract BuybackBurnSinkTest is Test {
         _seed(pool, 1_000_000 ether);
 
         // The graduation pool of a launch that is not the burn token: same 1% tier, same spacing, keyed
-        // to the guard hook. Deliberately thinner than the buyback pool - a graduate's seed is
-        // whatever its curve filled, not a market-made book.
+        // to the guard hook. As deep as the buyback pool since 1.7.0: a guard-hooked pool's
+        // sandwich bound is its LP fee times the launchpad's share (0.3% here), and these
+        // fixtures exist to prove ROUTING, so a 100-token conversion has to fit inside one window.
+        // The tests that are about the bound feed an oversized tranche on purpose.
         memePool = _graduationKey(meme, FEE);
-        _seed(memePool, 100_000 ether);
+        _seed(memePool, 1_000_000 ether);
         meme2Pool = _graduationKey(meme2, FEE);
-        _seed(meme2Pool, 100_000 ether);
+        _seed(meme2Pool, 1_000_000 ether);
 
         // And one on the tier launches graduated on BEFORE A0. Same hook, same spacing, one fee
         // field different - which is all it took to make A4's derived key miss it.
         stragglerPool = _graduationKey(straggler, OLD_FEE);
-        _seed(stragglerPool, 100_000 ether);
+        _seed(stragglerPool, 1_000_000 ether);
 
         // Launch 19's shape: the graduate trades against SAI, and SAI reaches wINJ through an
         // ordinary pool nobody's settler opened.
         saiLaunchPool = _pairKey(pre2e, sai, FEE);
-        _seed(saiLaunchPool, 100_000 ether);
+        _seed(saiLaunchPool, 1_000_000 ether);
         saiQuotePool = _key(sai, quote, FEE);
         _seed(saiQuotePool, 500_000 ether);
 
@@ -1002,40 +1006,43 @@ contract BuybackBurnSinkTest is Test {
     ///
     /// Measured on the pools themselves, either side of a conversion far too large to fill.
     function test_theImpactBoundIsSplitAcrossTheLegsRatherThanAppliedTwice() public {
+        // 20 bps, deliberately BELOW every pool's sandwich bound here (0.3% on a guard-hooked
+        // launch pool whose creator takes 7000, 1% on the hookless SAI route), so what binds is
+        // the setting and its split - the thing this test is about - and not the fee cap.
         vm.startPrank(TIMELOCK);
-        sink.setGuards(1 ether, 500, INTERVAL);
+        sink.setGuards(1 ether, 20, INTERVAL);
         sink.setQuoteRoute(Currency.wrap(address(sai)), saiQuotePool);
         vm.stopPrank();
 
-        // A one-leg conversion may walk its pool by the FULL 500 bps of sqrt price (250 either
-        // side of the halving `_priceLimit` does).
+        // A one-leg conversion may walk its pool by the FULL 20 bps of price: 10 bps, or 1,000
+        // pips, of sqrt price.
         uint160 memeBefore = _sqrtPrice(memePool);
         meme.mint(address(sink), 10_000_000 ether);
         sink.convert(Currency.wrap(address(meme)), MEME_LAUNCH);
-        uint256 oneLegMoveBps = _moveBps(memeBefore, _sqrtPrice(memePool));
+        uint256 oneLegMovePips = _movePips(memeBefore, _sqrtPrice(memePool));
 
-        // A two-leg conversion gets 250 bps per leg instead.
+        // A two-leg conversion gets half of that per leg instead.
         uint160 launchBefore = _sqrtPrice(saiLaunchPool);
         uint160 routeBefore = _sqrtPrice(saiQuotePool);
         pre2e.mint(address(sink), 10_000_000 ether);
         sink.convert(Currency.wrap(address(pre2e)), SAI_LAUNCH);
-        uint256 legOneMoveBps = _moveBps(launchBefore, _sqrtPrice(saiLaunchPool));
-        uint256 legTwoMoveBps = _moveBps(routeBefore, _sqrtPrice(saiQuotePool));
+        uint256 legOneMovePips = _movePips(launchBefore, _sqrtPrice(saiLaunchPool));
+        uint256 legTwoMovePips = _movePips(routeBefore, _sqrtPrice(saiQuotePool));
 
-        // `memePool` and `saiLaunchPool` are the same shape - same tier, same spacing, both
-        // seeded with 100,000 - and both are fed the same oversized tranche, so the two numbers
-        // are directly comparable. That comparison IS the claim: the same setting gives a leg of
-        // a two-leg route half of what it gives a one-leg conversion.
-        assertApproxEqAbs(oneLegMoveBps, 250, 1, "a one-leg conversion should walk to its full allowance");
-        assertApproxEqAbs(legOneMoveBps, 125, 1, "leg one of two should get half the allowance");
+        // `memePool` and `saiLaunchPool` are the same shape - same tier, same spacing, same seed -
+        // and both are fed the same oversized tranche, so the two numbers are directly
+        // comparable. That comparison IS the claim: the same setting gives a leg of a two-leg
+        // route half of what it gives a one-leg conversion.
+        assertApproxEqAbs(oneLegMovePips, 1000, 5, "a one-leg conversion should walk to its full allowance");
+        assertApproxEqAbs(legOneMovePips, 500, 5, "leg one of two should get half the allowance");
 
         // Leg two's share is a CEILING, not a target: leg one stopped at its own bound, so what
-        // reached the route pool was far too small to walk it 125 bps. What must hold is that it
-        // could not have gone further even if it were.
-        assertLe(legTwoMoveBps, 126, "leg two exceeded its share of the allowance");
+        // reached the route pool may be too small to walk it all the way. What must hold is that
+        // it could not have gone further even if it were.
+        assertLe(legTwoMovePips, 505, "leg two exceeded its share of the allowance");
         assertLe(
-            legOneMoveBps + legTwoMoveBps,
-            oneLegMoveBps + 1,
+            legOneMovePips + legTwoMovePips,
+            oneLegMovePips + 5,
             "two legs must not be allowed to move prices further in total than one"
         );
     }
@@ -1231,6 +1238,10 @@ contract BuybackBurnSinkTest is Test {
         sink.setHold(Currency.wrap(address(meme)), true);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
         sink.setMinConvertAmount(Currency.wrap(address(meme)), 1);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
+        sink.setOperator(STRANGER, 1);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, STRANGER));
+        sink.setMaxBuybackAmount(1);
         vm.stopPrank();
     }
 
@@ -1420,6 +1431,219 @@ contract BuybackBurnSinkTest is Test {
         assertEq(stray.balanceOf(address(fresh)), 100 ether, "it should park, not revert");
     }
 
+    // ── 1.7.0: the sandwich bound ─────────────────────────────────────────
+
+    /// 🔴 **The 2026-09-30 finding.** Anyone may call `buyback()`, and 1.6.0 bounded its impact
+    /// against the spot price in the SAME transaction. So one transaction could pump the pool,
+    /// call `buyback()`, and dump. A pump also raised what the sink was allowed to spend, so the
+    /// sink spent its whole backlog at the top. The fixture's own guard, 500 bps, is the setting
+    /// that was exploitable; this runs the attack at every pump size up to ~6x the pool's depth.
+    ///
+    /// Under 1.7.0 each buyback may move the price by at most the pool's unrecoverable fee, and
+    /// the attacker pays that fee twice to earn the move once. So it never pays.
+    function testFuzz_anAtomicSandwichOfThePublicBuybackNeverPays(uint96 rawPump) public {
+        uint256 pump = bound(uint256(rawPump), 1_000 ether, 3_000_000 ether);
+        // A backlog far larger than one window can spend: what the fallback path would face after
+        // an operator outage, and the balance that made 1.6.0 worth attacking.
+        quote.mint(address(sink), 200_000 ether);
+
+        quote.mint(address(this), pump);
+        uint256 quoteBefore = quote.balanceOf(address(this));
+        uint256 tokensBefore = burnToken.balanceOf(address(this));
+
+        bool buyZeroForOne = Currency.unwrap(pool.currency0) == address(quote);
+        uint256 bought = _attackerSwap(pool, buyZeroForOne, pump);
+        sink.buyback();
+        _attackerSwap(pool, !buyZeroForOne, bought);
+
+        assertEq(burnToken.balanceOf(address(this)), tokensBefore, "the attacker kept tokens");
+        assertLe(quote.balanceOf(address(this)), quoteBefore, "the sandwich paid");
+    }
+
+    /// The bound holds whatever `maxImpactBps` says. The fixture allows 500 bps; the pool's fee
+    /// is 1%, all of it unrecoverable on a hookless pool, so the move stops at 1% of price: 0.5%,
+    /// or 5,000 pips, of sqrt price. And the swap is sized to reach that limit rather than
+    /// offered the whole balance, so the rest is never put to the pool at all.
+    function test_theFeeCapBindsWhenTheGuardIsLooser() public {
+        uint160 before = _sqrtPrice(pool);
+        quote.mint(address(sink), 500_000 ether);
+
+        sink.buyback();
+
+        // Sized to land just SHORT of the limit (`_fillableInput` rounds down), and never past it.
+        uint256 moved = _movePips(before, _sqrtPrice(pool));
+        assertLe(moved, 5000, "the move went past the fee bound");
+        assertGe(moved, 4990, "the swap was sized well short of its limit");
+        assertGt(quote.balanceOf(address(sink)), 0, "the cap did not bind");
+    }
+
+    /// And a launch pool whose creator takes the WHOLE LP fee has nothing unrecoverable left, so
+    /// its creator could sandwich any nonzero bound. The bound is zero, the conversion parks as a
+    /// failed swap, and no window is spent.
+    function test_aLaunchPoolWhoseCreatorTakesTheWholeFeeNeverConverts() public {
+        MockERC20 greedy = new MockERC20("Greedy", "GREEDY", 18);
+        PoolKey memory greedyPool = _graduationKey(greedy, FEE);
+        _seed(greedyPool, 1_000_000 ether);
+        posm.setPool(9, greedyPool);
+        locker.registerWithShare(99, 9, 10_000);
+        greedy.mint(address(sink), 100 ether);
+
+        vm.expectEmit(true, false, false, true, address(sink));
+        emit BuybackBurnSink.Parked(Currency.wrap(address(greedy)), 100 ether, 3);
+        sink.convert(Currency.wrap(address(greedy)), 99);
+
+        assertEq(greedy.balanceOf(address(sink)), 100 ether, "the tranche moved");
+        assertEq(sink.lastConvertAt(Currency.wrap(address(greedy))), 0, "a refused swap spent the window");
+    }
+
+    /// What the operator's keeper reads to price a tranche: on a hookless 1% pool, the whole fee
+    /// is the pool manager's and all of it is unrecoverable.
+    function test_previewBuybackReportsTheOfferAndThePoolsFees() public {
+        quote.mint(address(sink), 50 ether);
+        vm.prank(TIMELOCK);
+        sink.setMaxBuybackAmount(20 ether);
+
+        (uint256 offer, uint160 sqrtPriceX96, uint128 liquidity, uint256 swapFee, uint256 hookFee, uint256 bound_) =
+            sink.previewBuyback();
+
+        assertEq(offer, 20 ether, "the offer ignores the tranche cap");
+        assertEq(sqrtPriceX96, _sqrtPrice(pool));
+        assertGt(liquidity, 0);
+        assertEq(swapFee, FEE);
+        assertEq(hookFee, 0);
+        assertEq(bound_, FEE);
+    }
+
+    // ── 1.7.0: the operator and the fallback ──────────────────────────────
+
+    function test_onlyTheOperatorRunsTheScheduledBuyback() public {
+        _appoint(6 hours);
+        quote.mint(address(sink), 100 ether);
+
+        vm.prank(STRANGER);
+        vm.expectRevert(abi.encodeWithSelector(BuybackBurnSink.NotOperator.selector, STRANGER));
+        sink.operatorBuyback(100 ether, 0);
+
+        vm.prank(OPERATOR);
+        (uint256 spent, uint256 received) = sink.operatorBuyback(100 ether, 0);
+        assertGt(spent, 0);
+        assertGt(received, 0);
+        assertEq(sink.lastOperatorBuybackAt(), block.timestamp);
+    }
+
+    /// While the operator is live the permissionless path PARKS (reason 7), because `harvest`
+    /// and the cranker both reach it and neither may revert. After `publicFallbackDelay` without
+    /// an operator fill it reopens: the burn never depends on the keeper staying up.
+    function test_aLiveOperatorHoldsThePublicBuybackUntilTheFallbackOpens() public {
+        _appoint(6 hours);
+        quote.mint(address(sink), 100 ether);
+
+        vm.expectEmit(true, false, false, true, address(sink));
+        emit BuybackBurnSink.Parked(Currency.wrap(address(quote)), 100 ether, 7);
+        sink.burn(Currency.wrap(address(quote)), 100 ether);
+        assertEq(quote.balanceOf(address(sink)), 100 ether, "the public path ran past a live operator");
+        assertFalse(sink.canBuyback());
+        assertEq(sink.publicBuybackOpensAt(), block.timestamp + 6 hours);
+
+        vm.warp(block.timestamp + 6 hours);
+        assertTrue(sink.canBuyback());
+        sink.buyback();
+        assertLt(quote.balanceOf(address(sink)), 100 ether, "the fallback did not reopen");
+    }
+
+    /// Only a real FILL moves the clock, so an operator that runs but never trades cannot hold the
+    /// fallback shut for ever.
+    function test_anOperatorFillRestartsTheFallbackClock() public {
+        _appoint(6 hours);
+        quote.mint(address(sink), 100 ether);
+
+        vm.warp(block.timestamp + 5 hours);
+        vm.prank(OPERATOR);
+        sink.operatorBuyback(10 ether, 0);
+
+        vm.warp(block.timestamp + 2 hours); // 7h since appointment, 2h since the fill
+        uint256 held = quote.balanceOf(address(sink));
+        sink.buyback();
+        assertEq(quote.balanceOf(address(sink)), held, "the fallback opened 2h after a fill");
+
+        vm.warp(block.timestamp + 4 hours);
+        sink.buyback();
+        assertLt(quote.balanceOf(address(sink)), held, "the fallback never reopened");
+    }
+
+    /// The operator's minimum is what refuses a spike, which no bound measured against spot can
+    /// do. A miss REVERTS, and nothing moves.
+    function test_theOperatorsMinimumRateRefusesABadPrice() public {
+        _appoint(6 hours);
+        quote.mint(address(sink), 100 ether);
+        uint256 supplyBefore = burnToken.totalSupply();
+
+        // The pool is 1:1, so two tokens per wINJ cannot be had.
+        vm.prank(OPERATOR);
+        vm.expectRevert();
+        sink.operatorBuyback(100 ether, 2e18);
+        assertEq(quote.balanceOf(address(sink)), 100 ether, "a refused buyback spent");
+        assertEq(burnToken.totalSupply(), supplyBefore);
+
+        // 0.95 per wINJ allows the 1% fee and the price walk, and it holds.
+        vm.prank(OPERATOR);
+        (uint256 spent, uint256 received) = sink.operatorBuyback(100 ether, 0.95e18);
+        assertGe(received * 1e18, spent * 0.95e18, "the minimum was not enforced");
+    }
+
+    /// 🔑 A stolen operator key buys nothing: the operator is held to the same fee bound as
+    /// everyone, so it cannot move the pool far enough to profit from sandwiching its own call.
+    function test_theOperatorIsHeldToTheSameFeeBound() public {
+        _appoint(6 hours);
+        vm.prank(TIMELOCK);
+        sink.setGuards(1 ether, 5000, INTERVAL); // 50%: as loose as the owner could make it
+        uint160 before = _sqrtPrice(pool);
+        quote.mint(address(sink), 500_000 ether);
+
+        vm.prank(OPERATOR);
+        sink.operatorBuyback(type(uint256).max, 0);
+
+        assertLe(_movePips(before, _sqrtPrice(pool)), 5005, "the operator moved the pool past the fee");
+    }
+
+    /// The TWAP tranche binds both paths, so no single call commits the whole backlog.
+    function test_theTrancheCapBoundsBothPaths() public {
+        vm.prank(TIMELOCK);
+        sink.setMaxBuybackAmount(10 ether);
+        quote.mint(address(sink), 100 ether);
+
+        sink.buyback();
+        assertEq(quote.balanceOf(address(sink)), 90 ether, "the public path spent past the tranche");
+
+        _appoint(6 hours);
+        vm.prank(OPERATOR);
+        (uint256 spent,) = sink.operatorBuyback(type(uint256).max, 0);
+        assertEq(spent, 10 ether, "the operator spent past the tranche");
+    }
+
+    function _appoint(uint32 delay) internal {
+        vm.prank(TIMELOCK);
+        sink.setOperator(OPERATOR, delay);
+    }
+
+    /// The attacker is this test contract, trading through the seeder router at no price limit.
+    function _attackerSwap(PoolKey memory key, bool zeroForOne, uint256 amountIn) internal returns (uint256 received) {
+        Currency output = zeroForOne ? key.currency1 : key.currency0;
+        MockERC20 out = MockERC20(Currency.unwrap(output));
+        uint256 before = out.balanceOf(address(this));
+        seeder.swap(
+            key,
+            ICLPoolManager.SwapParams({
+                zeroForOne: zeroForOne,
+                amountSpecified: -int256(amountIn),
+                sqrtPriceLimitX96: zeroForOne ? TickMath.MIN_SQRT_RATIO + 1 : TickMath.MAX_SQRT_RATIO - 1
+            }),
+            CLPoolManagerRouter.SwapTestSettings({withdrawTokens: true, settleUsingTransfer: true}),
+            ""
+        );
+        received = out.balanceOf(address(this)) - before;
+    }
+
     function _key(MockERC20 a, MockERC20 b, uint24 fee) internal view returns (PoolKey memory) {
         (address c0, address c1) = address(a) < address(b) ? (address(a), address(b)) : (address(b), address(a));
         return PoolKey({
@@ -1494,6 +1718,13 @@ contract BuybackBurnSinkTest is Test {
 
     function _sqrtPrice(PoolKey memory key) internal view returns (uint160 sqrtPriceX96) {
         (sqrtPriceX96,,,) = manager.getSlot0(key.toId());
+    }
+
+    /// How far a pool's sqrt price moved, in pips (1e-6), either direction. The 1.7.0 bounds are
+    /// fractions of a percent, below what whole basis points can resolve.
+    function _movePips(uint160 before, uint160 present) internal pure returns (uint256) {
+        uint256 diff = present > before ? present - before : before - present;
+        return diff * 1_000_000 / uint256(before);
     }
 
     /// How far a pool's sqrt price moved, in basis points, either direction.

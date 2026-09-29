@@ -103,7 +103,7 @@ contract DeployBuybackBurnSink is BaseScript {
         requireCode("clPositionManager", positionManager);
 
         address sink = factory.computeAddress(SINK_SALT);
-        console.log("BuybackBurnSink 1.5.0 ->", sink);
+        console.log("BuybackBurnSink 1.7.0 (salt 1.5.0) ->", sink);
 
         if (sink.code.length == 0) {
             bytes memory payload = _sinkPayload(burnToken, quote, vault, positionManager, treasury, timelock);
@@ -124,12 +124,14 @@ contract DeployBuybackBurnSink is BaseScript {
         writeAddress("choice.buybackBurnSink", sink);
 
         console.log("");
-        console.log("What still has to happen. The sink PARKS everything until all three land,");
+        console.log("What still has to happen. The sink PARKS everything until these land,");
         console.log("so none of it is optional and none of it can brick a harvest either.");
         console.log("");
 
         _requireLockers(sink);
         _requireGuards(sink);
+        _requireTranche(sink);
+        _requireOperator(sink);
         _requireBuybackPool(sink);
         _reportQuoteRoutes(sink);
 
@@ -286,6 +288,18 @@ contract DeployBuybackBurnSink is BaseScript {
 
     /// @dev Until `setGuards` is called `maxImpactBps` is 0, which truncates to a price limit the
     /// pool refuses - so every swap parks. `minBuybackInterval` of 0 is refused outright.
+    ///
+    /// 🔴 The values below are the plan-B4 mainnet SHAPE, not a measurement. 1.7.0 caps every leg's
+    /// move at the pool's unrecoverable fee, so `maxImpactBps` is now only an upper bound on top
+    /// of that. Anything at or above the fee is simply the fee. 100 bps (1%) is at or above the
+    /// fee on every pool the sink can reach today. The `(1e12, 500, 60)` this printed until
+    /// 2026-09-30 were TESTNET values, and 500 was the setting the review showed was exploitable
+    /// under 1.6.0.
+    ///
+    /// - `minBuybackAmount` 0.5 wINJ: below it a swap costs more in gas than it moves.
+    /// - `maxImpactBps` 100: see above.
+    /// - `minBuybackInterval` 300 s: this now paces only the permissionless FALLBACK. The
+    ///   operator's schedule is the real cadence, and neither path can profitably be sandwiched.
     function _requireGuards(address sink) internal {
         if (BuybackBurnSink(payable(sink)).maxImpactBps() != 0) {
             console.log("  [ok]   buybackBurnSink.setGuards");
@@ -293,16 +307,49 @@ contract DeployBuybackBurnSink is BaseScript {
         }
         outstanding++;
         console.log("  [TODO] the guards are unset, so every buyback and every conversion parks");
-        console.log("           TEST values below - see the launchpad tokenomics before mainnet");
-        // 🔴 `minBuybackAmount` is 1e12, not the 1e15 this printed until 2026-09-10. 1e15 was
-        // copied from sink 1.1.0 and it GATES EVERY REAL TESTNET CRANK: a graduate's accrued LP
-        // fee here is tens of MICRO-wINJ, so a buyback below 1e15 parks and the loop proves
-        // nothing. The live sink was lowered to 1e12 on 2026-09-06 and the address book records
-        // that, but this payload kept printing the number the operator had already rejected -
-        // so following the script exactly was the one way to configure a sink that never burns.
-        // ⛔ 1e12 is a TESTNET value chosen to make a session's volume visible. Do NOT carry it
-        // to mainnet; size it against measured depth after the burn token graduates (plan B4).
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (1e12, 500, 60)));
+        console.log("           plan-B4 shape below - re-size minBuybackAmount against the graduated pool");
+        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (0.5e18, 100, 300)));
+    }
+
+    /// @dev The TWAP tranche: at most this much `QUOTE` per buyback, on either path. Optional in
+    /// the sense that zero is legal (no cap), but a deploy should say so on purpose.
+    ///
+    /// 25 wINJ is about 1% of a 2,500 wINJ graduation raise. With the fee cap binding on the
+    /// burn pool, one buyback spends only a few wINJ anyway, so this bites only once the pool is
+    /// much deeper than at graduation - which is exactly when a whole backlog could otherwise go
+    /// in one call.
+    function _requireTranche(address sink) internal {
+        if (BuybackBurnSink(payable(sink)).maxBuybackAmount() != 0) {
+            console.log("  [ok]   buybackBurnSink.setMaxBuybackAmount");
+            return;
+        }
+        outstanding++;
+        console.log("  [TODO] no tranche cap: one buyback may offer the whole backlog");
+        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setMaxBuybackAmount, (25e18)));
+    }
+
+    /// @dev The key that runs the scheduled TWAP buyback, from `launchpad.buybackOperator` in the
+    /// address book. Without one the permissionless path is always open - safe under the fee cap,
+    /// but it buys whenever somebody calls, spikes included.
+    ///
+    /// Six hours of operator silence reopens the public path. That is long enough that a keeper
+    /// restart never hands the schedule to whoever calls first, and short enough that a dead
+    /// keeper costs the burn an afternoon, not a week.
+    function _requireOperator(address sink) internal {
+        address wanted = readAddressOrZero("launchpad.buybackOperator");
+        address installed = BuybackBurnSink(payable(sink)).operator();
+        if (wanted != address(0) && installed == wanted) {
+            console.log("  [ok]   buybackBurnSink.setOperator", installed);
+            return;
+        }
+        outstanding++;
+        if (wanted == address(0)) {
+            console.log("  [TODO] no operator in the address book (launchpad.buybackOperator)");
+            console.log("           generate a keystore key for the keeper, record it, re-run");
+            return;
+        }
+        console.log("  [TODO] the operator is not installed:", wanted);
+        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setOperator, (wanted, 6 hours)));
     }
 
     /// @dev The one pool the sink cannot be told about by a caller: the buyback's own.
