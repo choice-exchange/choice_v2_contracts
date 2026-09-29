@@ -13,14 +13,55 @@ import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 import {FullMath} from "infinity-core/src/pool-cl/libraries/FullMath.sol";
+import {SqrtPriceMath} from "infinity-core/src/pool-cl/libraries/SqrtPriceMath.sol";
+import {ProtocolFeeLibrary} from "infinity-core/src/libraries/ProtocolFeeLibrary.sol";
+import {PoolId} from "infinity-core/src/types/PoolId.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
 import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
+/// @notice The two views a fee-charging hook exposes: what a pool keyed to it charges, in pips,
+/// and how much of that goes to the launch's creator. `LaunchPoolFeeHook` answers both. A hook
+/// without them (`LaunchPoolGuardHook`) charges no hook fee.
+interface ILaunchPoolFee {
+    function poolFeePips(PoolId poolId) external view returns (uint24);
+    function poolInfo(PoolId poolId)
+        external
+        view
+        returns (bool registered, uint256 launchId, Currency quote, uint16 creatorBps);
+}
+
 /// @title BuybackBurnSink
 /// @notice Burn sink C: turn protocol revenue into the launchpad token and destroy it.
+///
+/// **VERSION 1.7.0** - three changes from the 2026-09-30 review, all before any mainnet deploy.
+///
+/// 1. **Every swap leg's impact is capped at that pool's own fee, on every path.** 1.6.0 measured
+///    `maxImpactBps` against the spot price in the same transaction, and `buyback()` is
+///    permissionless - so anyone could pump the pool, call `buyback()` and dump, in ONE
+///    transaction. A pump also deepens the pool, which raises what the sink is allowed to spend,
+///    so the sink ended up spending its whole balance at the top. Simulated on a ~2,400 wINJ
+///    graduation pool holding a 353 wINJ backlog, a 500 bps setting let the attacker net ~202
+///    wINJ while the sink got ~97% fewer tokens per wINJ. The rate limit did NOT make that
+///    unprofitable, whatever 1.6.0's `_priceLimit` comment said; it only bounded how often.
+///    The attacker pays the pool's fee twice and earns the sink's price move once, so the
+///    sandwich breaks even at a move of about 2x the fee. The cap is 1x, which leaves a 2x
+///    margin. Only the fee the attacker cannot get back counts, because a launch pool pays most
+///    of its fee to that launch's creator. See `_legFees` and `lockAcquired`.
+/// 2. **A swap asks only for what it can fill.** A graduation pool charges its fee through
+///    `LaunchPoolFeeHook`, on the GROSS quote a buyer specifies and in `beforeSwap`, before the
+///    pool has swapped anything. So a price-limited buyback of the whole balance paid the fee on
+///    all of it and filled only a sliver. Each leg is now sized to the input that reaches its own
+///    price limit (`_fillableInput`), and the rest stays here for the next window at no cost.
+/// 3. **An operator runs the buyback on a schedule, and the public path is a liveness fallback.**
+///    `operatorBuyback` carries a minimum output rate the operator prices off its own TWAP, so it
+///    also refuses to buy a spike, which no cap measured against spot can do. While the operator
+///    is live, the permissionless buyback parks (reason 7). Once the operator has not bought for
+///    `publicFallbackDelay`, it reopens, so the burn never depends on a keeper staying up. The
+///    fee cap above binds the operator too, so a compromised operator key cannot profit from
+///    sandwiching the sink either. It can only hold off a buyback, and the fallback caps how long.
 ///
 /// **VERSION 1.6.0** - quote hops are REGISTERED ONLY. 1.5.0 DERIVED one when nothing was
 /// registered, taking the deepest initialised hookless `{asset, QUOTE}` pool across five standard
@@ -28,7 +69,7 @@ import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 /// pool anybody can open and price, and the sink swapped its whole balance through it. Found by
 /// the 2026-09-16 security review, HIGH, fixed before any mainnet deploy. See `_hopFor`.
 ///
-/// ⛔ **1.6.0 SHIPS UNDER THE `1.5.0` CREATE3 SALT ON MAINNET, DELIBERATELY.** A CREATE3 salt is
+/// ⛔ **1.6.0 AND LATER SHIP UNDER THE `1.5.0` CREATE3 SALT ON MAINNET, DELIBERATELY.** A CREATE3 salt is
 /// an ADDRESS, not a version: `keccak256("CHOICE-V2/BuybackBurnSink/1.5.0")` predicts
 /// `0x65Dc46Ee554A27bC790710f9fAee74B427c1C57D`, which the live `LaunchPoolFeeHook.treasury()` and
 /// `PositionLocker.launchpadTreasury()` BOTH already point at and which already holds accrued wINJ.
@@ -169,8 +210,18 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     using CurrencyLibrary for Currency;
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
+    using ProtocolFeeLibrary for uint24;
+    using ProtocolFeeLibrary for uint16;
 
     uint16 public constant BPS_DENOMINATOR = 10_000;
+
+    /// @dev The pool manager's fee unit: 1,000,000 pips is 100%.
+    uint256 internal constant PIPS_DENOMINATOR = 1_000_000;
+    uint256 internal constant PIPS_PER_BPS = 100;
+
+    /// @dev Above this a hook's reported fee is not believed: 50%. Well past the 10% any launch
+    /// pool can charge, and low enough that `1 - fee` never reaches zero in `_fillableInput`.
+    uint256 internal constant MAX_HOOK_FEE_PIPS = 500_000;
 
     /// @notice Smallest `maxImpactBps` that describes a real price bound.
     /// @dev `_priceLimit` halves the setting, so 0 and 1 both truncate to a limit equal to the
@@ -183,6 +234,10 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// again - and a setting of 2 or 3 would give the second leg a limit equal to its pool's
     /// own price, which no swap can cross. Doubling the floor keeps "the smallest number that
     /// is still a bound" true for the longest route this contract can build.
+    ///
+    /// ⚠️ 1.7.0 carries the allowance in pips, so these settings no longer truncate to zero. The
+    /// floor stays anyway: a guard of a few bps is not a policy anybody means. And the bound that
+    /// actually binds is now usually the pool's fee, not this setting.
     uint16 public constant MIN_IMPACT_BPS = 4;
 
     /// @notice Ceiling on how many position lockers `setLockers` will hold.
@@ -255,6 +310,29 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
     /// @notice When the last buyback ran.
     uint64 public lastBuybackAt;
+
+    /// @notice Most `QUOTE` one buyback may offer, on either path. Zero means no cap.
+    /// @dev The impact cap already bounds what a buyback can MOVE; this bounds what it can
+    /// SPEND, so one call never commits the whole backlog. That matters because spend grows with
+    /// depth: whoever deepens the pool right before a buyback also raises what the impact cap
+    /// allows. It is the TWAP's tranche size.
+    uint256 public maxBuybackAmount;
+
+    /// @notice The key that runs scheduled buybacks through `operatorBuyback`. Zero means none,
+    /// and then the permissionless path is always open, exactly as before 1.7.0.
+    address public operator;
+
+    /// @notice How long the operator may go without buying before the permissionless path
+    /// reopens. The liveness fallback: the burn never depends on a keeper staying up.
+    uint32 public publicFallbackDelay;
+
+    /// @notice When `operator` was last set. The fallback clock starts here, so a newly
+    /// appointed operator is not bypassed before it has had a chance to run.
+    uint64 public operatorSince;
+
+    /// @notice When the operator last bought anything. Only a real fill counts, so an operator
+    /// that runs but never trades cannot hold the fallback shut.
+    uint64 public lastOperatorBuybackAt;
 
     /// @notice The `PositionLocker`s a conversion may read a graduate's pool key out of.
     ///
@@ -370,6 +448,14 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     error DuplicateLocker(address locker);
     error LockerHasAnotherPositionManager(address locker);
     error RouteMissingLeg(Currency asset);
+    error NotOperator(address caller);
+    error NoBuybackPool();
+    error NothingToBuyBack();
+    /// @dev Raised inside the lock when the pool has no liquidity between spot and the limit, so
+    /// the leg could not fill at all. It unwinds the lock, and on the permissionless path the
+    /// `try` turns that into a park that spends no rate-limit window.
+    error NothingFillable();
+    error BelowMinimumRate(uint256 spent, uint256 received, uint256 minOutPerInWad);
 
     /// @param quoteSpent quote actually consumed; may be less than offered if the limit bound.
     event BoughtBack(uint256 quoteOffered, uint256 quoteSpent, uint256 tokensReceived);
@@ -381,8 +467,10 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// route, 3 = the swap itself reverted, 4 = the burn/treasury settle reverted, 5 = held by
     /// policy (D32), 6 = a launch token reached `burn`, which carries no launch id to look its
     /// pool up by - `convert(currency, launchId)` is what moves it. Funds stay here in every
-    /// case.
+    /// case. 7 = the operator is live and the permissionless buyback waits for it (1.7.0).
     event Parked(Currency indexed currency, uint256 amount, uint8 reason);
+    event OperatorUpdated(address operator, uint32 publicFallbackDelay);
+    event MaxBuybackAmountUpdated(uint256 maxBuybackAmount);
     event BurnBpsUpdated(uint16 oldBps, uint16 newBps);
     event TreasuryUpdated(address oldTreasury, address newTreasury);
     event BuybackPoolUpdated(PoolKey key, bool quoteIsCurrency0);
@@ -404,6 +492,11 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         bool secondZeroForOne;
         /// @dev 0 = no route, 1 = straight to `QUOTE`, 2 = through a registered quote route.
         uint8 legs;
+        /// @dev 1.7.0. The share of the FIRST leg's LP fee that is paid to a launch's creator, in
+        /// bps: read off the locked position when that leg is a launch's own graduation pool,
+        /// and 10000 (assume all of it) otherwise. It feeds the sandwich bound in `_legFees`,
+        /// because a creator gets that share of their own LP fee back.
+        uint16 firstLpCreatorBps;
     }
 
     uint8 private constant PARK_BELOW_MINIMUM = 0;
@@ -413,6 +506,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     uint8 private constant PARK_SETTLE_FAILED = 4;
     uint8 private constant PARK_HELD = 5;
     uint8 private constant PARK_NEEDS_HINT = 6;
+    uint8 private constant PARK_OPERATOR_MANAGED = 7;
 
     constructor(
         IBurnableERC20 _burnToken,
@@ -484,6 +578,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             bool ok;
             (r.first, r.firstZeroForOne, ok) = _hopFor(currency);
             r.legs = ok ? 1 : 0;
+            r.firstLpCreatorBps = BPS_DENOMINATOR;
             _tryConvert(currency, r);
         } else {
             // A launch token. It PARKS here, and that is a deliberate consequence of A5.
@@ -511,6 +606,58 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @dev For keepers, and for draining a balance parked by an earlier guard.
     function buyback() external nonReentrant {
         _tryBuyback();
+    }
+
+    /// @notice The scheduled buyback: one TWAP tranche, refused unless it beats the operator's
+    /// minimum rate.
+    /// @param maxQuoteIn Most `QUOTE` to offer. Clamped to the balance and to `maxBuybackAmount`,
+    /// and inside the lock to what reaches the impact cap. So this is a ceiling, not an order size.
+    /// @param minOutPerInWad Least `BURN_TOKEN` per `QUOTE`, both in raw units, scaled by 1e18.
+    /// The operator prices it off a TWAP it keeps itself. Zero skips the check, which leaves this
+    /// exactly as safe as `buyback()` and no safer.
+    /// @return spent `QUOTE` actually consumed, fee included.
+    /// @return received `BURN_TOKEN` bought, before the burn/treasury split.
+    ///
+    /// @dev Unlike every permissionless path, this one REVERTS on failure, with a named error.
+    /// Nothing depends on it not reverting: it is not on the harvest path, and a caller who priced
+    /// its minimum wrong should find out from the error, not from a `Parked` event.
+    ///
+    /// No rate limit, because the operator's schedule IS the rate limit, and the fee cap makes
+    /// every sandwich of a single buyback unprofitable however often one runs. A fill does start
+    /// the permissionless window as well (`lastBuybackAt`), so the two paths never double up.
+    ///
+    /// 🔑 **What an operator key can and cannot do.** It chooses when and how much, within the
+    /// same caps as anyone, and it can refuse a price. It cannot move a token anywhere but into
+    /// the burn, and the per-leg fee cap means it cannot profitably sandwich its own call. So a
+    /// stolen key is worth nothing to the thief. The most it can do is stall buybacks, and only
+    /// until `publicFallbackDelay` reopens the public path.
+    function operatorBuyback(uint256 maxQuoteIn, uint256 minOutPerInWad)
+        external
+        nonReentrant
+        returns (uint256 spent, uint256 received)
+    {
+        if (msg.sender != operator) revert NotOperator(msg.sender);
+        if (address(buybackPool.poolManager) == address(0)) revert NoBuybackPool();
+        uint256 amountIn = _tranche(maxQuoteIn);
+        if (amountIn == 0) revert NothingToBuyBack();
+
+        uint256 quoteBefore = QUOTE.balanceOfSelf();
+        uint256 tokensBefore = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
+
+        // No `try`: a failure here is the operator's to see. The flag is cleared on the way out,
+        // and a revert takes the `tstore` with it.
+        _setLockOpen(true);
+        VAULT.lock(abi.encode(_buybackRoute(), amountIn, minOutPerInWad));
+        _setLockOpen(false);
+
+        spent = quoteBefore - QUOTE.balanceOfSelf();
+        received = IERC20(address(BURN_TOKEN)).balanceOf(address(this)) - tokensBefore;
+
+        lastBuybackAt = uint64(block.timestamp);
+        lastOperatorBuybackAt = uint64(block.timestamp);
+        emit BoughtBack(amountIn, spent, received);
+
+        _settleBurnToken();
     }
 
     /// @notice Convert a parked launch token to `QUOTE` now, and buy back with the proceeds.
@@ -558,23 +705,30 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     // -------------------------------------------------------------------------------------
 
     function _tryBuyback() private {
-        uint256 amountIn = QUOTE.balanceOfSelf();
-        if (amountIn < minBuybackAmount || amountIn == 0) {
-            emit Parked(QUOTE, amountIn, PARK_BELOW_MINIMUM);
+        uint256 balance = QUOTE.balanceOfSelf();
+        if (balance < minBuybackAmount || balance == 0) {
+            emit Parked(QUOTE, balance, PARK_BELOW_MINIMUM);
             return;
         }
+        // 1.7.0: while an operator is live, the permissionless buyback leaves the schedule to it.
+        // Parked, never reverted, because `harvest` and the cranker both land here.
+        if (_operatorHolds()) {
+            emit Parked(QUOTE, balance, PARK_OPERATOR_MANAGED);
+            return;
+        }
+        uint256 amountIn = _tranche(type(uint256).max);
         // `lastBuybackAt == 0` means NEVER RUN, not "ran at the epoch". Without the first
         // clause a fresh deployment refuses its own first buyback whenever the chain's
         // timestamp is below `minBuybackInterval` - which production never is, but resting the
         // gate on "unix time is a big number" is an assumption, not a guarantee.
         if (lastBuybackAt != 0 && block.timestamp < uint256(lastBuybackAt) + minBuybackInterval) {
-            emit Parked(QUOTE, amountIn, PARK_RATE_LIMITED);
+            emit Parked(QUOTE, balance, PARK_RATE_LIMITED);
             return;
         }
         // A pool that was never configured has a zero `poolManager`, which would revert inside
         // the lock. Park instead, so an unconfigured sink still cannot brick a harvest.
         if (address(buybackPool.poolManager) == address(0)) {
-            emit Parked(QUOTE, amountIn, PARK_NO_ROUTE);
+            emit Parked(QUOTE, balance, PARK_NO_ROUTE);
             return;
         }
 
@@ -586,11 +740,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // else's - reverts the sub-call and lands here instead of unwinding the harvest.
         bool swapped;
         _setLockOpen(true);
-        Route memory route;
-        route.first = buybackPool;
-        route.firstZeroForOne = quoteIsCurrency0;
-        route.legs = 1;
-        try VAULT.lock(abi.encode(route, amountIn)) returns (bytes memory) {
+        try VAULT.lock(abi.encode(_buybackRoute(), amountIn, uint256(0))) returns (bytes memory) {
             swapped = true;
         } catch {
             swapped = false;
@@ -613,10 +763,42 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         lastBuybackAt = uint64(block.timestamp);
 
         uint256 received = IERC20(address(BURN_TOKEN)).balanceOf(address(this)) - tokensBefore;
-        uint256 spent = amountIn - QUOTE.balanceOfSelf();
+        // Off the balance, not off `amountIn`: the lock may have spent less than it was offered
+        // (sized to the impact cap), and what it left is simply still here.
+        uint256 spent = balance - QUOTE.balanceOfSelf();
         emit BoughtBack(amountIn, spent, received);
 
         _settleBurnToken();
+    }
+
+    /// @dev The one-leg route every buyback takes: `QUOTE` in, `BURN_TOKEN` out, through the
+    /// owner-named pool.
+    function _buybackRoute() private view returns (Route memory route) {
+        route.first = buybackPool;
+        route.firstZeroForOne = quoteIsCurrency0;
+        route.legs = 1;
+        // The buyback pool is the burn token's own graduation pool, and nothing here says what its
+        // locked position pays the creator. So any LP fee on it is assumed to go back to a trader.
+        // On a fee-hook graduation pool the LP fee is zero, and the hook's own share is read in
+        // `_legFees`.
+        route.firstLpCreatorBps = BPS_DENOMINATOR;
+    }
+
+    /// @dev What one buyback may offer: the balance, clamped by the caller's ceiling and by
+    /// `maxBuybackAmount`. The lock may still spend less. It sizes the swap to the impact cap.
+    function _tranche(uint256 ceiling) private view returns (uint256 amountIn) {
+        amountIn = QUOTE.balanceOfSelf();
+        if (ceiling < amountIn) amountIn = ceiling;
+        uint256 cap = maxBuybackAmount;
+        if (cap != 0 && cap < amountIn) amountIn = cap;
+    }
+
+    /// @dev Whether a live operator is holding the permissionless buyback shut. It holds for
+    /// `publicFallbackDelay` after whichever came last: its appointment or its last real fill.
+    function _operatorHolds() private view returns (bool) {
+        if (operator == address(0)) return false;
+        uint256 since = lastOperatorBuybackAt > operatorSince ? lastOperatorBuybackAt : operatorSince;
+        return block.timestamp < since + publicFallbackDelay;
     }
 
     // -------------------------------------------------------------------------------------
@@ -669,7 +851,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // returndata, so a pre-flight existence check is itself a way to revert.
         bool swapped;
         _setLockOpen(true);
-        try VAULT.lock(abi.encode(route, amountIn)) returns (bytes memory) {
+        try VAULT.lock(abi.encode(route, amountIn, uint256(0))) returns (bytes memory) {
             swapped = true;
         } catch {
             swapped = false;
@@ -715,12 +897,14 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// step 1, but the other side is the launch token, which is not `QUOTE` and has no route -
     /// so step 1 declines, and step 3 sells it through the route the owner registered instead.
     function _resolveRoute(Currency currency, uint256 launchId) internal view returns (Route memory route) {
-        (PoolKey memory launchKey, bool zeroForOne, bool found) = _launchPoolFor(currency, launchId);
+        route.firstLpCreatorBps = BPS_DENOMINATOR;
+        (PoolKey memory launchKey, bool zeroForOne, bool found, uint16 creatorBps) = _launchPoolFor(currency, launchId);
         if (found) {
             Currency other = zeroForOne ? launchKey.currency1 : launchKey.currency0;
             if (other == QUOTE) {
                 route.first = launchKey;
                 route.firstZeroForOne = zeroForOne;
+                route.firstLpCreatorBps = creatorBps;
                 route.legs = 1;
                 return route;
             }
@@ -728,6 +912,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             if (hopFound) {
                 route.first = launchKey;
                 route.firstZeroForOne = zeroForOne;
+                route.firstLpCreatorBps = creatorBps;
                 route.second = hop;
                 route.secondZeroForOne = hopZeroForOne;
                 route.legs = 2;
@@ -801,19 +986,21 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @return zeroForOne True when `currency` is that pool's `currency0`, i.e. selling 0 -> 1.
     /// @return found False when no locker knows the launch, or when the pool it names does not
     /// hold this currency at all.
+    /// @return creatorBps The creator's share of that position's LP fee, as the locker recorded it
+    /// at graduation. The sandwich bound needs it: see `_legFees`.
     function _launchPoolFor(Currency currency, uint256 launchId)
         private
         view
-        returns (PoolKey memory key, bool zeroForOne, bool found)
+        returns (PoolKey memory key, bool zeroForOne, bool found, uint16 creatorBps)
     {
         address[] memory set = _lockers;
         for (uint256 i; i < set.length; ++i) {
-            uint256 tokenId = ILaunchPositionLocker(set[i]).getPosition(launchId).tokenId;
-            if (tokenId == 0) continue;
+            ILaunchPositionLocker.LockedPosition memory position = ILaunchPositionLocker(set[i]).getPosition(launchId);
+            if (position.tokenId == 0) continue;
 
-            (PoolKey memory held,) = POSITION_MANAGER.getPoolAndPositionInfo(tokenId);
-            if (held.currency0 == currency) return (held, true, true);
-            if (held.currency1 == currency) return (held, false, true);
+            (PoolKey memory held,) = POSITION_MANAGER.getPoolAndPositionInfo(position.tokenId);
+            if (held.currency0 == currency) return (held, true, true, position.creatorBps);
+            if (held.currency1 == currency) return (held, false, true, position.creatorBps);
         }
     }
 
@@ -832,7 +1019,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // The ROUTE travels with the call. Every path this contract opens - a buyback, a
         // one-leg conversion, a two-leg conversion through a registered quote route - is the
         // same shape, so they share one callback rather than one each.
-        (Route memory route, uint256 amountIn) = abi.decode(data, (Route, uint256));
+        (Route memory route, uint256 amountIn, uint256 minOutPerInWad) = abi.decode(data, (Route, uint256, uint256));
 
         // 🔑 ONE COMPOSITE BOUND, split across the legs, rather than one bound per leg.
         //
@@ -846,29 +1033,64 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // ⚠️ It is a bound on IMPACT, not on realised price: the swap fee sits on top of it on
         // every leg, so a two-leg conversion pays two pools' fees. That is a cost of the route,
         // not something a price limit can express, and `minConvertAmount` is the lever for it.
-        uint16 perLeg = maxImpactBps / route.legs;
+        //
+        // 1.7.0 carries the allowance in pips rather than bps, so a leg's share and the fee cap
+        // below are compared in the unit the pool itself uses.
+        uint256 perLegPips = uint256(maxImpactBps) * PIPS_PER_BPS / route.legs;
 
         uint256 amount = amountIn;
         for (uint8 i; i < route.legs; ++i) {
             PoolKey memory key = i == 0 ? route.first : route.second;
             bool zeroForOne = i == 0 ? route.firstZeroForOne : route.secondZeroForOne;
+            PoolId id = key.toId();
+            ICLPoolManager manager = ICLPoolManager(address(key.poolManager));
 
             // Read inside the lock rather than passed in, so a `getSlot0` that reverts - an
             // uninitialised pool reached despite `setBuybackPool`'s check, or a route pool that
             // has since been closed - is caught by the caller's `try/catch` along with
             // everything else, instead of escaping it.
-            ICLPoolManager(address(key.poolManager))
-                .swap(
-                    key,
-                    ICLPoolManager.SwapParams({
-                        zeroForOne: zeroForOne,
-                        // Negative is exact-input. The pool consumes up to this much and stops
-                        // at the limit, so a partial fill is the expected outcome, not an error.
-                        amountSpecified: -amount.toInt256(),
-                        sqrtPriceLimitX96: _priceLimit(key, zeroForOne, perLeg)
-                    }),
-                    ""
-                );
+            (uint160 sqrtPriceX96,, uint24 protocolFee, uint24 lpFee) = manager.getSlot0(id);
+            (uint256 swapFeePips, uint256 hookFeePips, uint256 unrecoverablePips) =
+                _legFees(key, id, zeroForOne, protocolFee, lpFee, i == 0 ? route.firstLpCreatorBps : BPS_DENOMINATOR);
+
+            // 🔴 THE SANDWICH BOUND (1.7.0). Whoever triggers this swap can move the pool first
+            // and move it back after. That pays this pool's fee twice and earns this leg's price
+            // move once, so it breaks even at a move of about 2x the fee the attacker cannot get
+            // back. Capping the move at 1x that fee leaves a 2x margin, and it holds on every
+            // path, whoever calls and however big the balance is. `_legFees` says why only the
+            // UNRECOVERABLE fee counts.
+            uint256 legPips = perLegPips < unrecoverablePips ? perLegPips : unrecoverablePips;
+            uint160 limit = _priceLimit(sqrtPriceX96, zeroForOne, legPips);
+
+            // Ask only for what reaches the limit. A graduation pool's fee hook charges on the
+            // quote a buyer SPECIFIES, before the pool swaps, so an exact-input swap that the
+            // limit cuts short would still pay the fee on the whole request. Sized here, the
+            // swap normally fills in full, and whatever was not asked for simply stays in this
+            // contract for the next window.
+            uint256 fillable =
+                _fillableInput(manager.getLiquidity(id), sqrtPriceX96, limit, zeroForOne, swapFeePips, hookFeePips);
+            if (fillable < amount) amount = fillable;
+            if (amount == 0) {
+                // Nothing between spot and the limit, or a limit equal to spot because the
+                // pool's unrecoverable fee rounds to nothing. On the first leg that is a failed
+                // swap, so the caller parks it and spends no window. On the second leg the
+                // intermediate is taken below as a real balance, as a partial fill always was.
+                if (i == 0) revert NothingFillable();
+                break;
+            }
+
+            manager.swap(
+                key,
+                ICLPoolManager.SwapParams({
+                    zeroForOne: zeroForOne,
+                    // Negative is exact-input. Sized to the limit above, so a partial fill is
+                    // now the exception (liquidity ending between spot and the limit), not the
+                    // rule.
+                    amountSpecified: -amount.toInt256(),
+                    sqrtPriceLimitX96: limit
+                }),
+                ""
+            );
 
             if (i + 1 == route.legs) break;
 
@@ -883,6 +1105,9 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             // forge-lint: disable-next-line(unsafe-typecast) - guarded positive above.
             amount = uint256(credit);
         }
+
+        // The operator's price check, before anything settles, so a miss unwinds the swap.
+        if (minOutPerInWad != 0) _requireRate(route, minOutPerInWad);
 
         // Debts before credits: the vault pays a credit out of real reserves, so taking first
         // can fail on a vault that is exactly funded. Same ordering as `ChoiceRouter`.
@@ -926,31 +1151,139 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
     /// @dev The impact guard, expressed as the price the swap may walk to and no further.
     ///
-    /// `maxImpactBps` bounds the **sqrt** price, because that is what the pool takes. The
-    /// realised bound on PRICE is `b - b²/4`, i.e. very slightly TIGHTER than `b` - the guard
-    /// stops marginally earlier than its nominal setting, which is the right direction for a
-    /// safety rail.
+    /// `pips` bounds the **sqrt** price by half its value, so the realised bound on PRICE is very
+    /// slightly TIGHTER than `pips` itself - the guard stops marginally earlier than its nominal
+    /// setting, which is the right direction for a safety rail. A `pips` below 2 halves to
+    /// nothing: the limit equals spot, `_fillableInput` finds nothing to fill, and the leg parks.
     ///
-    /// ⚠️ Two things this does NOT bound. It is measured against the pool's raw spot price, so
-    /// the **swap fee is on top** - on the launchpad's 1% graduation tier the effective cost of
-    /// a buyback is roughly `1% + maxImpactBps`. And spot is whatever the pool says right now,
-    /// so a pool already pushed off-market by an attacker moves the reference with it; the rate
-    /// limit, not this, is what makes that unprofitable to farm.
-    ///
-    /// One setting serves every path, and `lockAcquired` divides it by the number of legs before
-    /// calling this - so `bps` here is this leg's SHARE of the conversion's total allowance, not
-    /// `maxImpactBps` itself. A conversion sells into a graduate's own pool, which is thinner
-    /// than the buyback pool rather than deeper, so a setting sized for the buyback is if anything
-    /// conservative there - and a leg that hits its bound fills PARTIALLY and leaves the rest
-    /// for the next window, exactly as an oversized buyback does.
-    function _priceLimit(PoolKey memory key, bool zeroForOne, uint16 bps) private view returns (uint160) {
-        (uint160 sqrtPriceX96,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
-        uint256 halfImpact = uint256(bps) / 2;
+    /// ⚠️ It is measured against the pool's raw spot price, so the **swap fee is on top**. And
+    /// spot is whatever the pool says right now, so a pool already pushed off-market moves the
+    /// reference with it. 🔴 1.6.0's comment here said the rate limit made that unprofitable to
+    /// farm. It did not: it bounded how OFTEN, and each instance paid. What makes a sandwich
+    /// unprofitable is `lockAcquired` capping `pips` at the pool's unrecoverable fee. What keeps
+    /// the sink from buying a spike that is not an attack is the operator's `minOutPerInWad`.
+    function _priceLimit(uint160 sqrtPriceX96, bool zeroForOne, uint256 pips) private pure returns (uint160) {
+        uint256 half = pips / 2;
         if (zeroForOne) {
             // 0 -> 1 walks the price DOWN.
-            return FullMath.mulDiv(sqrtPriceX96, BPS_DENOMINATOR - halfImpact, BPS_DENOMINATOR).toUint160();
+            return FullMath.mulDiv(sqrtPriceX96, PIPS_DENOMINATOR - half, PIPS_DENOMINATOR).toUint160();
         }
-        return FullMath.mulDiv(sqrtPriceX96, BPS_DENOMINATOR + halfImpact, BPS_DENOMINATOR).toUint160();
+        return FullMath.mulDiv(sqrtPriceX96, PIPS_DENOMINATOR + half, PIPS_DENOMINATOR).toUint160();
+    }
+
+    /// @dev A leg's fees, three ways.
+    /// @return swapFeePips What the pool manager charges: LP fee composed with this direction's
+    /// protocol fee. Used to size the fill.
+    /// @return hookFeePips What a fee hook charges on top, as `LaunchPoolFeeHook.poolFeePips`
+    /// reports it. Zero for a hook without that view. Used to size the fill.
+    /// @return unrecoverablePips The part of the fee a sandwicher CANNOT get back, which is
+    /// the only part that costs them anything. This is the sandwich bound.
+    ///
+    /// 🔴 **Why "unrecoverable", and not simply the fee.** A launch pool pays its fee to that
+    /// launch's CREATOR at the launch's creator share (7000 bps on an INJ launch, and up to 10000),
+    /// so a creator who sandwiches the sink gets most of their own fee back. Counting the whole
+    /// fee would let a creator profit at a move the bound calls safe. That includes the burn
+    /// token's own creator, on the buyback pool. So:
+    ///
+    /// - the **protocol fee** always counts. It goes to Choice, never to a trader.
+    /// - a **hook fee** counts at its non-creator share, read from the hook's `poolInfo`. A hook
+    ///   that reports a fee but no share is assumed to rebate all of it.
+    /// - the **LP fee counts in full on a hookless pool** (a registered quote route), whose
+    ///   liquidity belongs to third parties. On a hooked pool it is a launch's locked position,
+    ///   whose fee is paid `lpCreatorBps` to the creator, so only the rest counts. When a leg is
+    ///   not a launch's own pool that share is unknown, and it is taken as all of it.
+    ///
+    /// So a graduation pool keyed to the old `LaunchPoolGuardHook` (an LP fee, no hook fee, and
+    /// its protocol fee zeroed at graduation) is bounded at its LP fee times the launchpad's
+    /// share: 0.3% on a 1% pool whose creator takes 7000. A creator who takes 10000 leaves a
+    /// bound of ZERO, and conversions through that pool park - deliberately, because that creator
+    /// could sandwich any nonzero bound. Such revenue can still leave, as `setHold` then `sweep`.
+    ///
+    /// 🔑 An attacker's OWN liquidity does not lower their cost. Liquidity they place in range
+    /// earns back the fee on the part of their swap that trades against it, but that part moves
+    /// no price. Moving the price still means paying the fee on everybody else's liquidity. What
+    /// a JIT position does take is a share of the sink's own fee, which is a small leak and not a
+    /// sandwich. The per-tranche cap (`maxBuybackAmount`) is what bounds it.
+    function _legFees(
+        PoolKey memory key,
+        PoolId id,
+        bool zeroForOne,
+        uint24 protocolFee,
+        uint24 lpFee,
+        uint16 lpCreatorBps
+    ) private view returns (uint256 swapFeePips, uint256 hookFeePips, uint256 unrecoverablePips) {
+        uint16 protocolPips = zeroForOne ? protocolFee.getZeroForOneFee() : protocolFee.getOneForZeroFee();
+        swapFeePips = protocolPips.calculateSwapFee(lpFee);
+
+        address hooks = address(key.hooks);
+        if (hooks == address(0)) return (swapFeePips, 0, swapFeePips);
+
+        unrecoverablePips = protocolPips;
+        if (lpCreatorBps < BPS_DENOMINATOR) {
+            unrecoverablePips += uint256(lpFee) * (BPS_DENOMINATOR - lpCreatorBps) / BPS_DENOMINATOR;
+        }
+        if (hooks.code.length == 0) return (swapFeePips, 0, unrecoverablePips);
+
+        try ILaunchPoolFee(hooks).poolFeePips(id) returns (uint24 fee) {
+            hookFeePips = fee > MAX_HOOK_FEE_PIPS ? MAX_HOOK_FEE_PIPS : fee;
+        } catch {
+            return (swapFeePips, 0, unrecoverablePips);
+        }
+        try ILaunchPoolFee(hooks).poolInfo(id) returns (bool, uint256, Currency, uint16 creatorBps) {
+            if (creatorBps < BPS_DENOMINATOR) {
+                unrecoverablePips += hookFeePips * (BPS_DENOMINATOR - creatorBps) / BPS_DENOMINATOR;
+            }
+        } catch {}
+    }
+
+    /// @dev The exact input that walks the pool from `sqrtPriceX96` to `limit` and no further,
+    /// grossed up for the fees taken from the input on the way.
+    ///
+    /// Reads the pool's CURRENT in-range liquidity only. If liquidity changes between spot and the
+    /// limit, the estimate is off in the harmless direction either way: more liquidity past a
+    /// tick means the swap stops short of the limit having spent everything asked, and less
+    /// means the limit cuts it slightly short. For a graduation pool, the locked full-range
+    /// position dominates, and the estimate is exact to rounding.
+    ///
+    /// The hook fee is grossed up on every leg, including sells, where `LaunchPoolFeeHook` takes it
+    /// from the OUTPUT instead. There that over-asks a little, the limit binds, and the rest of
+    /// the input stays. A sell's fee is charged on what filled, so over-asking costs nothing.
+    function _fillableInput(
+        uint128 liquidity,
+        uint160 sqrtPriceX96,
+        uint160 limit,
+        bool zeroForOne,
+        uint256 swapFeePips,
+        uint256 hookFeePips
+    ) private pure returns (uint256 gross) {
+        if (liquidity == 0 || limit == sqrtPriceX96) return 0;
+        // Rounded DOWN, so the estimate lands just short of the limit rather than on it.
+        uint256 net = zeroForOne
+            ? SqrtPriceMath.getAmount0Delta(limit, sqrtPriceX96, liquidity, false)
+            : SqrtPriceMath.getAmount1Delta(sqrtPriceX96, limit, liquidity, false);
+        if (swapFeePips >= PIPS_DENOMINATOR) return 0;
+        gross = FullMath.mulDiv(net, PIPS_DENOMINATOR, PIPS_DENOMINATOR - swapFeePips);
+        gross = FullMath.mulDiv(gross, PIPS_DENOMINATOR, PIPS_DENOMINATOR - hookFeePips);
+    }
+
+    /// @dev The operator's minimum: at least `minOutPerInWad` of the route's final output per
+    /// unit of its first input, both raw, scaled by 1e18. Read off the vault's ledger before
+    /// anything settles, so it prices exactly what this lock did, fees included.
+    function _requireRate(Route memory route, uint256 minOutPerInWad) private view {
+        Currency input = route.firstZeroForOne ? route.first.currency0 : route.first.currency1;
+        bool lastZeroForOne = route.legs > 1 ? route.secondZeroForOne : route.firstZeroForOne;
+        PoolKey memory lastKey = route.legs > 1 ? route.second : route.first;
+        Currency output = lastZeroForOne ? lastKey.currency1 : lastKey.currency0;
+
+        int256 inDelta = VAULT.currencyDelta(address(this), input);
+        int256 outDelta = VAULT.currencyDelta(address(this), output);
+        // forge-lint: disable-next-line(unsafe-typecast) - each branch casts a value its sign test made non-negative.
+        uint256 spent = inDelta < 0 ? uint256(-inDelta) : 0;
+        // forge-lint: disable-next-line(unsafe-typecast) - guarded positive.
+        uint256 received = outDelta > 0 ? uint256(outDelta) : 0;
+        if (received < FullMath.mulDiv(spent, minOutPerInWad, 1e18)) {
+            revert BelowMinimumRate(spent, received, minOutPerInWad);
+        }
     }
 
     // -------------------------------------------------------------------------------------
@@ -1025,9 +1358,53 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @dev For keepers and dashboards deciding whether a call is worth its gas.
     function canBuyback() external view returns (bool) {
         uint256 amountIn = QUOTE.balanceOfSelf();
-        return amountIn > 0 && amountIn >= minBuybackAmount
+        return amountIn > 0 && amountIn >= minBuybackAmount && !_operatorHolds()
             && (lastBuybackAt == 0 || block.timestamp >= uint256(lastBuybackAt) + minBuybackInterval)
             && address(buybackPool.poolManager) != address(0);
+    }
+
+    /// @notice When the permissionless buyback reopens under a live operator. Zero when no
+    /// operator is set, so the public path is simply open.
+    /// @dev For a dashboard: "the operator has not bought since X, and the fallback opens at Y".
+    function publicBuybackOpensAt() external view returns (uint256) {
+        if (operator == address(0)) return 0;
+        uint256 since = lastOperatorBuybackAt > operatorSince ? lastOperatorBuybackAt : operatorSince;
+        return since + publicFallbackDelay;
+    }
+
+    /// @notice What the operator needs to price its next tranche: the most the next buyback
+    /// would offer, the pool's state and its fees.
+    /// @return offer `QUOTE` the next buyback would offer before the lock sizes it to the limit.
+    /// @return sqrtPriceX96 The buyback pool's spot, in the pool's own orientation.
+    /// @return liquidity Its in-range liquidity.
+    /// @return swapFeePips The pool manager's composite fee in the buyback direction.
+    /// @return hookFeePips A fee hook's charge on top.
+    /// @return unrecoverablePips The sandwich bound: how far one buyback may move the price, at
+    /// most, whatever `maxImpactBps` says.
+    /// @dev Reverts when no buyback pool is set. Nothing here needs to be a transaction.
+    function previewBuyback()
+        external
+        view
+        returns (
+            uint256 offer,
+            uint160 sqrtPriceX96,
+            uint128 liquidity,
+            uint256 swapFeePips,
+            uint256 hookFeePips,
+            uint256 unrecoverablePips
+        )
+    {
+        if (address(buybackPool.poolManager) == address(0)) revert NoBuybackPool();
+        PoolKey memory key = buybackPool;
+        PoolId id = key.toId();
+        ICLPoolManager manager = ICLPoolManager(address(key.poolManager));
+        uint24 protocolFee;
+        uint24 lpFee;
+        (sqrtPriceX96,, protocolFee, lpFee) = manager.getSlot0(id);
+        liquidity = manager.getLiquidity(id);
+        (swapFeePips, hookFeePips, unrecoverablePips) =
+            _legFees(key, id, quoteIsCurrency0, protocolFee, lpFee, BPS_DENOMINATOR);
+        offer = _tranche(type(uint256).max);
     }
 
     /// @notice The hop this sink would ACTUALLY use to sell `asset` for `QUOTE`.
@@ -1165,6 +1542,25 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         maxImpactBps = newMaxImpactBps;
         minBuybackInterval = newMinBuybackInterval;
         emit GuardsUpdated(newMinBuybackAmount, newMaxImpactBps, newMinBuybackInterval);
+    }
+
+    /// @notice Appoint (or remove, with zero) the key that runs scheduled buybacks, and how long
+    /// it may go without buying before the permissionless path reopens.
+    /// @dev Resets the fallback clock, so a new operator gets a full `newFallbackDelay` before
+    /// the public path can run past it. A zero delay leaves the public path always open - a
+    /// legal setting, since the fee cap already makes it sandwich-safe, but it gives up the
+    /// schedule.
+    function setOperator(address newOperator, uint32 newFallbackDelay) external onlyOwner {
+        operator = newOperator;
+        publicFallbackDelay = newFallbackDelay;
+        operatorSince = uint64(block.timestamp);
+        emit OperatorUpdated(newOperator, newFallbackDelay);
+    }
+
+    /// @notice The TWAP tranche: most `QUOTE` one buyback may offer, on either path. Zero is no cap.
+    function setMaxBuybackAmount(uint256 newMaxBuybackAmount) external onlyOwner {
+        maxBuybackAmount = newMaxBuybackAmount;
+        emit MaxBuybackAmountUpdated(newMaxBuybackAmount);
     }
 
     /// @notice Set the position lockers a conversion may read a graduate's pool key out of.

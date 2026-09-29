@@ -295,9 +295,9 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         console.log("3. Re-run 09 and 10 WITHOUT --broadcast: they find code, check the wiring, write the book.");
         if (!bracket) console.log("4. The factory's owner removes the timelock from the whitelist again.");
         console.log("");
-        console.log("Deliberately NOT in this batch: setGuards (the mainnet values are a plan-B4 decision; 09");
-        console.log("prints TEST values), setBuybackPool (needs the burn token's graduation pool), and the");
-        console.log("keeper's CRANK_CRANKER set. Until the guards are set the sink PARKS everything - safely.");
+        console.log("Deliberately NOT in this batch: setGuards, setMaxBuybackAmount and setOperator (09 prints");
+        console.log("the plan-B4 shape for all three), setBuybackPool (needs the burn token's graduation pool),");
+        console.log("and the keeper's CRANK_CRANKER set. Until the guards are set the sink PARKS everything - safely.");
     }
 
     /// @dev The real `execTransaction`, on the lowest `threshold` owners' pre-approved hashes.

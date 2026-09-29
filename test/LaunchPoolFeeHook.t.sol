@@ -723,6 +723,59 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         assertEq(feeHook.treasuryOwed(quote), buybackFee - toCreator, "the buyback's treasury share");
     }
 
+    /// @dev 🔴 1.6.0 offered a buyback its WHOLE balance under a price limit, and this hook takes
+    /// its fee on the quote a buyer SPECIFIES, in `beforeSwap`, before the pool has swapped. So a
+    /// limit-bound buyback paid the fee on everything it offered and filled only a sliver. 1.7.0
+    /// sizes each swap to the input that reaches its limit, so the fee is on what filled.
+    function test_aLimitBoundBuybackPaysTheHookOnlyOnWhatFilled() public {
+        _graduate(false);
+        MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
+        PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
+        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        // A backlog as big as the pool's whole quote side: far more than one window can spend.
+        uint256 backlog = SEED_PAIR;
+        pairToken.mint(address(sink), backlog);
+        Currency quote = Currency.wrap(address(pairToken));
+        uint256 feesBefore = feeHook.creatorOwed(LAUNCH_ID + 1) + feeHook.treasuryOwed(quote);
+
+        vm.prank(RANDOM);
+        sink.buyback();
+
+        uint256 spent = backlog - pairToken.balanceOf(address(sink));
+        uint256 fee = feeHook.creatorOwed(LAUNCH_ID + 1) + feeHook.treasuryOwed(quote) - feesBefore;
+        assertGt(spent, 0, "nothing was bought");
+        assertLt(spent, backlog / 10, "the limit did not bind, so this proves nothing");
+        assertApproxEqAbs(fee, spent * FEE_PIPS / PIPS, 2, "the hook was paid on more than filled");
+    }
+
+    /// @dev 🔴 The burn token's own CREATOR is the one trader for whom this hook's fee is mostly a
+    /// round trip: 70% of every fee on the pool is credited back to them. So they could sandwich a
+    /// buyback that an ordinary trader could not. The sink's bound counts only the fee they do NOT
+    /// get back, and at every pump size up to 5x the pool's quote side their sandwich - rebate
+    /// included - still loses.
+    function testFuzz_theBurnTokensCreatorCannotSandwichTheBuyback(uint96 raw) public {
+        _graduate(false);
+        MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
+        PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
+        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        pairToken.mint(address(sink), SEED_PAIR);
+        uint256 pump = bound(uint256(raw), SEED_PAIR / 100, SEED_PAIR * 5);
+        bool buyZeroForOne = Currency.unwrap(burnPool.currency0) == address(pairToken);
+
+        uint256 owedBefore = feeHook.creatorOwed(LAUNCH_ID + 1);
+        (uint256 paid, uint256 bought) = _routerSwap(burnPool, buyZeroForOne, true, pump);
+        uint256 rebate = feeHook.creatorOwed(LAUNCH_ID + 1) - owedBefore;
+
+        vm.prank(RANDOM);
+        sink.buyback();
+
+        owedBefore = feeHook.creatorOwed(LAUNCH_ID + 1);
+        (, uint256 dumped) = _routerSwap(burnPool, !buyZeroForOne, true, bought);
+        rebate += feeHook.creatorOwed(LAUNCH_ID + 1) - owedBefore;
+
+        assertLe(dumped + rebate, paid, "the creator's sandwich paid");
+    }
+
     // =====================================================================================
     // The neighbours: harmless on a hooked graduate
     // =====================================================================================

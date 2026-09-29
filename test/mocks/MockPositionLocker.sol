@@ -32,6 +32,12 @@ contract MockPositionLocker is ILaunchPositionLocker {
         _positions[launchId] = LockedPosition({tokenId: tokenId, creator: address(0xC12A), creatorBps: 7000});
     }
 
+    /// The same, at a creator share of the caller's choosing - for the sandwich bound, which
+    /// counts only the share of a launch pool's LP fee its creator does NOT get back.
+    function registerWithShare(uint256 launchId, uint256 tokenId, uint16 creatorBps) external {
+        _positions[launchId] = LockedPosition({tokenId: tokenId, creator: address(0xC12A), creatorBps: creatorBps});
+    }
+
     function getPosition(uint256 launchId) external view override returns (LockedPosition memory) {
         return _positions[launchId];
     }
