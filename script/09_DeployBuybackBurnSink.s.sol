@@ -99,18 +99,22 @@ contract DeployBuybackBurnSink is BaseScript {
     /// - `MIN_BUYBACK` 0.5 wINJ: below it a swap costs more in gas than it moves.
     /// - `MAX_IMPACT_BPS` 100: an upper bound only. The per-leg fee cap binds first: 0.3% of price
     ///   on the burn token's 1% fee-hook pool with a 7000 creator share.
-    /// - `MIN_INTERVAL` 300 s: one fill per window, on the operator path and the public one alike
-    ///   (1.8.0). The keeper's `BUYBACK_INTERVAL_MS` default is the same five minutes.
-    /// - `MAX_BUYBACK` 10 wINJ: about one fee-capped fill on the mainnet burn pool (~6,690 wINJ
-    ///   deep on 2026-10-06), so it costs no throughput. A pump-and-JIT sandwich pays only when
-    ///   the tranche is over `fee * depth`: ~67 wINJ for an outsider there, ~20 for whoever holds
-    ///   the burn token's creator key. Anchored sizing closes the attack on its own. This is the second
-    ///   bound.
+    /// - `MIN_INTERVAL` 1,800 s: D20's 30-60 minutes. One fill per window, on the operator path
+    ///   and the public one alike (1.8.0). 🔴 The keeper's `BUYBACK_INTERVAL_MS` defaults to five
+    ///   minutes; run it at 1,800,000, or most of its passes simulate into `RateLimited`.
+    /// - `MAX_BUYBACK` 5 wINJ: about half a fee-capped fill on the mainnet burn pool (~6,716 wINJ
+    ///   deep on 2026-10-07), so one buyback moves its price ~0.15%. With `MIN_INTERVAL` this IS
+    ///   the pace: at most 240 wINJ a day. Chosen so a backlog is bought over days, not hours: the
+    ///   ~770 wINJ of buying waiting on 2026-10-07 takes ~3.2 days, where 10 wINJ every 300 s would
+    ///   have taken ~6.4 hours. Still well above steady inflow, ~20-25 wINJ a day that week.
+    ///   A pump-and-JIT sandwich pays only when the tranche is over `fee * depth`: ~67 wINJ for an
+    ///   outsider there, ~20 for whoever holds the burn token's creator key. Anchored sizing
+    ///   closes the attack on its own. This is the second bound.
     /// - `FALLBACK_DELAY` 6 h of operator silence before the public path reopens.
     uint256 internal constant MIN_BUYBACK = 0.5e18;
     uint16 internal constant MAX_IMPACT_BPS = 100;
-    uint32 internal constant MIN_INTERVAL = 300;
-    uint256 internal constant MAX_BUYBACK = 10e18;
+    uint32 internal constant MIN_INTERVAL = 1800;
+    uint256 internal constant MAX_BUYBACK = 5e18;
     uint32 internal constant FALLBACK_DELAY = 6 hours;
 
     uint256 internal outstanding;
