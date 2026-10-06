@@ -110,12 +110,16 @@ contract DeployBuybackBurnSink is BaseScript {
     ///   A pump-and-JIT sandwich pays only when the tranche is over `fee * depth`: ~67 wINJ for an
     ///   outsider there, ~20 for whoever holds the burn token's creator key. Anchored sizing
     ///   closes the attack on its own. This is the second bound.
-    /// - `FALLBACK_DELAY` 6 h of operator silence before the public path reopens.
+    /// - `FALLBACK_DELAY` 30 days of operator silence before the public path reopens. Buybacks run
+    ///   as BATCHES the operator starts and stops (an amount, at a pace within the two bounds
+    ///   above), and revenue accumulates in between, so the public path must stay shut across
+    ///   the gap between batches. Thirty days is that gap's ceiling, and the backstop: a lost
+    ///   operator key, or a month with no batch, reopens the permissionless buyback by itself.
     uint256 internal constant MIN_BUYBACK = 0.5e18;
     uint16 internal constant MAX_IMPACT_BPS = 100;
     uint32 internal constant MIN_INTERVAL = 1800;
     uint256 internal constant MAX_BUYBACK = 5e18;
-    uint32 internal constant FALLBACK_DELAY = 6 hours;
+    uint32 internal constant FALLBACK_DELAY = 30 days;
 
     uint256 internal outstanding;
 

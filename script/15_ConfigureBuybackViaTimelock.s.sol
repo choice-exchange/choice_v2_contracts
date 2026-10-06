@@ -38,7 +38,8 @@ import {DeploySinkAndCrankerViaTimelock} from "./13_DeploySinkAndCrankerViaTimel
  *
  * ⚠️ Before EXECUTING on mainnet: roll a keeper that has the buyback loop, with
  * `BUYBACK_ENABLED=true` and the operator's key. The public path is held for `FALLBACK_DELAY`
- * after the operator is appointed, so a missing keeper costs six hours of buybacks, not money.
+ * after the operator is appointed and after each of its fills, 30 days, so a missing keeper
+ * delays buybacks, and never costs money.
  *
  *   NETWORK=injective_mainnet forge script \
  *     script/15_ConfigureBuybackViaTimelock.s.sol:ConfigureBuybackViaTimelock -vv --rpc-url $RPC_URL
@@ -117,7 +118,7 @@ contract ConfigureBuybackViaTimelock is DeploySinkAndCrankerViaTimelock {
         console.log("3. Re-run 09 WITHOUT --broadcast: it should report the sink configured.");
         console.log("");
         console.log("Before step 2 on mainnet: the keeper with the buyback loop is rolled, BUYBACK_ENABLED=true,");
-        console.log("signing with the operator key. Until it fills, the public path stays held for 6h.");
+        console.log("signing with the operator key. The public path stays held for 30 days after its last fill.");
     }
 
     /// @dev What the batch must leave behind, asserted against the state it left in this fork.
