@@ -31,8 +31,10 @@ allow_internal_expect_revert = true
 # The one exception to the pin above, and it is our own contract, not the audited protocol.
 # BuybackBurnSink 1.8.0 is 26,187 bytes of runtime at 25,666 runs, over EIP-170's 24,576, and 23,566
 # at 1,000. Same mechanism infinity-periphery uses for CLPositionManager (its `clPosm` profile).
-# 🔴 Verifying it needs `--compilation-profile sink`. Without that, `forge verify-contract
-# --show-standard-json-input` fails with "Ambiguous compilation profiles" and still exits 0.
+# 🔴 This holds only while NOTHING imports the sink's source (see IBuybackBurnSink). The sink then
+# builds under `sink` alone, and `forge verify-contract --show-standard-json-input` picks 1,000
+# runs on its own (checked on the 2026-10-06 testnet rehearsal). An importer would build the sink
+# and itself under two profiles, and verification would then need `--compilation-profile`.
 additional_compiler_profiles = [{ name = "sink", optimizer_runs = 1_000 }]
 compilation_restrictions = [{ paths = "src/fees/BuybackBurnSink.sol", optimizer_runs = 1_000 }]
 
