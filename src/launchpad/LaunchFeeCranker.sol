@@ -7,7 +7,7 @@ import {Currency} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
 
-import {BuybackBurnSink} from "../fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../interfaces/IBuybackBurnSink.sol";
 import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
@@ -129,7 +129,7 @@ contract LaunchFeeCranker is Ownable2Step {
     /// and one of them, `convert(Currency,uint256)`, is new in sink 1.2.0 - so the compiler, not
     /// a comment, is what keeps the two in lockstep at BUILD time. 🔴 That says nothing about the
     /// address `setSink` is given, which is why the setter probes it.
-    BuybackBurnSink public SINK;
+    IBuybackBurnSink public SINK;
 
     /// @notice `SINK.QUOTE()`, cached. Immutable on the sink, so it can only change when the sink does.
     /// @dev Re-derived by `setSink`. It decides which leg `_drive` takes, so a stale copy would
@@ -197,7 +197,7 @@ contract LaunchFeeCranker is Ownable2Step {
 
     /// @param _owner 🔴 The TIMELOCK. See the header: the setters below are only defensible
     /// behind a delay, and an EOA owner here is a mutable burn destination in one hand.
-    constructor(ILaunchPositionLocker _locker, BuybackBurnSink _sink, address _owner) Ownable(_owner) {
+    constructor(ILaunchPositionLocker _locker, IBuybackBurnSink _sink, address _owner) Ownable(_owner) {
         // Ownable(0) reverts on its own with OwnableInvalidOwner, which is a better error than
         // ours would be, so only the two this contract knows about are checked here.
         if (address(_locker) == address(0) || address(_sink) == address(0)) revert ZeroAddress();
@@ -220,7 +220,7 @@ contract LaunchFeeCranker is Ownable2Step {
     /// route - `feedIsWired()` and `sinkKnowsOurLocker()` are the two questions to ask
     /// afterwards, and script 10 asserts both. Neither is *required* here on purpose: forcing an
     /// order would make a legitimate move of both ends impossible in a single timelock batch.
-    function setSink(BuybackBurnSink newSink) external onlyOwner {
+    function setSink(IBuybackBurnSink newSink) external onlyOwner {
         if (address(newSink) == address(0)) revert ZeroAddress();
         _setSink(newSink);
     }
@@ -243,7 +243,7 @@ contract LaunchFeeCranker is Ownable2Step {
     /// @dev Probe, derive, then assign. The probe is the whole value of the setter being a
     /// function rather than a raw storage write: a wrong address here would otherwise be found
     /// by `_drive` swallowing an empty revert into a `try` and reporting `false` for ever.
-    function _setSink(BuybackBurnSink newSink) private {
+    function _setSink(IBuybackBurnSink newSink) private {
         // 🔴 An address with NO CODE first, and separately, because `try` does not reliably turn
         // it into a catchable failure: a high-level call to an EOA can return empty and revert on
         // the decode OUTSIDE the catch, which surfaces as a bare revert with no data - the exact

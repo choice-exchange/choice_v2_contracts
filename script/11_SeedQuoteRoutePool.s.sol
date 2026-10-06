@@ -16,7 +16,7 @@ import {LiquidityAmounts} from "infinity-periphery/src/pool-cl/libraries/Liquidi
 import {Plan, Planner} from "infinity-periphery/src/libraries/Planner.sol";
 
 import {BaseScript} from "./BaseScript.sol";
-import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
 
 /**
  * Encode the pool that gives a quote asset its second leg (plan A2), and the `setQuoteRoute`
@@ -129,10 +129,12 @@ contract SeedQuoteRoutePool is BaseScript {
         console.log("SEED_AMOUNT0=%s", vm.toString(amount0));
         console.log("SEED_POOL_ID=%s", vm.toString(PoolId.unwrap(key.toId())));
         console.log("SEED_PAYLOAD=%s", vm.toString(abi.encode(plan.actions, plan.params)));
-        // The timelock call that registers it, ready to schedule.
+        // The timelock call that registers it, ready to schedule. Sink 1.8.0 sizes a conversion
+        // through a route against the depth named with it (F1), and the seed is the depth this
+        // script KNOWS is there. If the pool deepens later, the ceiling can be raised.
         console.log(
             "SEED_SET_ROUTE_CALLDATA=%s",
-            vm.toString(abi.encodeCall(BuybackBurnSink.setQuoteRoute, (Currency.wrap(asset), key)))
+            vm.toString(abi.encodeCall(IBuybackBurnSink.setQuoteRoute, (Currency.wrap(asset), key, liquidity)))
         );
         console.log("SEED_SINK=%s", vm.toString(sink));
     }
