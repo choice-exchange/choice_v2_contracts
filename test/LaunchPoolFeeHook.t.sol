@@ -30,7 +30,8 @@ import {CLQuoter} from "infinity-periphery/src/pool-cl/lens/CLQuoter.sol";
 import {MockInfinityRouter} from "infinity-periphery/test/mocks/MockInfinityRouter.sol";
 
 import {ChoiceFeeController} from "../src/fees/ChoiceFeeController.sol";
-import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
+import {deployBuybackBurnSink} from "./utils/DeployBuybackBurnSink.sol";
 import {IBurnableERC20} from "../src/interfaces/IBurnableERC20.sol";
 import {IBurnSink} from "../src/interfaces/IBurnSink.sol";
 import {ILaunchpadCore} from "../src/interfaces/ILaunchpadCore.sol";
@@ -696,8 +697,8 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     function test_harvestIntoARealSinkBuysAndBurns() public {
         PoolKey memory key = _graduate(false);
         MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
-        PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
-        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
+        IBuybackBurnSink sink = _deploySink(burnToken, LAUNCH_ID + 1);
         vm.prank(OWNER);
         feeHook.setTreasury(address(sink));
 
@@ -712,12 +713,15 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         feeHook.harvest(quote);
 
         assertLt(burnToken.totalSupply(), supplyBefore, "nothing was burnt");
-        assertGt(burnToken.balanceOf(OPS), 0, "the ops share never arrived");
-        assertEq(pairToken.balanceOf(address(sink)), 0, "the sink did not spend what it was paid");
+        // Sink 1.8.0: `burnBps` (7000 here) of revenue buys, the rest is paid to ops in quote.
+        uint256 spent = owed * 7_000 / 10_000;
+        assertEq(burnToken.balanceOf(OPS), 0, "ops was paid in the burn token");
+        assertEq(pairToken.balanceOf(OPS), spent * 3_000 / 7_000, "the ops share never arrived");
+        assertLe(pairToken.balanceOf(address(sink)), 2, "the sink did not spend what it was paid");
 
         // The buyback is a buy through a hooked pool, so it paid the hook 1% like any trader: 70%
         // to the burn token's creator and the rest back into the treasury's credit.
-        uint256 buybackFee = owed * FEE_PIPS / PIPS;
+        uint256 buybackFee = spent * FEE_PIPS / PIPS;
         uint256 toCreator = buybackFee * HOOK_CREATOR_BPS / 10_000;
         assertEq(feeHook.creatorOwed(LAUNCH_ID + 1), toCreator, "the buyback's creator share");
         assertEq(feeHook.treasuryOwed(quote), buybackFee - toCreator, "the buyback's treasury share");
@@ -730,18 +734,20 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     function test_aLimitBoundBuybackPaysTheHookOnlyOnWhatFilled() public {
         _graduate(false);
         MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
-        PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
-        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
+        IBuybackBurnSink sink = _deploySink(burnToken, LAUNCH_ID + 1);
         // A backlog as big as the pool's whole quote side: far more than one window can spend.
         uint256 backlog = SEED_PAIR;
         pairToken.mint(address(sink), backlog);
         Currency quote = Currency.wrap(address(pairToken));
         uint256 feesBefore = feeHook.creatorOwed(LAUNCH_ID + 1) + feeHook.treasuryOwed(quote);
+        uint256 opsBefore = pairToken.balanceOf(OPS);
 
         vm.prank(RANDOM);
         sink.buyback();
 
-        uint256 spent = backlog - pairToken.balanceOf(address(sink));
+        // What the SWAP spent: the sink also paid ops its share of it, in quote (1.8.0).
+        uint256 spent = backlog - pairToken.balanceOf(address(sink)) - (pairToken.balanceOf(OPS) - opsBefore);
         uint256 fee = feeHook.creatorOwed(LAUNCH_ID + 1) + feeHook.treasuryOwed(quote) - feesBefore;
         assertGt(spent, 0, "nothing was bought");
         assertLt(spent, backlog / 10, "the limit did not bind, so this proves nothing");
@@ -757,7 +763,7 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         _graduate(false);
         MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
         PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
-        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        IBuybackBurnSink sink = _deploySink(burnToken, LAUNCH_ID + 1);
         pairToken.mint(address(sink), SEED_PAIR);
         uint256 pump = bound(uint256(raw), SEED_PAIR / 100, SEED_PAIR * 5);
         bool buyZeroForOne = Currency.unwrap(burnPool.currency0) == address(pairToken);
@@ -785,8 +791,8 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     function test_theCrankerIsAHarmlessNoOpOnAHookedGraduate() public {
         PoolKey memory key = _graduate(false);
         MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
-        PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
-        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
+        IBuybackBurnSink sink = _deploySink(burnToken, LAUNCH_ID + 1);
         LaunchFeeCranker cranker = new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), sink, OWNER);
         vm.prank(OWNER);
         locker.setLaunchpadTreasury(address(sink));
@@ -817,8 +823,8 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
     function test_theSinksConvertIsAHarmlessNoOpOnAHookedGraduate() public {
         PoolKey memory key = _graduate(false);
         MockBurnableERC20 burnToken = new MockBurnableERC20("Burn", "BURN", 18);
-        PoolKey memory burnPool = _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
-        BuybackBurnSink sink = _deploySink(burnToken, burnPool);
+        _graduateAt(LAUNCH_ID + 1, MockERC20(address(burnToken)), pairToken, HOOK_CREATOR_BPS);
+        IBuybackBurnSink sink = _deploySink(burnToken, LAUNCH_ID + 1);
         _buy(key, address(pairToken), BUY_QUOTE);
         Currency quote = Currency.wrap(address(pairToken));
         uint256 claims = vault.balanceOf(address(feeHook), quote);
@@ -1235,19 +1241,17 @@ contract LaunchPoolFeeHookTest is LaunchpadGraduationHarness {
         used = before - gasleft();
     }
 
-    function _deploySink(MockBurnableERC20 burnToken, PoolKey memory buybackPool)
-        internal
-        returns (BuybackBurnSink sink)
-    {
-        sink = new BuybackBurnSink(
+    function _deploySink(MockBurnableERC20 burnToken, uint256 burnLaunchId) internal returns (IBuybackBurnSink sink) {
+        sink = deployBuybackBurnSink(
             IBurnableERC20(address(burnToken)), Currency.wrap(address(pairToken)), vault, posm, OPS, OWNER, 5_000, 7_000
         );
         address[] memory lockers = new address[](1);
         lockers[0] = address(locker);
         vm.startPrank(OWNER);
-        sink.setBuybackPool(buybackPool);
         sink.setLockers(lockers);
+        sink.setBuybackLaunch(burnLaunchId);
         sink.setGuards(0.0001 ether, 500, 1 hours);
+        sink.setMaxBuybackAmount(type(uint128).max);
         vm.stopPrank();
     }
 

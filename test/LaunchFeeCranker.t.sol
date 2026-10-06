@@ -26,7 +26,8 @@ import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLP
 import {ICLPositionDescriptor} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionDescriptor.sol";
 import {IWETH9} from "infinity-periphery/src/interfaces/external/IWETH9.sol";
 
-import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
+import {deployBuybackBurnSink} from "./utils/DeployBuybackBurnSink.sol";
 import {ChoiceFeeController} from "../src/fees/ChoiceFeeController.sol";
 import {IBurnSink} from "../src/interfaces/IBurnSink.sol";
 import {IBurnableERC20} from "../src/interfaces/IBurnableERC20.sol";
@@ -68,7 +69,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     InfinitySettler internal settler;
     LaunchPoolGuardHook internal guardHook;
 
-    BuybackBurnSink internal sink;
+    IBuybackBurnSink internal sink;
     LaunchFeeCranker internal cranker;
 
     MockERC20 internal launchToken;
@@ -91,6 +92,13 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
     uint256 internal constant SEED_TOKEN = 206_900_000e18;
     uint256 internal constant SEED_PAIR = 1_500e18;
+
+    /// The burn token is a graduate too, as it is on mainnet. Sink 1.8.0 names its buyback
+    /// pool by this launch id and sizes every buyback against the locked position. It is seeded
+    /// deep and at 1:1 so that one window clears what these tests accrue.
+    uint256 internal constant BURN_LAUNCH_ID = 41;
+    uint256 internal constant BURN_SEED = 1_000_000e18;
+    uint256 internal constant LOOSE_TRANCHE = 10_000_000e18;
 
     uint24 internal constant FEE = 10_000;
     int24 internal constant SPACING = 200;
@@ -129,7 +137,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         quote = new MockERC20("Wrapped INJ", "wINJ", 18);
         burnToken = new MockBurnableERC20("Burn Token", "BURN", 18);
 
-        sink = new BuybackBurnSink(
+        sink = deployBuybackBurnSink(
             IBurnableERC20(address(burnToken)),
             Currency.wrap(address(quote)),
             IVault(address(vault)),
@@ -141,15 +149,27 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         );
         cranker = new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), sink, OWNER);
 
-        buybackPool = _plainKey(quote, burnToken);
-        _seed(buybackPool, 1_000_000 ether);
+        core.seedLaunch(
+            BURN_LAUNCH_ID,
+            CREATOR,
+            address(burnToken),
+            IERC20(address(quote)),
+            address(settler),
+            BURN_SEED,
+            CREATOR_BPS
+        );
+        burnToken.mint(address(core), BURN_SEED);
+        quote.mint(address(core), BURN_SEED);
+        core.triggerGraduation(BURN_LAUNCH_ID, BURN_SEED);
+        buybackPool = _keyFor(MockERC20(address(burnToken)), quote);
 
         address[] memory lockers = new address[](1);
         lockers[0] = address(locker);
         vm.startPrank(OWNER);
-        sink.setBuybackPool(buybackPool);
         sink.setLockers(lockers);
+        sink.setBuybackLaunch(BURN_LAUNCH_ID);
         sink.setGuards(0.0001 ether, 500, INTERVAL);
+        sink.setMaxBuybackAmount(LOOSE_TRANCHE);
         // B6: the field that IS the burnToken revenue feed. It pointed at the pad treasury for the
         // whole life of the first two sinks, so the burn leg was fed by nothing.
         locker.setLaunchpadTreasury(address(sink));
@@ -180,10 +200,10 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertTrue(result.drove0 && result.drove1, "one of the sink legs did not run");
         assertLt(burnToken.totalSupply(), supplyBefore, "no burn token was destroyed");
 
-        // 80% burnt, 20% to ops - the immutable floor, measured rather than assumed.
-        uint256 burnt = supplyBefore - burnToken.totalSupply();
-        uint256 toOps = burnToken.balanceOf(OPS);
-        assertEq(burnt, (burnt + toOps) * FLOOR / 10_000, "the split is not burnBps of what was bought");
+        // 80% of revenue bought and burnt WHOLE, 20% paid to ops in quote (sink 1.8.0).
+        assertEq(burnToken.balanceOf(OPS), 0, "ops was paid in the burn token");
+        assertGt(quote.balanceOf(OPS), 0, "the ops share never reached the treasury");
+        assertEq(burnToken.balanceOf(address(sink)), 0, "burn tokens were left sitting in the sink");
     }
 
     /// 🔑 Both currencies clear in ONE call, and that is the ordering argument in
@@ -209,7 +229,8 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         cranker.crank(LAUNCH_ID);
 
         assertEq(launchToken.balanceOf(address(sink)), 0, "the launch-token leg did not clear");
-        assertEq(quote.balanceOf(address(sink)), 0, "the quote leg did not clear in the same call");
+        // `burnBps` bought, the rest paid out: rounding leaves at most a wei or two.
+        assertLe(quote.balanceOf(address(sink)), 2, "the quote leg did not clear in the same call");
         assertEq(burnToken.balanceOf(address(sink)), 0, "burn tokens were left sitting in the sink");
     }
 
@@ -395,7 +416,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         PoolKey memory hop = _plainKey(otherQuote, quote);
         _seed(hop, 500_000 ether);
         vm.prank(OWNER);
-        sink.setQuoteRoute(Currency.wrap(address(otherQuote)), hop);
+        sink.setQuoteRoute(Currency.wrap(address(otherQuote)), hop, type(uint128).max);
 
         uint256 supplyBefore = burnToken.totalSupply();
 
@@ -407,19 +428,18 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         assertTrue(result.drove0 && result.drove1, "a leg was still refused after the route existed");
         assertLt(supplyBefore - burnToken.totalSupply(), supplyBefore, "sanity");
         assertGt(supplyBefore - burnToken.totalSupply(), 0, "a SAI-paired graduate still burnt nothing");
-        assertGt(burnToken.balanceOf(OPS), 0, "the ops share never reached the treasury");
+        assertGt(quote.balanceOf(OPS), 0, "the ops share never reached the treasury");
     }
 
     /// The launchpad's own token is a launch like any other, and its LP fees are burn revenue
     /// with no swap in the way: the sink's `BURN_TOKEN` arm splits and destroys the balance.
     function test_aBurnTokenPairedLaunchBurnsItsOwnLegDirectly() public {
-        launchToken = MockERC20(address(burnToken));
-        _graduate();
-        _swap(_launchKey(), true, 50_000e18);
-        _swap(_launchKey(), false, 10e18);
+        // The burn token graduated in `setUp`: its own pool is the buyback pool.
+        _swap(buybackPool, true, 50_000e18);
+        _swap(buybackPool, false, 50_000e18);
 
         uint256 supplyBefore = burnToken.totalSupply();
-        LaunchFeeCranker.Crank memory result = cranker.crank(LAUNCH_ID);
+        LaunchFeeCranker.Crank memory result = cranker.crank(BURN_LAUNCH_ID);
 
         assertTrue(result.drove0 && result.drove1, "one of the legs did not run");
         assertLt(burnToken.totalSupply(), supplyBefore, "the burn token's own fee leg was not destroyed");
@@ -435,7 +455,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     function test_theSinkFindsTheRealPoolOfARealGraduate() public {
         _graduate();
 
-        BuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(launchToken)), LAUNCH_ID);
+        IBuybackBurnSink.Route memory route = sink.conversionRoute(Currency.wrap(address(launchToken)), LAUNCH_ID);
         assertEq(route.legs, 1, "a wINJ-paired graduate needs exactly one leg");
         assertEq(
             PoolId.unwrap(route.first.toId()), PoolId.unwrap(_launchKey().toId()), "that is not the graduated pool"
@@ -496,7 +516,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         new LaunchFeeCranker(ILaunchPositionLocker(address(0)), sink, OWNER);
 
         vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
-        new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), BuybackBurnSink(payable(address(0))), OWNER);
+        new LaunchFeeCranker(ILaunchPositionLocker(address(locker)), IBuybackBurnSink(address(0)), OWNER);
     }
 
     function test_launchPoolViewAnswersForAGraduateAndNotForAnythingElse() public {
@@ -662,7 +682,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
     function test_repointingTheSinkReDerivesQuoteAndBurnToken() public {
         MockERC20 otherQuote = new MockERC20("Other", "OTH", 18);
         MockBurnableERC20 otherBurn = new MockBurnableERC20("Other Burn Token", "OBRN", 18);
-        BuybackBurnSink otherSink = new BuybackBurnSink(
+        IBuybackBurnSink otherSink = deployBuybackBurnSink(
             IBurnableERC20(address(otherBurn)),
             Currency.wrap(address(otherQuote)),
             IVault(address(vault)),
@@ -712,7 +732,7 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
 
         // The locker is a real contract and answers neither QUOTE() nor BURN_TOKEN().
         vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotASink.selector, address(locker)));
-        cranker.setSink(BuybackBurnSink(payable(address(locker))));
+        cranker.setSink(IBuybackBurnSink(address(locker)));
 
         // 🔑 The sink DOES answer `POSITION_MANAGER()` - it has one, for exactly the check
         // `setLockers` does - so it gets past the first probe and is caught by the second. That
@@ -727,10 +747,10 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         cranker.setLocker(ILaunchPositionLocker(OPS));
 
         vm.expectRevert(abi.encodeWithSelector(LaunchFeeCranker.NotASink.selector, OPS));
-        cranker.setSink(BuybackBurnSink(payable(OPS)));
+        cranker.setSink(IBuybackBurnSink(OPS));
 
         vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
-        cranker.setSink(BuybackBurnSink(payable(address(0))));
+        cranker.setSink(IBuybackBurnSink(address(0)));
 
         vm.expectRevert(LaunchFeeCranker.ZeroAddress.selector);
         cranker.setLocker(ILaunchPositionLocker(address(0)));
@@ -794,8 +814,21 @@ contract LaunchFeeCrankerTest is Test, DeployPermit2 {
         });
     }
 
-    /// @dev The buyback pool. Not a graduation pool - the burn token has not graduated in this fixture -
-    /// so it carries no hook and is opened directly.
+    /// @dev The key the settler graduates `token` onto against `pair`.
+    function _keyFor(MockERC20 token, MockERC20 pair) internal view returns (PoolKey memory) {
+        (address c0, address c1) =
+            address(token) < address(pair) ? (address(token), address(pair)) : (address(pair), address(token));
+        return PoolKey({
+            currency0: Currency.wrap(c0),
+            currency1: Currency.wrap(c1),
+            hooks: settler.hooks(),
+            poolManager: IPoolManager(address(clPoolManager)),
+            fee: settler.lpFee(),
+            parameters: settler.poolParameters()
+        });
+    }
+
+    /// @dev An ordinary pool nobody's settler opened: no hook, opened directly.
     function _plainKey(MockERC20 a, MockERC20 b) internal view returns (PoolKey memory) {
         (address c0, address c1) = address(a) < address(b) ? (address(a), address(b)) : (address(b), address(a));
         return PoolKey({

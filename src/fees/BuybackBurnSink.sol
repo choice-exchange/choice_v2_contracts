@@ -13,12 +13,18 @@ import {Currency, CurrencyLibrary} from "infinity-core/src/types/Currency.sol";
 import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 import {FullMath} from "infinity-core/src/pool-cl/libraries/FullMath.sol";
+import {FixedPoint96} from "infinity-core/src/pool-cl/libraries/FixedPoint96.sol";
 import {SqrtPriceMath} from "infinity-core/src/pool-cl/libraries/SqrtPriceMath.sol";
 import {ProtocolFeeLibrary} from "infinity-core/src/libraries/ProtocolFeeLibrary.sol";
 import {PoolId} from "infinity-core/src/types/PoolId.sol";
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
+import {
+    CLPositionInfo,
+    CLPositionInfoLibrary
+} from "infinity-periphery/src/pool-cl/libraries/CLPositionInfoLibrary.sol";
 
 import {IBurnSink} from "../interfaces/IBurnSink.sol";
+import {IBuybackBurnSink} from "../interfaces/IBuybackBurnSink.sol";
 import {IBurnableERC20} from "../interfaces/IBurnableERC20.sol";
 import {ILaunchPositionLocker} from "../interfaces/ILaunchPositionLocker.sol";
 
@@ -35,6 +41,38 @@ interface ILaunchPoolFee {
 
 /// @title BuybackBurnSink
 /// @notice Burn sink C: turn protocol revenue into the launchpad token and destroy it.
+///
+/// **VERSION 1.8.0** - the 2026-10-01 audit's §4.1 fixes and an ops share paid in `QUOTE`, all
+/// before any mainnet deploy. 1.7.0 never ran on any chain.
+///
+/// 1. **Every leg is sized against liquidity nobody can add in the same transaction (F1).** 1.7.0
+///    capped how far a buyback moves the price, but it sized the swap from the pool's whole
+///    in-range liquidity, and that includes a position an attacker opens one call earlier. So the
+///    attack became: pump, open a one-tick position at the pumped price, trigger the buyback, and
+///    sell the sink its entire tranche at the top while barely moving the price. Modelled on the
+///    mainnet burn pool (~6,690 wINJ deep) with a 945 wINJ backlog, an outsider netted ~575
+///    wINJ. A leg is now sized against `min(pool liquidity, trusted liquidity)`. On a graduation
+///    pool the trusted figure is the launch's LOCKED position, which can never be withdrawn and
+///    must cover the whole walk from spot to the limit. On a registered quote route it is a
+///    ceiling the owner names. See `_sizingLiquidity`.
+/// 2. **A tranche cap is mandatory and binds conversions too (F1).** `maxBuybackAmount` of zero no
+///    longer means "no cap". It means nothing trades yet (reason 8). A conversion is capped at the
+///    input worth `maxBuybackAmount` of `QUOTE` at the route's spot. See `_inputWorth`.
+/// 3. **The operator path is rate-limited and must name a price (F2).** `operatorBuyback` shares
+///    `minBuybackInterval` with the public path, refuses `minOutPerInWad == 0`, and only a fill of
+///    at least `minBuybackAmount` restarts the fallback clock. A stolen key used to be able to
+///    call it N times in one transaction and walk the price N fee-caps; now it gets one call per
+///    window, and a dust fill cannot hold the public path shut.
+/// 4. **The ops share is paid in `QUOTE`, not in the burn token.** `burnBps` is now the share of
+///    REVENUE spent on the buyback. The rest accrues to `treasuryOwed` in `QUOTE` and is paid to
+///    `treasury`, and every token bought is burnt. Under 1.7.0 the treasury received
+///    `1 - burnBps` of the bought tokens. That paid ops in the very token the buyback had just
+///    bought, and selling it would undo part of the buyback. Dan, 2026-10-06: "the 20% ops should
+///    be INJ".
+///
+/// The fourth fix in the audit (F3: configuration landing as separate timelock operations, with
+/// the executor open) is a script fix. `script/15` schedules the whole configuration as ONE
+/// batch, with `setGuards` last.
 ///
 /// **VERSION 1.7.0** - three changes from the 2026-09-30 review, all before any mainnet deploy.
 ///
@@ -116,7 +154,7 @@ interface ILaunchPoolFee {
 /// contract controls. See `_settleBurnToken` for why that wrapper is one atomic self-call and
 /// not a `try` around each leg.
 ///
-/// The named guards below still exist, because failing inside `setGuards` / `setBuybackPool`
+/// The named guards below still exist, because failing inside `setGuards` / `setBuybackLaunch`
 /// says what is wrong while somebody is looking at it, where a park is silent.
 ///
 /// That is also why the price guard is a `sqrtPriceLimitX96` on the swap rather than a
@@ -206,12 +244,13 @@ interface ILaunchPoolFee {
 /// they became convertible. `sweep` refuses any currency that is not on the hold allowlist, so
 /// taking one out is `setHold` and then `sweep` - two calls, both of which emit, rather than one
 /// that looks like housekeeping.
-contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, ILockCallback {
+contract BuybackBurnSink is IBuybackBurnSink, Ownable2Step, ReentrancyGuardTransient {
     using CurrencyLibrary for Currency;
     using SafeERC20 for IERC20;
     using SafeCast for uint256;
     using ProtocolFeeLibrary for uint24;
     using ProtocolFeeLibrary for uint16;
+    using CLPositionInfoLibrary for CLPositionInfo;
 
     uint16 public constant BPS_DENOMINATOR = 10_000;
 
@@ -269,15 +308,29 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice Floor under `burnBps`, fixed at construction. THE differentiator; see the notice.
     uint16 public immutable MIN_BURN_BPS;
 
-    /// @notice Share of bought tokens destroyed; the remainder funds infrastructure. Free to
-    /// move, but never below `MIN_BURN_BPS`.
+    /// @notice Share of `QUOTE` revenue spent buying the burn token, every unit of which is then
+    /// destroyed. The remainder accrues to `treasuryOwed` and funds infrastructure in `QUOTE`. Free
+    /// to move, but never below `MIN_BURN_BPS`.
     /// @dev A floor, deliberately, and not a one-way ratchet. The launchpad's own tokenomics argue
     /// that revenue is reflexive and that the burn share is what should flex when it falls, so
     /// the guarantee worth making is the floor rather than monotonicity.
+    ///
+    /// 🔴 1.8.0 changed what it splits. It used to split the BOUGHT tokens, sending `1 - burnBps`
+    /// of them to the treasury. Now it splits the REVENUE before buying, so 8000 means "80% of
+    /// revenue buys and burns, 20% is paid out as wINJ". The economics are the same, but only the
+    /// new one matches the promise the pad makes in public.
     uint16 public burnBps;
 
-    /// @notice Receives the non-burnt share.
+    /// @notice Receives the ops share, in `QUOTE`.
     address public treasury;
+
+    /// @notice `QUOTE` held here that belongs to `treasury`: the ops share of every buyback so
+    /// far, not yet paid out. Never spent on a buyback.
+    /// @dev It accrues when `QUOTE` is SPENT, in proportion to what was spent, because revenue
+    /// arrives as bare transfers and there is no other moment at which this contract sees it.
+    /// `_tranche` offers at most `burnBps` of what is not already owed, so the ledger is always
+    /// covered by the balance. A payout that fails leaves it in place for the next attempt.
+    uint256 public treasuryOwed;
 
     /// @notice The pool the buyback trades through. Settable because a deeper pool on another
     /// fee tier is the expected upgrade path: the launchpad's graduation pool is a full-range
@@ -286,8 +339,20 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     PoolKey public buybackPool;
 
     /// @notice True when `QUOTE` is the pool's `currency0`, i.e. the buyback swaps 0 -> 1.
-    /// Derived in `setBuybackPool` so the hot path does no comparison.
+    /// Derived in `setBuybackLaunch` so the hot path does no comparison.
     bool public quoteIsCurrency0;
+
+    /// @notice The burn token's own launch, whose graduation pool `buybackPool` is.
+    uint256 public buybackLaunchId;
+
+    /// @notice The burn token's LOCKED graduation position. Every buyback is sized against its
+    /// liquidity and never against the pool's whole in-range liquidity, which anybody can add to
+    /// in the same transaction (1.8.0, F1).
+    uint256 public buybackAnchor;
+
+    /// @notice The creator's share of that position's LP fee, as the locker recorded it. It feeds
+    /// the sandwich bound in `_legFees`, the same way a conversion's does.
+    uint16 public buybackLpCreatorBps;
 
     /// @notice Minimum quote balance before a buyback runs. Below it, revenue accumulates.
     /// A swap costs the same gas whether it moves a dollar or a thousand.
@@ -311,11 +376,19 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice When the last buyback ran.
     uint64 public lastBuybackAt;
 
-    /// @notice Most `QUOTE` one buyback may offer, on either path. Zero means no cap.
+    /// @notice Most `QUOTE` one buyback may offer, on either path, and the most `QUOTE` one
+    /// conversion may be worth. Zero means it has not been set, and then nothing trades (1.8.0).
     /// @dev The impact cap already bounds what a buyback can MOVE; this bounds what it can
     /// SPEND, so one call never commits the whole backlog. That matters because spend grows with
     /// depth: whoever deepens the pool right before a buyback also raises what the impact cap
     /// allows. It is the TWAP's tranche size.
+    ///
+    /// 🔴 1.7.0 read zero as "no cap". The 2026-10-01 audit showed that the cap is what bounds a
+    /// JIT sandwich's prize: a pump-and-JIT attacker earns about `tranche * x / (1 + x)` and pays
+    /// about `fee * depth * x`. So the attack is unprofitable for any pump once the tranche is
+    /// under `fee * depth`. That is ~67 wINJ for an outsider on the mainnet burn pool, and ~20
+    /// for whoever holds its creator key. Anchored sizing (`_sizingLiquidity`) closes the attack
+    /// on its own. This is the second, independent bound, and a deploy must name it on purpose.
     uint256 public maxBuybackAmount;
 
     /// @notice The key that runs scheduled buybacks through `operatorBuyback`. Zero means none,
@@ -330,8 +403,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// appointed operator is not bypassed before it has had a chance to run.
     uint64 public operatorSince;
 
-    /// @notice When the operator last bought anything. Only a real fill counts, so an operator
-    /// that runs but never trades cannot hold the fallback shut.
+    /// @notice When the operator last bought at least `minBuybackAmount`. Only a real fill counts,
+    /// so an operator that runs but never trades - or trades dust - cannot hold the fallback shut.
     uint64 public lastOperatorBuybackAt;
 
     /// @notice The `PositionLocker`s a conversion may read a graduate's pool key out of.
@@ -410,6 +483,15 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// is registered for against `QUOTE`, so the owner chooses a VENUE, never a destination.
     mapping(Currency asset => PoolKey key) internal _quoteRoutes;
 
+    /// @notice The liquidity a registered quote route is SIZED against, named with the route
+    /// (1.8.0, F1).
+    /// @dev A route is an ordinary pool with no locked position in it, so nothing on chain says
+    /// how much of its liquidity will still be there after the transaction. The owner names a
+    /// ceiling at or under the pool's real depth. If that depth later falls under the ceiling,
+    /// the ceiling is stale and has to be lowered. `maxBuybackAmount` still caps what one
+    /// conversion can be worth in the meantime.
+    mapping(Currency asset => uint128 liquidity) public quoteRouteDepth;
+
     /// @notice D32. A launch token designated to accumulate here instead of being converted.
     /// @dev Also the gate on `sweep`: what is not held is burn revenue and cannot be taken out.
     mapping(Currency currency => bool held) public isHeld;
@@ -430,73 +512,20 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// a lock THIS contract opened rather than merely on the vault's identity.
     uint256 private constant LOCK_OPEN_SLOT = 0xbb393ca8346e746397cbb72e3dd898fcb21e70d8c1e3b5ee10773bc10d26776e;
 
-    error ZeroAddress();
-    error InvalidBps(uint16 bps);
-    error BurnBpsBelowFloor(uint16 given, uint16 floor);
-    error PoolMissingLeg();
-    error PoolNotInitialised();
-    error ImpactBpsTooLow(uint16 given, uint16 floor);
-    error RateLimitRequired();
-    error NotVault();
-    error LockNotOpen();
-    error NotSelf();
-    error CannotSweepBuybackLeg(Currency currency);
-    error NotAConvertibleCurrency(Currency currency);
-    error SweepRequiresHold(Currency currency);
-    error LaunchDoesNotTrade(uint256 launchId, Currency currency);
-    error TooManyLockers(uint256 given, uint256 max);
-    error DuplicateLocker(address locker);
-    error LockerHasAnotherPositionManager(address locker);
-    error RouteMissingLeg(Currency asset);
-    error NotOperator(address caller);
-    error NoBuybackPool();
-    error NothingToBuyBack();
-    /// @dev Raised inside the lock when the pool has no liquidity between spot and the limit, so
-    /// the leg could not fill at all. It unwinds the lock, and on the permissionless path the
-    /// `try` turns that into a park that spends no rate-limit window.
-    error NothingFillable();
-    error BelowMinimumRate(uint256 spent, uint256 received, uint256 minOutPerInWad);
+    // Errors, events and `Route` are declared in `IBuybackBurnSink`.
 
-    /// @param quoteSpent quote actually consumed; may be less than offered if the limit bound.
-    event BoughtBack(uint256 quoteOffered, uint256 quoteSpent, uint256 tokensReceived);
-    /// @param burnt destroyed via `BURN_TOKEN.burn`; `toTreasury` is the ops remainder.
-    event Burnt(uint256 burnt, uint256 toTreasury);
-    /// @param quoteReceived what the sink now holds to buy back with; it goes on to do so.
-    event Converted(Currency indexed currency, uint256 offered, uint256 spent, uint256 quoteReceived);
-    /// @param reason 0 = below the minimum, 1 = inside `minBuybackInterval`, 2 = currency has no
-    /// route, 3 = the swap itself reverted, 4 = the burn/treasury settle reverted, 5 = held by
-    /// policy (D32), 6 = a launch token reached `burn`, which carries no launch id to look its
-    /// pool up by - `convert(currency, launchId)` is what moves it. Funds stay here in every
-    /// case. 7 = the operator is live and the permissionless buyback waits for it (1.7.0).
-    event Parked(Currency indexed currency, uint256 amount, uint8 reason);
-    event OperatorUpdated(address operator, uint32 publicFallbackDelay);
-    event MaxBuybackAmountUpdated(uint256 maxBuybackAmount);
-    event BurnBpsUpdated(uint16 oldBps, uint16 newBps);
-    event TreasuryUpdated(address oldTreasury, address newTreasury);
-    event BuybackPoolUpdated(PoolKey key, bool quoteIsCurrency0);
-    event GuardsUpdated(uint256 minBuybackAmount, uint16 maxImpactBps, uint32 minBuybackInterval);
-    event LockersUpdated(address[] lockers);
-    /// @param key the pool the asset reaches `QUOTE` through; a zero `poolManager` clears it.
-    event QuoteRouteUpdated(Currency indexed asset, PoolKey key, bool assetIsCurrency0);
-    event HoldUpdated(Currency indexed currency, bool held);
-    event MinConvertAmountUpdated(Currency indexed currency, uint256 amount);
-    event TokenSwept(Currency indexed currency, address indexed to, uint256 amount);
-
-    /// @notice A resolved conversion path: one or two exact-input swaps ending in `QUOTE`.
-    /// @dev Fixed-size rather than an array, because this contract builds at most two legs and a
-    /// bounded shape is one less thing a lock callback can be handed too much of.
-    struct Route {
-        PoolKey first;
-        bool firstZeroForOne;
-        PoolKey second;
-        bool secondZeroForOne;
-        /// @dev 0 = no route, 1 = straight to `QUOTE`, 2 = through a registered quote route.
-        uint8 legs;
-        /// @dev 1.7.0. The share of the FIRST leg's LP fee that is paid to a launch's creator, in
-        /// bps: read off the locked position when that leg is a launch's own graduation pool,
-        /// and 10000 (assume all of it) otherwise. It feeds the sandwich bound in `_legFees`,
-        /// because a creator gets that share of their own LP fee back.
-        uint16 firstLpCreatorBps;
+    /// @notice What each leg of a route is SIZED against: liquidity nobody can add in the same
+    /// transaction (1.8.0, F1).
+    /// @dev Kept out of `Route`, because the keeper decodes `conversionRoute` and an extended
+    /// struct already broke that decode once (#284).
+    struct Depth {
+        /// @dev The locked position under the first leg, when that leg is a launch's graduation
+        /// pool. Zero when it is a registered quote route.
+        uint256 firstAnchor;
+        /// @dev The owner's ceiling for the first leg when it has no anchor.
+        uint128 firstCeiling;
+        /// @dev A second leg is always a registered route, so it always has a ceiling.
+        uint128 secondCeiling;
     }
 
     uint8 private constant PARK_BELOW_MINIMUM = 0;
@@ -507,6 +536,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     uint8 private constant PARK_HELD = 5;
     uint8 private constant PARK_NEEDS_HINT = 6;
     uint8 private constant PARK_OPERATOR_MANAGED = 7;
+    uint8 private constant PARK_NO_TRANCHE_CAP = 8;
 
     constructor(
         IBurnableERC20 _burnToken,
@@ -524,7 +554,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         ) {
             revert ZeroAddress();
         }
-        if (_minBurnBps > BPS_DENOMINATOR) revert InvalidBps(_minBurnBps);
+        // Zero would be a sink that never buys: `_tranche` offers `burnBps` of the balance.
+        if (_minBurnBps == 0 || _minBurnBps > BPS_DENOMINATOR) revert InvalidBps(_minBurnBps);
         if (_burnBps > BPS_DENOMINATOR) revert InvalidBps(_burnBps);
         if (_burnBps < _minBurnBps) revert BurnBpsBelowFloor(_burnBps, _minBurnBps);
 
@@ -579,7 +610,9 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             (r.first, r.firstZeroForOne, ok) = _hopFor(currency);
             r.legs = ok ? 1 : 0;
             r.firstLpCreatorBps = BPS_DENOMINATOR;
-            _tryConvert(currency, r);
+            Depth memory d;
+            d.firstCeiling = quoteRouteDepth[currency];
+            _tryConvert(currency, r, d);
         } else {
             // A launch token. It PARKS here, and that is a deliberate consequence of A5.
             //
@@ -610,34 +643,42 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
 
     /// @notice The scheduled buyback: one TWAP tranche, refused unless it beats the operator's
     /// minimum rate.
-    /// @param maxQuoteIn Most `QUOTE` to offer. Clamped to the balance and to `maxBuybackAmount`,
-    /// and inside the lock to what reaches the impact cap. So this is a ceiling, not an order size.
+    /// @param maxQuoteIn Most `QUOTE` to offer. Clamped to `burnBps` of the unowed balance and to
+    /// `maxBuybackAmount`, and inside the lock to what reaches the impact cap. So this is a
+    /// ceiling, not an order size.
     /// @param minOutPerInWad Least `BURN_TOKEN` per `QUOTE`, both in raw units, scaled by 1e18.
-    /// The operator prices it off a TWAP it keeps itself. Zero skips the check, which leaves this
-    /// exactly as safe as `buyback()` and no safer.
+    /// The operator prices it off a TWAP it keeps itself. Required since 1.8.0: zero reverts.
     /// @return spent `QUOTE` actually consumed, fee included.
-    /// @return received `BURN_TOKEN` bought, before the burn/treasury split.
+    /// @return received `BURN_TOKEN` bought, all of which is burnt.
     ///
     /// @dev Unlike every permissionless path, this one REVERTS on failure, with a named error.
     /// Nothing depends on it not reverting: it is not on the harvest path, and a caller who priced
     /// its minimum wrong should find out from the error, not from a `Parked` event.
     ///
-    /// No rate limit, because the operator's schedule IS the rate limit, and the fee cap makes
-    /// every sandwich of a single buyback unprofitable however often one runs. A fill does start
-    /// the permissionless window as well (`lastBuybackAt`), so the two paths never double up.
+    /// 🔴 **Rate-limited since 1.8.0 (F2).** 1.7.0 had no limit here, on the theory that the
+    /// operator's schedule was the limit. But a stolen key keeps no schedule. It could pump, call
+    /// this seven or more times in one transaction, and walk the price seven fee-caps at the
+    /// sink's expense, with the tranche cap applying to each call separately. The operator now
+    /// shares `minBuybackInterval` and `lastBuybackAt` with the public path: one fill per window,
+    /// whoever makes it.
     ///
     /// 🔑 **What an operator key can and cannot do.** It chooses when and how much, within the
-    /// same caps as anyone, and it can refuse a price. It cannot move a token anywhere but into
-    /// the burn, and the per-leg fee cap means it cannot profitably sandwich its own call. So a
-    /// stolen key is worth nothing to the thief. The most it can do is stall buybacks, and only
-    /// until `publicFallbackDelay` reopens the public path.
+    /// same caps and window as anyone, and it can refuse a price. It cannot move a token anywhere
+    /// but into the burn. Each call is sized against locked liquidity under the fee cap, so it
+    /// cannot profitably sandwich its own call. The most a stolen key can do is stall buybacks,
+    /// and only until `publicFallbackDelay` reopens the public path. A dust fill no longer resets
+    /// that clock.
     function operatorBuyback(uint256 maxQuoteIn, uint256 minOutPerInWad)
         external
         nonReentrant
         returns (uint256 spent, uint256 received)
     {
         if (msg.sender != operator) revert NotOperator(msg.sender);
+        if (minOutPerInWad == 0) revert MinimumRateRequired();
         if (address(buybackPool.poolManager) == address(0)) revert NoBuybackPool();
+        if (lastBuybackAt != 0 && block.timestamp < uint256(lastBuybackAt) + minBuybackInterval) {
+            revert RateLimited(uint256(lastBuybackAt) + minBuybackInterval);
+        }
         uint256 amountIn = _tranche(maxQuoteIn);
         if (amountIn == 0) revert NothingToBuyBack();
 
@@ -647,17 +688,19 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // No `try`: a failure here is the operator's to see. The flag is cleared on the way out,
         // and a revert takes the `tstore` with it.
         _setLockOpen(true);
-        VAULT.lock(abi.encode(_buybackRoute(), amountIn, minOutPerInWad));
+        VAULT.lock(abi.encode(_buybackRoute(), _buybackDepth(), amountIn, minOutPerInWad, uint256(0)));
         _setLockOpen(false);
 
         spent = quoteBefore - QUOTE.balanceOfSelf();
         received = IERC20(address(BURN_TOKEN)).balanceOf(address(this)) - tokensBefore;
 
         lastBuybackAt = uint64(block.timestamp);
-        lastOperatorBuybackAt = uint64(block.timestamp);
+        if (spent >= minBuybackAmount) lastOperatorBuybackAt = uint64(block.timestamp);
         emit BoughtBack(amountIn, spent, received);
 
+        _accrueTreasury(spent);
         _settleBurnToken();
+        _payTreasury();
     }
 
     /// @notice Convert a parked launch token to `QUOTE` now, and buy back with the proceeds.
@@ -695,9 +738,16 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         }
         // Argument validation before state: a caller with a bad hint is told so even when the
         // tranche would have parked for an unrelated reason.
-        Route memory route = _resolveRoute(currency, launchId);
+        (Route memory route, Depth memory depth) = _resolve(currency, launchId);
         if (route.legs == 0) revert LaunchDoesNotTrade(launchId, currency);
-        _tryConvert(currency, route);
+        _tryConvert(currency, route, depth);
+    }
+
+    /// @notice Pay `treasury` the `QUOTE` it is owed, now. Permissionless: the recipient is fixed.
+    /// @dev Every buyback already tries this. It exists for the case where the last attempt failed
+    /// and no buyback has run since.
+    function payTreasury() external nonReentrant {
+        _payTreasury();
     }
 
     // -------------------------------------------------------------------------------------
@@ -705,7 +755,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     // -------------------------------------------------------------------------------------
 
     function _tryBuyback() private {
-        uint256 balance = QUOTE.balanceOfSelf();
+        // What is not already owed to the treasury. 1.8.0: the ops share is never spent here.
+        uint256 balance = _spendable();
         if (balance < minBuybackAmount || balance == 0) {
             emit Parked(QUOTE, balance, PARK_BELOW_MINIMUM);
             return;
@@ -731,7 +782,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             emit Parked(QUOTE, balance, PARK_NO_ROUTE);
             return;
         }
+        // 1.8.0: a sink that was never told how much one buyback may spend does not guess.
+        if (maxBuybackAmount == 0) {
+            emit Parked(QUOTE, balance, PARK_NO_TRANCHE_CAP);
+            return;
+        }
 
+        uint256 quoteBefore = QUOTE.balanceOfSelf();
         uint256 tokensBefore = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
 
         // The one gate that cannot be enumerated. Everything reachable from inside the lock -
@@ -740,7 +797,9 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // else's - reverts the sub-call and lands here instead of unwinding the harvest.
         bool swapped;
         _setLockOpen(true);
-        try VAULT.lock(abi.encode(_buybackRoute(), amountIn, uint256(0))) returns (bytes memory) {
+        try VAULT.lock(abi.encode(_buybackRoute(), _buybackDepth(), amountIn, uint256(0), uint256(0))) returns (
+            bytes memory
+        ) {
             swapped = true;
         } catch {
             swapped = false;
@@ -765,32 +824,66 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         uint256 received = IERC20(address(BURN_TOKEN)).balanceOf(address(this)) - tokensBefore;
         // Off the balance, not off `amountIn`: the lock may have spent less than it was offered
         // (sized to the impact cap), and what it left is simply still here.
-        uint256 spent = balance - QUOTE.balanceOfSelf();
+        uint256 spent = quoteBefore - QUOTE.balanceOfSelf();
         emit BoughtBack(amountIn, spent, received);
 
+        _accrueTreasury(spent);
         _settleBurnToken();
+        _payTreasury();
     }
 
-    /// @dev The one-leg route every buyback takes: `QUOTE` in, `BURN_TOKEN` out, through the
-    /// owner-named pool.
+    /// @dev The one-leg route every buyback takes: `QUOTE` in, `BURN_TOKEN` out, through the burn
+    /// token's own graduation pool.
     function _buybackRoute() private view returns (Route memory route) {
         route.first = buybackPool;
         route.firstZeroForOne = quoteIsCurrency0;
         route.legs = 1;
-        // The buyback pool is the burn token's own graduation pool, and nothing here says what its
-        // locked position pays the creator. So any LP fee on it is assumed to go back to a trader.
-        // On a fee-hook graduation pool the LP fee is zero, and the hook's own share is read in
+        // 1.8.0 reads this off the burn token's locked position, as a conversion does. 1.7.0
+        // assumed the creator took ALL of the LP fee, which left a guard-hooked burn pool (LP fee
+        // and no hook fee) with a bound of zero, so it could never buy back. On a fee-hook
+        // graduation pool the LP fee is zero either way, and the hook's own share is read in
         // `_legFees`.
-        route.firstLpCreatorBps = BPS_DENOMINATOR;
+        route.firstLpCreatorBps = buybackLpCreatorBps;
     }
 
-    /// @dev What one buyback may offer: the balance, clamped by the caller's ceiling and by
-    /// `maxBuybackAmount`. The lock may still spend less. It sizes the swap to the impact cap.
+    /// @dev Every buyback is sized against the burn token's locked graduation position.
+    function _buybackDepth() private view returns (Depth memory depth) {
+        depth.firstAnchor = buybackAnchor;
+    }
+
+    /// @dev `QUOTE` held here that is not owed to the treasury.
+    function _spendable() private view returns (uint256) {
+        uint256 balance = QUOTE.balanceOfSelf();
+        uint256 owed = treasuryOwed;
+        return balance > owed ? balance - owed : 0;
+    }
+
+    /// @dev What one buyback may offer: `burnBps` of the unowed balance, clamped by the caller's
+    /// ceiling and by `maxBuybackAmount`. The lock may still spend less, because it sizes the
+    /// swap to the impact cap. Zero when no cap is set (1.8.0).
+    ///
+    /// 🔑 Offering `burnBps` of the balance rather than all of it is what keeps `treasuryOwed`
+    /// covered. Whatever is spent, `_accrueTreasury` sets aside `spent * (1 - b) / b`, and with
+    /// `spent <= S * b` that is at most `S * (1 - b)`. So the spend plus the ops share never
+    /// exceeds the unowed balance `S`.
     function _tranche(uint256 ceiling) private view returns (uint256 amountIn) {
-        amountIn = QUOTE.balanceOfSelf();
-        if (ceiling < amountIn) amountIn = ceiling;
         uint256 cap = maxBuybackAmount;
-        if (cap != 0 && cap < amountIn) amountIn = cap;
+        if (cap == 0) return 0;
+        amountIn = _spendable() * burnBps / BPS_DENOMINATOR;
+        if (ceiling < amountIn) amountIn = ceiling;
+        if (cap < amountIn) amountIn = cap;
+    }
+
+    /// @dev Set aside the ops share of a buyback that spent `spent`: `1 - burnBps` of revenue
+    /// for every `burnBps` that bought the burn token.
+    function _accrueTreasury(uint256 spent) private {
+        uint16 b = burnBps;
+        if (spent == 0 || b == BPS_DENOMINATOR) return;
+        uint256 accrued = spent * (BPS_DENOMINATOR - b) / b;
+        if (accrued == 0) return;
+        uint256 owed = treasuryOwed + accrued;
+        treasuryOwed = owed;
+        emit TreasuryAccrued(accrued, owed);
     }
 
     /// @dev Whether a live operator is holding the permissionless buyback shut. It holds for
@@ -820,7 +913,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// through a pool with a fee hook on it would not be taxed by that hook - the sink is not the
     /// hook here, but the graduation pool's guard hook registers `beforeInitialize` and nothing
     /// else, so there is no swap-time hook on this path at all.
-    function _tryConvert(Currency currency, Route memory route) private {
+    function _tryConvert(Currency currency, Route memory route, Depth memory depth) private {
         uint256 amountIn = currency.balanceOfSelf();
 
         // D32 first, so a held token reports the POLICY rather than whichever guard it happens
@@ -842,6 +935,14 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             emit Parked(currency, amountIn, PARK_RATE_LIMITED);
             return;
         }
+        // 1.8.0 (F1): a conversion is capped at what `maxBuybackAmount` of `QUOTE` is worth. The
+        // cap is in `QUOTE` because a launch token's units mean nothing, so the lock converts it at
+        // the route's spot prices. Unset means nothing trades, as on the buyback path.
+        uint256 outputCap = maxBuybackAmount;
+        if (outputCap == 0) {
+            emit Parked(currency, amountIn, PARK_NO_TRANCHE_CAP);
+            return;
+        }
 
         uint256 quoteBefore = QUOTE.balanceOfSelf();
 
@@ -851,7 +952,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // returndata, so a pre-flight existence check is itself a way to revert.
         bool swapped;
         _setLockOpen(true);
-        try VAULT.lock(abi.encode(route, amountIn, uint256(0))) returns (bytes memory) {
+        try VAULT.lock(abi.encode(route, depth, amountIn, uint256(0), outputCap)) returns (bytes memory) {
             swapped = true;
         } catch {
             swapped = false;
@@ -896,9 +997,17 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// accidentally get sold into the launch's own pool: `currency == SAI` matches the pool at
     /// step 1, but the other side is the launch token, which is not `QUOTE` and has no route -
     /// so step 1 declines, and step 3 sells it through the route the owner registered instead.
-    function _resolveRoute(Currency currency, uint256 launchId) internal view returns (Route memory route) {
+    ///
+    /// 1.8.0: it also says what each leg is SIZED against. A launch's own pool is anchored on its
+    /// locked position, and a registered route on the ceiling named with it.
+    function _resolve(Currency currency, uint256 launchId)
+        internal
+        view
+        returns (Route memory route, Depth memory depth)
+    {
         route.firstLpCreatorBps = BPS_DENOMINATOR;
-        (PoolKey memory launchKey, bool zeroForOne, bool found, uint16 creatorBps) = _launchPoolFor(currency, launchId);
+        (PoolKey memory launchKey, bool zeroForOne, bool found, uint16 creatorBps, uint256 tokenId) =
+            _launchPoolFor(currency, launchId);
         if (found) {
             Currency other = zeroForOne ? launchKey.currency1 : launchKey.currency0;
             if (other == QUOTE) {
@@ -906,7 +1015,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
                 route.firstZeroForOne = zeroForOne;
                 route.firstLpCreatorBps = creatorBps;
                 route.legs = 1;
-                return route;
+                depth.firstAnchor = tokenId;
+                return (route, depth);
             }
             (PoolKey memory hop, bool hopZeroForOne, bool hopFound) = _hopFor(other);
             if (hopFound) {
@@ -916,7 +1026,9 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
                 route.second = hop;
                 route.secondZeroForOne = hopZeroForOne;
                 route.legs = 2;
-                return route;
+                depth.firstAnchor = tokenId;
+                depth.secondCeiling = quoteRouteDepth[other];
+                return (route, depth);
             }
         }
 
@@ -925,7 +1037,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             route.first = direct;
             route.firstZeroForOne = directZeroForOne;
             route.legs = 1;
+            depth.firstCeiling = quoteRouteDepth[currency];
         }
+    }
+
+    /// @dev The route alone, for the views that have always answered with one.
+    function _resolveRoute(Currency currency, uint256 launchId) internal view returns (Route memory route) {
+        (route,) = _resolve(currency, launchId);
     }
 
     /// @dev Whether `asset` can reach `QUOTE` in one swap. Registered, or not at all.
@@ -988,10 +1106,12 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// hold this currency at all.
     /// @return creatorBps The creator's share of that position's LP fee, as the locker recorded it
     /// at graduation. The sandwich bound needs it: see `_legFees`.
+    /// @return tokenId The locked position itself: what a swap through this pool is sized against
+    /// (1.8.0).
     function _launchPoolFor(Currency currency, uint256 launchId)
         private
         view
-        returns (PoolKey memory key, bool zeroForOne, bool found, uint16 creatorBps)
+        returns (PoolKey memory key, bool zeroForOne, bool found, uint16 creatorBps, uint256 tokenId)
     {
         address[] memory set = _lockers;
         for (uint256 i; i < set.length; ++i) {
@@ -999,8 +1119,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             if (position.tokenId == 0) continue;
 
             (PoolKey memory held,) = POSITION_MANAGER.getPoolAndPositionInfo(position.tokenId);
-            if (held.currency0 == currency) return (held, true, true, position.creatorBps);
-            if (held.currency1 == currency) return (held, false, true, position.creatorBps);
+            if (held.currency0 == currency) return (held, true, true, position.creatorBps, position.tokenId);
+            if (held.currency1 == currency) return (held, false, true, position.creatorBps, position.tokenId);
         }
     }
 
@@ -1019,7 +1139,16 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // The ROUTE travels with the call. Every path this contract opens - a buyback, a
         // one-leg conversion, a two-leg conversion through a registered quote route - is the
         // same shape, so they share one callback rather than one each.
-        (Route memory route, uint256 amountIn, uint256 minOutPerInWad) = abi.decode(data, (Route, uint256, uint256));
+        (Route memory route, Depth memory depth, uint256 amountIn, uint256 minOutPerInWad, uint256 outputCap) =
+            abi.decode(data, (Route, Depth, uint256, uint256, uint256));
+
+        // 1.8.0: a conversion may be worth at most `outputCap` of `QUOTE` at the route's spot. A
+        // buyback passes zero, because its input already IS `QUOTE` and `_tranche` capped it.
+        uint256 amount = amountIn;
+        if (outputCap != 0) {
+            uint256 capIn = _inputWorth(route, outputCap);
+            if (capIn < amount) amount = capIn;
+        }
 
         // 🔑 ONE COMPOSITE BOUND, split across the legs, rather than one bound per leg.
         //
@@ -1038,7 +1167,6 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         // below are compared in the unit the pool itself uses.
         uint256 perLegPips = uint256(maxImpactBps) * PIPS_PER_BPS / route.legs;
 
-        uint256 amount = amountIn;
         for (uint8 i; i < route.legs; ++i) {
             PoolKey memory key = i == 0 ? route.first : route.second;
             bool zeroForOne = i == 0 ? route.firstZeroForOne : route.secondZeroForOne;
@@ -1046,10 +1174,10 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             ICLPoolManager manager = ICLPoolManager(address(key.poolManager));
 
             // Read inside the lock rather than passed in, so a `getSlot0` that reverts - an
-            // uninitialised pool reached despite `setBuybackPool`'s check, or a route pool that
+            // uninitialised pool reached despite `setBuybackLaunch`'s check, or a route pool that
             // has since been closed - is caught by the caller's `try/catch` along with
             // everything else, instead of escaping it.
-            (uint160 sqrtPriceX96,, uint24 protocolFee, uint24 lpFee) = manager.getSlot0(id);
+            (uint160 sqrtPriceX96, int24 tick, uint24 protocolFee, uint24 lpFee) = manager.getSlot0(id);
             (uint256 swapFeePips, uint256 hookFeePips, uint256 unrecoverablePips) =
                 _legFees(key, id, zeroForOne, protocolFee, lpFee, i == 0 ? route.firstLpCreatorBps : BPS_DENOMINATOR);
 
@@ -1067,8 +1195,21 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
             // limit cuts short would still pay the fee on the whole request. Sized here, the
             // swap normally fills in full, and whatever was not asked for simply stays in this
             // contract for the next window.
-            uint256 fillable =
-                _fillableInput(manager.getLiquidity(id), sqrtPriceX96, limit, zeroForOne, swapFeePips, hookFeePips);
+            //
+            // 🔴 1.8.0 (F1): sized against liquidity nobody can add in this transaction. 1.7.0
+            // used `getLiquidity`, so an attacker could pump, open a one-tick position at the top,
+            // and have the whole tranche fill against it while the price barely moved: inside the
+            // fee cap, at a price of their making. Liquidity they add now only makes the swap
+            // move LESS than its sizing assumed. It no longer makes the swap bigger.
+            uint128 sizing = _sizingLiquidity(
+                manager,
+                id,
+                tick,
+                legPips,
+                i == 0 ? depth.firstAnchor : 0,
+                i == 0 ? depth.firstCeiling : depth.secondCeiling
+            );
+            uint256 fillable = _fillableInput(sizing, sqrtPriceX96, limit, zeroForOne, swapFeePips, hookFeePips);
             if (fillable < amount) amount = fillable;
             if (amount == 0) {
                 // Nothing between spot and the limit, or a limit equal to spot because the
@@ -1201,9 +1342,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     ///
     /// 🔑 An attacker's OWN liquidity does not lower their cost. Liquidity they place in range
     /// earns back the fee on the part of their swap that trades against it, but that part moves
-    /// no price. Moving the price still means paying the fee on everybody else's liquidity. What
-    /// a JIT position does take is a share of the sink's own fee, which is a small leak and not a
-    /// sandwich. The per-tranche cap (`maxBuybackAmount`) is what bounds it.
+    /// no price. Moving the price still means paying the fee on everybody else's liquidity.
+    ///
+    /// 🔴 What 1.7.0 missed is that a JIT position raises what the SINK spends. The swap was sized
+    /// from the pool's in-range liquidity, so a one-tick position at a pumped price let the whole
+    /// tranche fill there without crossing the fee cap. The 2026-10-01 audit (F1) found it. 1.8.0
+    /// sizes every leg against liquidity the attacker cannot add (`_sizingLiquidity`), and that
+    /// restores this bound's 2x margin.
     function _legFees(
         PoolKey memory key,
         PoolId id,
@@ -1236,14 +1381,15 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         } catch {}
     }
 
-    /// @dev The exact input that walks the pool from `sqrtPriceX96` to `limit` and no further,
-    /// grossed up for the fees taken from the input on the way.
+    /// @dev The exact input that would walk `liquidity` from `sqrtPriceX96` to `limit` and no
+    /// further, grossed up for the fees taken from the input on the way.
     ///
-    /// Reads the pool's CURRENT in-range liquidity only. If liquidity changes between spot and the
-    /// limit, the estimate is off in the harmless direction either way: more liquidity past a
-    /// tick means the swap stops short of the limit having spent everything asked, and less
-    /// means the limit cuts it slightly short. For a graduation pool, the locked full-range
-    /// position dominates, and the estimate is exact to rounding.
+    /// Since 1.8.0, `liquidity` is the SIZING liquidity from `_sizingLiquidity`, not the pool's.
+    /// Any real liquidity above it only makes the swap stop short of the limit having spent
+    /// everything it asked for. On an anchored leg that liquidity covers the whole walk, so the
+    /// swap never asks for more than it can fill, and the hook's fee is never charged on unfilled
+    /// input (the audit's F4). On a graduation pool with no other LPs, the estimate is exact to
+    /// rounding.
     ///
     /// The hook fee is grossed up on every leg, including sells, where `LaunchPoolFeeHook` takes it
     /// from the OUTPUT instead. There that over-asks a little, the limit binds, and the rest of
@@ -1264,6 +1410,72 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         if (swapFeePips >= PIPS_DENOMINATOR) return 0;
         gross = FullMath.mulDiv(net, PIPS_DENOMINATOR, PIPS_DENOMINATOR - swapFeePips);
         gross = FullMath.mulDiv(gross, PIPS_DENOMINATOR, PIPS_DENOMINATOR - hookFeePips);
+    }
+
+    /// @dev The liquidity a leg is SIZED against: the pool's in-range liquidity, but never more
+    /// than the leg's trusted figure (1.8.0, F1).
+    ///
+    /// - **Anchored** (a launch's graduation pool): the locked position's liquidity. That
+    ///   position can never be withdrawn, since `PositionLocker` only ever decreases by zero to
+    ///   collect. It counts only if its range covers the WHOLE walk from spot to `limit`. A
+    ///   position the price has left is not in range, and then the in-range liquidity could be
+    ///   entirely an attacker's. Graduation positions are full-range, so this never bites on a
+    ///   real graduate.
+    /// - **Unanchored** (a registered quote route): the ceiling the owner named with the route.
+    ///
+    /// Taking the MINIMUM with `getLiquidity` means liquidity that left the pool can only shrink
+    /// a swap, and liquidity that arrived in this transaction can never grow one.
+    function _sizingLiquidity(
+        ICLPoolManager manager,
+        PoolId id,
+        int24 tick,
+        uint256 legPips,
+        uint256 anchor,
+        uint128 ceiling
+    ) private view returns (uint128 liquidity) {
+        uint128 trusted = anchor != 0 ? _anchoredLiquidity(anchor, id, tick, legPips) : ceiling;
+        liquidity = manager.getLiquidity(id);
+        if (trusted < liquidity) liquidity = trusted;
+    }
+
+    /// @dev A locked position's liquidity, or zero unless it sits in this pool and its range
+    /// covers every tick a walk of `legPips` from `tick` could reach.
+    ///
+    /// A walk moves the SQRT price by at most `h = legPips / 2e6` (see `_priceLimit`), and so the
+    /// tick by at most `2|ln(1 - h)| / ln(1.0001)`. That is under `legPips / 50` for any `h` up to
+    /// one half, which `setGuards` guarantees. Taking it in both directions costs a tick or two
+    /// against a full-range position and saves this contract the tick-to-price table.
+    function _anchoredLiquidity(uint256 tokenId, PoolId id, int24 tick, uint256 legPips)
+        private
+        view
+        returns (uint128)
+    {
+        (, CLPositionInfo info) = POSITION_MANAGER.getPoolAndPositionInfo(tokenId);
+        // The position manager keeps the top 25 bytes of the pool id.
+        if (info.poolId() != bytes25(PoolId.unwrap(id))) return 0;
+        int256 margin = int256(legPips / 50) + 1;
+        if (int256(info.tickLower()) > int256(tick) - margin || int256(tick) + margin >= int256(info.tickUpper())) {
+            return 0;
+        }
+        return POSITION_MANAGER.getPositionLiquidity(tokenId);
+    }
+
+    /// @dev How much of a route's INPUT is worth `quoteOut` of `QUOTE` at the route's spot
+    /// prices. It walks back from the last leg, which pays out `QUOTE`. It ignores fees, so it
+    /// slightly over-states the input, which is harmless under a cap the swap then sizes on its
+    /// own. It reverts on an uninitialised pool, which the caller's `try` turns into a park.
+    function _inputWorth(Route memory route, uint256 quoteOut) private view returns (uint256 amount) {
+        amount = quoteOut;
+        for (uint256 j = route.legs; j > 0; --j) {
+            PoolKey memory key = j == 1 ? route.first : route.second;
+            bool zeroForOne = j == 1 ? route.firstZeroForOne : route.secondZeroForOne;
+            (uint160 sqrtPriceX96,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
+            // price = currency1 per currency0 = (sqrtPriceX96 / 2^96)^2. Selling 0 -> 1 pays out
+            // currency1, so the input is output / price. Selling 1 -> 0 makes it output * price.
+            (uint256 num, uint256 den) =
+                zeroForOne ? (FixedPoint96.Q96, uint256(sqrtPriceX96)) : (uint256(sqrtPriceX96), FixedPoint96.Q96);
+            amount = FullMath.mulDiv(FullMath.mulDiv(amount, num, den), num, den);
+        }
     }
 
     /// @dev The operator's minimum: at least `minOutPerInWad` of the route's final output per
@@ -1298,16 +1510,16 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// `lastBuybackAt` is written by then, so propagating would unwind a good swap rather than
     /// merely refusing a settle.
     ///
-    /// Neither leg is unfailable. `BURN_TOKEN.burn` and the treasury transfer both route through
-    /// the bank precompile on a `MintBurnBankERC20`, and `treasury` is owner-settable to any
-    /// address - a module account among them.
+    /// `BURN_TOKEN.burn` routes through the bank precompile on a `MintBurnBankERC20` and is not
+    /// unfailable. So it runs as an external self-call, the one shape Solidity can `try` that
+    /// catches everything underneath it.
     ///
-    /// ⛔ Wrapping the two legs in SEPARATE `try/catch`es is the obvious fix and it is wrong. A
-    /// burn that succeeds beside a transfer that fails leaves only the treasury's share sitting
-    /// here, and the next call - which acts on the BALANCE, as everything in this contract does -
-    /// would apply `burnBps` to that remainder and burn 80% of the ops share. The split has to be
-    /// all-or-nothing, so the whole settle goes through ONE external self-call: either both legs
-    /// land or the balance is untouched and parks intact for a later attempt.
+    /// 1.8.0: there is no split here any more. Every token bought is burnt, and the ops share was
+    /// set aside in `QUOTE` before buying (`_accrueTreasury`) and is paid by `_payTreasury`. The
+    /// two can now fail independently. 1.7.0's all-or-nothing self-call existed because both legs
+    /// split ONE balance, and a half-done split would have been re-split on the retry. A burn that
+    /// fails now leaves only tokens to burn, and a payout that fails leaves only `treasuryOwed`,
+    /// so either one is simply retried.
     function _settleBurnToken() private {
         uint256 balance = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
         if (balance == 0) return;
@@ -1319,48 +1531,65 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         }
     }
 
-    /// @notice The burn/treasury split, as an external function so it can be caught.
-    /// @dev Solidity cannot `try` a revert raised in its own frame, so the atomicity argued for
-    /// above needs a real external call. Callable by this contract ONLY - it moves the burn
-    /// token and would otherwise be a permissionless way to force the split at a chosen moment.
+    /// @notice The burn, as an external function so it can be caught.
+    /// @dev Solidity cannot `try` a revert raised in its own frame. Callable by this contract
+    /// ONLY, so that nobody else chooses the moment the burn happens.
     ///
     /// Deliberately NOT `nonReentrant`: it is reached from inside `burn`/`buyback`, both of
     /// which hold the guard, so carrying the modifier here would make every settle revert into
     /// the `catch` above and park the balance forever.
-    ///
-    /// The treasury gets the remainder rather than a second multiplication, so integer division
-    /// cannot strand dust here on every call.
     function settleBurnTokenSelf() external {
         if (msg.sender != address(this)) revert NotSelf();
 
         uint256 balance = IERC20(address(BURN_TOKEN)).balanceOf(address(this));
         if (balance == 0) return;
 
-        uint256 toBurn = balance * burnBps / BPS_DENOMINATOR;
-        uint256 toTreasury = balance - toBurn;
+        BURN_TOKEN.burn(balance);
+        emit Burnt(balance, 0);
+    }
 
-        if (toBurn > 0) BURN_TOKEN.burn(toBurn);
-        if (toTreasury > 0) IERC20(address(BURN_TOKEN)).safeTransfer(treasury, toTreasury);
+    /// @dev Pay the treasury what it is owed, parking on failure like everything else here. The
+    /// recipient is owner-set to any address, so the transfer is not unfailable either.
+    function _payTreasury() private {
+        uint256 owed = treasuryOwed;
+        if (owed == 0) return;
+        try this.payTreasurySelf() {}
+        catch {
+            emit Parked(QUOTE, owed, PARK_SETTLE_FAILED);
+        }
+    }
 
-        emit Burnt(toBurn, toTreasury);
+    /// @notice The ops payout, as an external function so it can be caught. This contract only.
+    /// @dev Not `nonReentrant`, for the reason `settleBurnTokenSelf` gives. A revert anywhere in
+    /// it restores `treasuryOwed`, so a failed payout is retried in full.
+    function payTreasurySelf() external {
+        if (msg.sender != address(this)) revert NotSelf();
+
+        uint256 owed = treasuryOwed;
+        if (owed == 0) return;
+        treasuryOwed = 0;
+        address to = treasury;
+        IERC20(Currency.unwrap(QUOTE)).safeTransfer(to, owed);
+        emit TreasuryPaid(to, owed);
     }
 
     // -------------------------------------------------------------------------------------
     // Views
     // -------------------------------------------------------------------------------------
 
-    /// @notice Quote revenue waiting to be spent.
+    /// @notice Quote revenue waiting to be spent. Excludes `treasuryOwed`, which is not the
+    /// buyback's to spend.
     function pendingQuote() external view returns (uint256) {
-        return QUOTE.balanceOfSelf();
+        return _spendable();
     }
 
     /// @notice Whether a `buyback()` right now would actually trade.
     /// @dev For keepers and dashboards deciding whether a call is worth its gas.
     function canBuyback() external view returns (bool) {
-        uint256 amountIn = QUOTE.balanceOfSelf();
+        uint256 amountIn = _spendable();
         return amountIn > 0 && amountIn >= minBuybackAmount && !_operatorHolds()
             && (lastBuybackAt == 0 || block.timestamp >= uint256(lastBuybackAt) + minBuybackInterval)
-            && address(buybackPool.poolManager) != address(0);
+            && address(buybackPool.poolManager) != address(0) && maxBuybackAmount != 0;
     }
 
     /// @notice When the permissionless buyback reopens under a live operator. Zero when no
@@ -1376,7 +1605,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// would offer, the pool's state and its fees.
     /// @return offer `QUOTE` the next buyback would offer before the lock sizes it to the limit.
     /// @return sqrtPriceX96 The buyback pool's spot, in the pool's own orientation.
-    /// @return liquidity Its in-range liquidity.
+    /// @return liquidity What the next buyback is SIZED against: the in-range liquidity, capped
+    /// at the burn token's locked position (1.8.0).
     /// @return swapFeePips The pool manager's composite fee in the buyback direction.
     /// @return hookFeePips A fee hook's charge on top.
     /// @return unrecoverablePips The sandwich bound: how far one buyback may move the price, at
@@ -1400,10 +1630,13 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         ICLPoolManager manager = ICLPoolManager(address(key.poolManager));
         uint24 protocolFee;
         uint24 lpFee;
-        (sqrtPriceX96,, protocolFee, lpFee) = manager.getSlot0(id);
-        liquidity = manager.getLiquidity(id);
+        int24 tick;
+        (sqrtPriceX96, tick, protocolFee, lpFee) = manager.getSlot0(id);
         (swapFeePips, hookFeePips, unrecoverablePips) =
-            _legFees(key, id, quoteIsCurrency0, protocolFee, lpFee, BPS_DENOMINATOR);
+            _legFees(key, id, quoteIsCurrency0, protocolFee, lpFee, buybackLpCreatorBps);
+        uint256 legPips = uint256(maxImpactBps) * PIPS_PER_BPS;
+        if (unrecoverablePips < legPips) legPips = unrecoverablePips;
+        liquidity = _sizingLiquidity(manager, id, tick, legPips, buybackAnchor, 0);
         offer = _tranche(type(uint256).max);
     }
 
@@ -1446,7 +1679,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         uint256 amountIn = currency.balanceOfSelf();
         uint64 last = lastConvertAt[currency];
         return amountIn > 0 && amountIn >= minConvertAmount[currency]
-            && (last == 0 || block.timestamp >= uint256(last) + minBuybackInterval);
+            && (last == 0 || block.timestamp >= uint256(last) + minBuybackInterval) && maxBuybackAmount != 0;
     }
 
     /// @notice The pool a launch token would convert through, and the direction it would sell.
@@ -1461,7 +1694,7 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     /// @notice A launch's real graduation pool key, whatever currencies it holds.
     /// @dev Unfiltered, unlike `conversionPool`: this one answers for a launch paired against
     /// something other than `QUOTE`, and for the burn token's own launch. That last case is the
-    /// point - `setBuybackPool` needs the burn token's own graduation key, and reading it off that
+    /// point - `setBuybackLaunch` reads the burn token's own graduation key, and reading it off that
     /// token's locked position is how a deploy script gets it without a human retyping a tier.
     /// @return key Zero when no locker in the set knows this launch.
     /// @return locker Which locker answered, or the zero address.
@@ -1498,30 +1731,36 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         treasury = newTreasury;
     }
 
-    /// @notice Point the buyback at a pool.
-    /// @dev Both legs are checked, so a key that does not actually trade the pair cannot be
-    /// installed - a misconfiguration here would otherwise park revenue silently forever.
-    function setBuybackPool(PoolKey calldata key) external onlyOwner {
-        address burnToken = address(BURN_TOKEN);
-        address quote = Currency.unwrap(QUOTE);
-        address c0 = Currency.unwrap(key.currency0);
-        address c1 = Currency.unwrap(key.currency1);
+    /// @notice Point the buyback at the burn token's own graduation pool, by the burn token's
+    /// launch id.
+    /// @dev 1.8.0 replaces `setBuybackPool(PoolKey)`. A buyback is sized against liquidity nobody
+    /// can add in the same transaction (F1), so the pool has to come with a position that cannot
+    /// leave. The burn token's locked graduation position is exactly that, and the locker that
+    /// holds it also names the real key. So the owner names a LAUNCH and the sink reads both off
+    /// the chain, the same way `convert` does. That gives up 1.7.0's option of following
+    /// liquidity to a deeper unanchored pool, which is the option F1 showed to be unsafe.
+    ///
+    /// The lockers have to be installed first, because they are what answers.
+    function setBuybackLaunch(uint256 launchId) external onlyOwner {
+        Currency burnToken = Currency.wrap(address(BURN_TOKEN));
+        (PoolKey memory key, bool burnIsCurrency0, bool found, uint16 creatorBps, uint256 tokenId) =
+            _launchPoolFor(burnToken, launchId);
+        if (!found) revert LaunchDoesNotTrade(launchId, burnToken);
+        if (!((burnIsCurrency0 ? key.currency1 : key.currency0) == QUOTE)) revert PoolMissingLeg();
 
-        if (address(key.poolManager) == address(0)) revert ZeroAddress();
-        bool quoteFirst = c0 == quote && c1 == burnToken;
-        bool burnFirst = c0 == burnToken && c1 == quote;
-        if (!quoteFirst && !burnFirst) revert PoolMissingLeg();
-
-        // Both legs being right does not make the pool exist. A key on a tier nobody has
-        // opened installs cleanly and then parks every tranche for as long as nobody notices,
-        // so it is refused here where the error names the cause. Doubles as a check that
-        // `poolManager` is a CL manager at all - this sink swaps through `ICLPoolManager`.
+        // A locked position's pool was initialised when the position was minted, so this only
+        // fails for a manager that is not a CL manager at all - which this sink cannot swap
+        // through.
         (uint160 sqrtPriceX96,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
         if (sqrtPriceX96 == 0) revert PoolNotInitialised();
 
         buybackPool = key;
-        quoteIsCurrency0 = quoteFirst;
-        emit BuybackPoolUpdated(key, quoteFirst);
+        quoteIsCurrency0 = !burnIsCurrency0;
+        buybackLaunchId = launchId;
+        buybackAnchor = tokenId;
+        buybackLpCreatorBps = creatorBps;
+        emit BuybackPoolUpdated(key, !burnIsCurrency0);
+        emit BuybackLaunchUpdated(launchId, tokenId);
     }
 
     /// @notice Set the three guards that decide when a buyback runs and how far it may push.
@@ -1557,8 +1796,10 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         emit OperatorUpdated(newOperator, newFallbackDelay);
     }
 
-    /// @notice The TWAP tranche: most `QUOTE` one buyback may offer, on either path. Zero is no cap.
+    /// @notice The TWAP tranche: most `QUOTE` one buyback may offer on either path, and most a
+    /// conversion may be worth. Required since 1.8.0, so zero is refused.
     function setMaxBuybackAmount(uint256 newMaxBuybackAmount) external onlyOwner {
+        if (newMaxBuybackAmount == 0) revert TrancheCapRequired();
         maxBuybackAmount = newMaxBuybackAmount;
         emit MaxBuybackAmountUpdated(newMaxBuybackAmount);
     }
@@ -1638,17 +1879,25 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
     ///   buyback spends. The owner cannot point revenue at a third currency.
     /// - the pool must be initialised, so a key on a tier nobody has opened is refused here,
     ///   where the error names the cause, rather than parking every tranche silently.
-    function setQuoteRoute(Currency asset, PoolKey calldata key) external onlyOwner {
+    ///
+    /// @param depth 1.8.0 (F1). The liquidity a conversion through this route is sized against.
+    /// Name it at or under the pool's real in-range depth. A route has no locked position, so
+    /// this ceiling is the only thing stopping liquidity added in the attacker's own transaction
+    /// from enlarging the sink's swap. Zero is refused when a route is set and ignored when one is
+    /// cleared.
+    function setQuoteRoute(Currency asset, PoolKey calldata key, uint128 depth) external onlyOwner {
         if (Currency.unwrap(asset) == address(BURN_TOKEN) || asset == QUOTE) {
             revert NotAConvertibleCurrency(asset);
         }
 
         if (address(key.poolManager) == address(0)) {
             delete _quoteRoutes[asset];
+            delete quoteRouteDepth[asset];
             PoolKey memory cleared;
-            emit QuoteRouteUpdated(asset, cleared, false);
+            emit QuoteRouteUpdated(asset, cleared, false, 0);
             return;
         }
+        if (depth == 0) revert DepthRequired();
 
         bool assetFirst = key.currency0 == asset && key.currency1 == QUOTE;
         bool quoteFirst = key.currency1 == asset && key.currency0 == QUOTE;
@@ -1658,7 +1907,8 @@ contract BuybackBurnSink is IBurnSink, Ownable2Step, ReentrancyGuardTransient, I
         if (sqrtPriceX96 == 0) revert PoolNotInitialised();
 
         _quoteRoutes[asset] = key;
-        emit QuoteRouteUpdated(asset, key, assetFirst);
+        quoteRouteDepth[asset] = depth;
+        emit QuoteRouteUpdated(asset, key, assetFirst, depth);
     }
 
     /// @notice D32. Designate a launch token to accumulate here instead of being converted.

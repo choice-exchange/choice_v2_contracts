@@ -67,9 +67,13 @@ jobs:
       # EIP-170, checked on the contracts THIS repo deploys. Plain `forge build --sizes`
       # cannot be used: it fails on upstream's CLPositionManager, which infinity-periphery
       # compiles at 9,000 optimizer runs (a compilation_restrictions entry) precisely so it
-      # fits, while this repo has one flat profile at 25,666 runs. That oversized artifact is
-      # a byproduct nothing here deploys - periphery's own script 02 deploys it, under
-      # periphery's profile.
+      # fits, while this repo builds it at 25,666 runs. That oversized artifact is a byproduct
+      # nothing here deploys - periphery's own script 02 deploys it, under periphery's profile.
+      # 🔴 This repo has one exception of its own: BuybackBurnSink is built at 1,000 runs (the
+      # `sink` profile in foundry.toml), so its row below is measured at the settings it is
+      # deployed with. That works only because NOTHING imports the sink's source - a file that
+      # did would be built under that profile too, and every contract it pulls in would show
+      # up below as "Name (path)" at the wrong settings, or go missing from the report.
       - name: Contract sizes
         run: |
           ours="$(find src -name '*.sol' \

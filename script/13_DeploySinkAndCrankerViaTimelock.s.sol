@@ -5,7 +5,8 @@ import "forge-std/Script.sol";
 import {Create3Factory} from "pancake-create3-factory/src/Create3Factory.sol";
 import {Currency} from "infinity-core/src/types/Currency.sol";
 
-import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {LaunchFeeCranker} from "../src/launchpad/LaunchFeeCranker.sol";
 import {ISafe} from "./interfaces/ISafe.sol";
 import {DeployBuybackBurnSink} from "./09_DeployBuybackBurnSink.s.sol";
@@ -114,12 +115,16 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
     bytes[] internal payloads;
     string[] internal labels;
 
-    function run() public override(DeployBuybackBurnSink, DeployLaunchFeeCranker) {
+    /// Set by `run` when `REHEARSAL_TAG` is. It also unlocks the `REHEARSAL_*` overrides below.
+    bool internal rehearsing;
+
+    function run() public virtual override(DeployBuybackBurnSink, DeployLaunchFeeCranker) {
         require(block.chainid == readUint("chainId"), "the address book is for another chain - check NETWORK");
 
         string memory tag = vm.envOr("REHEARSAL_TAG", string(""));
         bool rehearsal = bytes(tag).length != 0;
         require(!rehearsal || block.chainid != MAINNET_CHAIN_ID, "REHEARSAL_TAG is refused on mainnet");
+        rehearsing = rehearsal;
         bytes32 sinkSalt = rehearsal ? _rehearsalSalt(tag, "BuybackBurnSink") : SINK_SALT;
         bytes32 crankerSalt = rehearsal ? _rehearsalSalt(tag, "LaunchFeeCranker") : CRANKER_SALT;
 
@@ -130,7 +135,10 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         address sink = factory.computeAddress(sinkSalt);
         address cranker = factory.computeAddress(crankerSalt);
         console.log(
-            rehearsal ? "REHEARSAL, throwaway salts from tag:" : "BuybackBurnSink 1.5.0 + LaunchFeeCranker 2.1.0", tag
+            rehearsal
+                ? "REHEARSAL, throwaway salts from tag:"
+                : "BuybackBurnSink 1.8.0 (salt 1.5.0) + LaunchFeeCranker 2.1.0",
+            tag
         );
         console.log("BuybackBurnSink  ->", sink);
         console.log("LaunchFeeCranker ->", cranker);
@@ -197,7 +205,7 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         if (sink.code.length == 0) {
             // The sink's payload carries the burn token, so this batch cannot exist before it does.
             // `readAddress` dies on a null entry with a bare JSON parse error; say why instead.
-            address burnToken = readAddressOrZero("launchpad.burnToken");
+            address burnToken = _burnToken();
             require(
                 burnToken != address(0),
                 "launchpad.burnToken is not in the book yet - the sink's payload carries it, so this batch cannot be built until the burn token exists"
@@ -220,7 +228,7 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
 
         address[] memory wanted = _wantedLockers();
         if (!_lockersMatch(sink, wanted)) {
-            _push(sink, abi.encodeCall(BuybackBurnSink.setLockers, (wanted)), "sink.setLockers(<the book's lockers>)");
+            _push(sink, abi.encodeCall(IBuybackBurnSink.setLockers, (wanted)), "sink.setLockers(<the book's lockers>)");
         }
 
         if (cranker.code.length == 0) {
@@ -292,12 +300,17 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         }
         console.log(string.concat("2. anyone -> timelock ", vm.toString(timelock), ":"));
         console.log(string.concat("EXECUTE_BATCH_CALLDATA=", vm.toString(executeData)));
+        _printNextSteps(bracket);
+    }
+
+    /// @dev What follows the batch. Script 15 reuses `_simulateAndPrint` and overrides this.
+    function _printNextSteps(bool bracket) internal view virtual {
         console.log("3. Re-run 09 and 10 WITHOUT --broadcast: they find code, check the wiring, write the book.");
         if (!bracket) console.log("4. The factory's owner removes the timelock from the whitelist again.");
         console.log("");
-        console.log("Deliberately NOT in this batch: setGuards, setMaxBuybackAmount and setOperator (09 prints");
-        console.log("the plan-B4 shape for all three), setBuybackPool (needs the burn token's graduation pool),");
-        console.log("and the keeper's CRANK_CRANKER set. Until the guards are set the sink PARKS everything - safely.");
+        console.log("Deliberately NOT in this batch: the turn-on settings (tranche cap, operator, buyback");
+        console.log("launch, guards). They are ONE later batch, script 15, scheduled when the burn should start.");
+        console.log("Until then the sink PARKS everything, safely, and the keeper's CRANK_CRANKER set is unchanged.");
     }
 
     /// @dev The real `execTransaction`, on the lowest `threshold` owners' pre-approved hashes.
@@ -347,10 +360,10 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         bool whitelistedBefore,
         bool rehearsal
     ) internal view {
-        BuybackBurnSink s = BuybackBurnSink(payable(sink));
-        require(address(s.BURN_TOKEN()) == readAddress("launchpad.burnToken"), "sink burns the wrong token");
+        IBuybackBurnSink s = IBuybackBurnSink(sink);
+        require(address(s.BURN_TOKEN()) == _burnToken(), "sink burns the wrong token");
         require(Currency.unwrap(s.QUOTE()) == readAddress("external.wINJ"), "sink quotes the wrong currency");
-        require(s.owner() == timelock, "sink is not timelock-owned");
+        require(Ownable(sink).owner() == timelock, "sink is not timelock-owned");
         require(s.MIN_BURN_BPS() == MIN_BURN_BPS && s.burnBps() == BURN_BPS, "sink carries the wrong burn bps");
         require(_lockersMatch(sink, _wantedLockers()), "the sink's lockers do not match the book");
 
@@ -380,6 +393,17 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
         }
     }
 
+    /// @dev The book's burn token, or in a rehearsal `REHEARSAL_BURN_TOKEN` when it is set. That
+    /// lets a rehearsal burn a token shaped like mainnet's (a fee-hook graduate) without
+    /// repointing the book, which the live testnet sink is still checked against.
+    function _burnToken() internal view returns (address) {
+        if (rehearsing) {
+            address t = vm.envOr("REHEARSAL_BURN_TOKEN", address(0));
+            if (t != address(0)) return t;
+        }
+        return readAddressOrZero("launchpad.burnToken");
+    }
+
     function _push(address target, bytes memory data, string memory label) internal {
         targets.push(target);
         payloads.push(data);
@@ -388,7 +412,7 @@ contract DeploySinkAndCrankerViaTimelock is DeployBuybackBurnSink, DeployLaunchF
 
     function _lockersMatch(address sink, address[] memory wanted) internal view returns (bool) {
         if (sink.code.length == 0) return false;
-        address[] memory installed = BuybackBurnSink(payable(sink)).lockers();
+        address[] memory installed = IBuybackBurnSink(sink).lockers();
         if (installed.length != wanted.length) return false;
         for (uint256 i; i < wanted.length; ++i) {
             if (installed[i] != wanted[i]) return false;

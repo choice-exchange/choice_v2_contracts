@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import "forge-std/Script.sol";
 import {Create3Factory} from "pancake-create3-factory/src/Create3Factory.sol";
 
-import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
 import {ILaunchPositionLocker} from "../src/interfaces/ILaunchPositionLocker.sol";
 import {LaunchFeeCranker} from "../src/launchpad/LaunchFeeCranker.sol";
 import {BaseScript} from "./BaseScript.sol";
@@ -26,8 +26,10 @@ import {BaseScript} from "./BaseScript.sol";
  * 🔴 **Its sink reference is immutable, and it calls `convert(Currency,uint256)`, which exists
  * only from sink 1.2.0. A sink redeploy is therefore ALWAYS a cranker redeploy** - bump both
  * salts, run 09 then 10, and check `cranker.SINK()` afterwards. That is the A3 lockstep rule
- * applied forwards; the compiler enforces the ABI half of it, because this contract holds the
- * concrete `BuybackBurnSink` type rather than an interface copy of it. ⚠️ Since A9 that is
+ * applied forwards. The compiler enforces the ABI half of it: the cranker holds
+ * `IBuybackBurnSink`, and the sink inherits that interface, so the two cannot drift. It is an
+ * interface rather than the concrete type since sink 1.8.0, whose own optimizer profile would
+ * otherwise reach every file that imports it. ⚠️ Since A9 that is
  * "bump BOTH instances' salts and run this script twice", once per `CRANKER_LOCKER_KEY`.
  *
  * ## 🔑 One cranker per locker generation, and why it is a second instance rather than a branch
@@ -140,7 +142,7 @@ contract DeployLaunchFeeCranker is BaseScript {
         // The sink must be able to resolve this locker's launches, or every crank collects and
         // claims and then finds no route. It is a `setLockers` call on the sink, not here.
         require(
-            BuybackBurnSink(payable(sink)).isLocker(locker),
+            IBuybackBurnSink(sink).isLocker(locker),
             "the sink does not list this locker - run 09 and make the setLockers call first"
         );
 
@@ -171,7 +173,7 @@ contract DeployLaunchFeeCranker is BaseScript {
     function _crankerPayload(address locker, address sink, address timelock) internal pure returns (bytes memory) {
         return abi.encodePacked(
             type(LaunchFeeCranker).creationCode,
-            abi.encode(ILaunchPositionLocker(locker), BuybackBurnSink(payable(sink)), timelock)
+            abi.encode(ILaunchPositionLocker(locker), IBuybackBurnSink(sink), timelock)
         );
     }
 

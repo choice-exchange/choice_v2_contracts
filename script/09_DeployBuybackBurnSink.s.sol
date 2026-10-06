@@ -3,26 +3,30 @@ pragma solidity 0.8.26;
 
 import "forge-std/Script.sol";
 import {Create3Factory} from "pancake-create3-factory/src/Create3Factory.sol";
-import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
-import {IPoolManager} from "infinity-core/src/interfaces/IPoolManager.sol";
 import {IVault} from "infinity-core/src/interfaces/IVault.sol";
 import {Currency} from "infinity-core/src/types/Currency.sol";
-import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
-import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 
 import {ICLPositionManager} from "infinity-periphery/src/pool-cl/interfaces/ICLPositionManager.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 
-import {BuybackBurnSink} from "../src/fees/BuybackBurnSink.sol";
+import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
 import {IBurnableERC20} from "../src/interfaces/IBurnableERC20.sol";
-import {ILaunchPositionLocker} from "../src/interfaces/ILaunchPositionLocker.sol";
 import {BaseScript} from "./BaseScript.sol";
 
 /**
  * The launchpad's buyback-and-burn sink (plan A4).
  *
- * Deploys `BuybackBurnSink` owned by the TIMELOCK from construction, then prints the calls that
- * still have to come from it. Nothing here wires anything: the sink's three settings are owner
- * calls and this script cannot make them.
+ * Deploys `BuybackBurnSink` owned by the TIMELOCK from construction, then reports what still has
+ * to come from it. Nothing here wires anything: the sink's settings are owner calls and this
+ * script cannot make them. Since 1.8.0 the turn-on settings are ONE timelock batch, built by
+ * `script/15` (the 2026-10-01 audit's F3). This script reports them and never prints them one
+ * operation at a time.
+ *
+ * 🔴 It does not import the sink's SOURCE, only `IBuybackBurnSink`, and it takes the creation
+ * code from the sink's artifact with `vm.getCode`. The sink compiles under its own optimizer
+ * profile (`foundry.toml`), and a file that imported it would be compiled under that profile too.
+ * For script 13, which inherits this one, that would also rebuild the CRANKER's embedded creation
+ * code at 1,000 runs.
  *
  * ⛔ It also never touches `ChoiceFeeController.setBurnSink`. Under D30 a Choice fee controller
  * is NEVER pointed at this sink - the launchpad's revenue reaches it through the pad's treasury
@@ -82,8 +86,32 @@ contract DeployBuybackBurnSink is BaseScript {
     /// costs comparability with the 2026-09-06 walk's burn figures, which were measured at 8000:
     /// a burn under this sink destroys 7000 bps of the bought-back amount, not 8000, so do not
     /// diff the two runs' totals without scaling.
+    ///
+    /// 🔴 `BURN_BPS` is 8000 since Dan's 2026-10-03 decision: 80% of the launchpad's protocol
+    /// revenue buys the burn token, as the launchpad now says publicly. Under sink 1.8.0 it is the
+    /// share of REVENUE that buys and burns. The other 20% is paid to the treasury in wINJ.
     uint16 internal constant MIN_BURN_BPS = 5000;
-    uint16 internal constant BURN_BPS = 7000;
+    uint16 internal constant BURN_BPS = 8000;
+
+    /// The turn-on settings `script/15` schedules as one batch. They live here so that this
+    /// script's report and that batch can never disagree.
+    ///
+    /// - `MIN_BUYBACK` 0.5 wINJ: below it a swap costs more in gas than it moves.
+    /// - `MAX_IMPACT_BPS` 100: an upper bound only. The per-leg fee cap binds first: 0.3% of price
+    ///   on the burn token's 1% fee-hook pool with a 7000 creator share.
+    /// - `MIN_INTERVAL` 300 s: one fill per window, on the operator path and the public one alike
+    ///   (1.8.0). The keeper's `BUYBACK_INTERVAL_MS` default is the same five minutes.
+    /// - `MAX_BUYBACK` 10 wINJ: about one fee-capped fill on the mainnet burn pool (~6,690 wINJ
+    ///   deep on 2026-10-06), so it costs no throughput. A pump-and-JIT sandwich pays only when
+    ///   the tranche is over `fee * depth`: ~67 wINJ for an outsider there, ~20 for whoever holds
+    ///   the burn token's creator key. Anchored sizing closes the attack on its own. This is the second
+    ///   bound.
+    /// - `FALLBACK_DELAY` 6 h of operator silence before the public path reopens.
+    uint256 internal constant MIN_BUYBACK = 0.5e18;
+    uint16 internal constant MAX_IMPACT_BPS = 100;
+    uint32 internal constant MIN_INTERVAL = 300;
+    uint256 internal constant MAX_BUYBACK = 10e18;
+    uint32 internal constant FALLBACK_DELAY = 6 hours;
 
     uint256 internal outstanding;
 
@@ -103,7 +131,7 @@ contract DeployBuybackBurnSink is BaseScript {
         requireCode("clPositionManager", positionManager);
 
         address sink = factory.computeAddress(SINK_SALT);
-        console.log("BuybackBurnSink 1.7.0 (salt 1.5.0) ->", sink);
+        console.log("BuybackBurnSink 1.8.0 (salt 1.5.0) ->", sink);
 
         if (sink.code.length == 0) {
             bytes memory payload = _sinkPayload(burnToken, quote, vault, positionManager, treasury, timelock);
@@ -117,9 +145,9 @@ contract DeployBuybackBurnSink is BaseScript {
             console.log("  already deployed - checking its wiring");
         }
 
-        require(address(BuybackBurnSink(payable(sink)).BURN_TOKEN()) == burnToken, "sink burns the wrong token");
-        require(Currency.unwrap(BuybackBurnSink(payable(sink)).QUOTE()) == quote, "sink quotes the wrong currency");
-        require(BuybackBurnSink(payable(sink)).owner() == timelock, "sink is not timelock-owned");
+        require(address(IBuybackBurnSink(sink).BURN_TOKEN()) == burnToken, "sink burns the wrong token");
+        require(Currency.unwrap(IBuybackBurnSink(sink).QUOTE()) == quote, "sink quotes the wrong currency");
+        require(Ownable(sink).owner() == timelock, "sink is not timelock-owned");
 
         writeAddress("choice.buybackBurnSink", sink);
 
@@ -129,10 +157,11 @@ contract DeployBuybackBurnSink is BaseScript {
         console.log("");
 
         _requireLockers(sink);
-        _requireGuards(sink);
+        uint256 beforeTurnOn = outstanding;
         _requireTranche(sink);
         _requireOperator(sink);
         _requireBuybackPool(sink);
+        _requireGuards(sink);
         _reportQuoteRoutes(sink);
 
         console.log("");
@@ -140,6 +169,9 @@ contract DeployBuybackBurnSink is BaseScript {
             console.log("  The sink is configured. It converts, buys back and burns.");
         } else {
             console.log(string.concat("  ", vm.toString(outstanding), " timelock step(s) OUTSTANDING - see above."));
+            if (outstanding > beforeTurnOn) {
+                console.log("  The turn-on steps are ONE batch: script/15_ConfigureBuybackViaTimelock.s.sol.");
+            }
             console.log("  Re-run this script after they land; it is idempotent and will confirm them.");
         }
     }
@@ -157,9 +189,9 @@ contract DeployBuybackBurnSink is BaseScript {
         address positionManager,
         address treasury,
         address timelock
-    ) internal pure returns (bytes memory) {
+    ) internal view returns (bytes memory) {
         return abi.encodePacked(
-            type(BuybackBurnSink).creationCode,
+            vm.getCode("BuybackBurnSink.sol:BuybackBurnSink"),
             abi.encode(
                 IBurnableERC20(burnToken),
                 Currency.wrap(quote),
@@ -188,7 +220,7 @@ contract DeployBuybackBurnSink is BaseScript {
     function _requireLockers(address sink) internal {
         address[] memory wanted = _wantedLockers();
 
-        address[] memory installed = BuybackBurnSink(payable(sink)).lockers();
+        address[] memory installed = IBuybackBurnSink(sink).lockers();
         bool matches = installed.length == wanted.length;
         for (uint256 i; matches && i < wanted.length; ++i) {
             if (installed[i] != wanted[i]) matches = false;
@@ -203,7 +235,7 @@ contract DeployBuybackBurnSink is BaseScript {
         for (uint256 i; i < wanted.length; ++i) {
             console.log("           want", wanted[i]);
         }
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setLockers, (wanted)));
+        _printTimelockPayloads(sink, abi.encodeCall(IBuybackBurnSink.setLockers, (wanted)));
     }
 
     /// @dev A2/D28. Which quote assets can currently reach `QUOTE`, and which cannot.
@@ -231,7 +263,7 @@ contract DeployBuybackBurnSink is BaseScript {
             return;
         }
         for (uint256 i; i < assets.length; ++i) {
-            (,, bool found) = BuybackBurnSink(payable(sink)).quoteRoute(Currency.wrap(assets[i]));
+            (,, bool found) = IBuybackBurnSink(sink).quoteRoute(Currency.wrap(assets[i]));
             console.log(found ? "  [ok]   quote route" : "  [TODO] quote route MISSING for", assets[i]);
         }
     }
@@ -287,59 +319,39 @@ contract DeployBuybackBurnSink is BaseScript {
     }
 
     /// @dev Until `setGuards` is called `maxImpactBps` is 0, which truncates to a price limit the
-    /// pool refuses - so every swap parks. `minBuybackInterval` of 0 is refused outright.
-    ///
-    /// 🔴 The values below are the plan-B4 mainnet SHAPE, not a measurement. 1.7.0 caps every leg's
-    /// move at the pool's unrecoverable fee, so `maxImpactBps` is now only an upper bound on top
-    /// of that. Anything at or above the fee is simply the fee. 100 bps (1%) is at or above the
-    /// fee on every pool the sink can reach today. The `(1e12, 500, 60)` this printed until
-    /// 2026-09-30 were TESTNET values, and 500 was the setting the review showed was exploitable
-    /// under 1.6.0.
-    ///
-    /// - `minBuybackAmount` 0.5 wINJ: below it a swap costs more in gas than it moves.
-    /// - `maxImpactBps` 100: see above.
-    /// - `minBuybackInterval` 300 s: this now paces only the permissionless FALLBACK. The
-    ///   operator's schedule is the real cadence, and neither path can profitably be sandwiched.
+    /// pool refuses, so every swap parks. It is the LAST call in script 15's batch: the switch.
     function _requireGuards(address sink) internal {
-        if (BuybackBurnSink(payable(sink)).maxImpactBps() != 0) {
+        IBuybackBurnSink s = IBuybackBurnSink(sink);
+        if (
+            s.maxImpactBps() == MAX_IMPACT_BPS && s.minBuybackAmount() == MIN_BUYBACK
+                && s.minBuybackInterval() == MIN_INTERVAL
+        ) {
             console.log("  [ok]   buybackBurnSink.setGuards");
             return;
         }
         outstanding++;
-        console.log("  [TODO] the guards are unset, so every buyback and every conversion parks");
-        console.log("           plan-B4 shape below - re-size minBuybackAmount against the graduated pool");
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setGuards, (0.5e18, 100, 300)));
+        console.log("  [TODO] the guards are not the batch's, so every buyback and every conversion parks");
     }
 
-    /// @dev The TWAP tranche: at most this much `QUOTE` per buyback, on either path. Optional in
-    /// the sense that zero is legal (no cap), but a deploy should say so on purpose.
-    ///
-    /// 25 wINJ is about 1% of a 2,500 wINJ graduation raise. With the fee cap binding on the
-    /// burn pool, one buyback spends only a few wINJ anyway, so this bites only once the pool is
-    /// much deeper than at graduation - which is exactly when a whole backlog could otherwise go
-    /// in one call.
+    /// @dev The tranche cap: at most this much `QUOTE` per buyback, on either path, and the most
+    /// one conversion may be worth. Mandatory since 1.8.0: until it is set, nothing trades.
     function _requireTranche(address sink) internal {
-        if (BuybackBurnSink(payable(sink)).maxBuybackAmount() != 0) {
+        if (IBuybackBurnSink(sink).maxBuybackAmount() == MAX_BUYBACK) {
             console.log("  [ok]   buybackBurnSink.setMaxBuybackAmount");
             return;
         }
         outstanding++;
-        console.log("  [TODO] no tranche cap: one buyback may offer the whole backlog");
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setMaxBuybackAmount, (25e18)));
+        console.log("  [TODO] the tranche cap is not the batch's, so nothing trades");
     }
 
     /// @dev The key that runs the scheduled TWAP buyback, from `launchpad.buybackOperator` in the
-    /// address book. Without one the permissionless path is always open - safe under the fee cap,
-    /// but it buys whenever somebody calls, spikes included.
-    ///
-    /// Six hours of operator silence reopens the public path. That is long enough that a keeper
-    /// restart never hands the schedule to whoever calls first, and short enough that a dead
-    /// keeper costs the burn an afternoon, not a week.
+    /// address book. Script 15 refuses to build a batch without one. Without an operator the
+    /// permissionless path would always be open, buying whenever somebody calls, spikes included.
     function _requireOperator(address sink) internal {
         address wanted = readAddressOrZero("launchpad.buybackOperator");
-        address installed = BuybackBurnSink(payable(sink)).operator();
-        if (wanted != address(0) && installed == wanted) {
-            console.log("  [ok]   buybackBurnSink.setOperator", installed);
+        IBuybackBurnSink s = IBuybackBurnSink(sink);
+        if (wanted != address(0) && s.operator() == wanted && s.publicFallbackDelay() == FALLBACK_DELAY) {
+            console.log("  [ok]   buybackBurnSink.setOperator", wanted);
             return;
         }
         outstanding++;
@@ -349,42 +361,25 @@ contract DeployBuybackBurnSink is BaseScript {
             return;
         }
         console.log("  [TODO] the operator is not installed:", wanted);
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setOperator, (wanted, 6 hours)));
     }
 
-    /// @dev The one pool the sink cannot be told about by a caller: the buyback's own.
-    ///
-    /// The burn token is a launch like any other, so its graduation pool key is read the same way
-    /// every other launch's is now - off its own locked position, through `launchPool`. That is
-    /// strictly better than the tier derivation it replaces: it is the key the position is
-    /// actually in, so it cannot be one fee tier or one tick spacing away from a pool that does
-    /// not exist.
-    ///
-    /// ⚠️ Needs `launchpad.burnTokenLaunchId` in the address book, and the lockers installed first -
-    /// which is why this check runs last.
+    /// @dev The one pool the sink cannot be told about by a caller: the buyback's own. Since 1.8.0
+    /// it is named by the burn token's LAUNCH ID, and the sink reads the key and the locked
+    /// position it sizes every buyback against off the lockers.
     function _requireBuybackPool(address sink) internal {
-        BuybackBurnSink s = BuybackBurnSink(payable(sink));
-        (,,, IPoolManager installed,,) = s.buybackPool();
-        if (address(installed) != address(0)) {
-            console.log("  [ok]   buybackBurnSink.setBuybackPool");
-            return;
-        }
-
-        outstanding++;
+        IBuybackBurnSink s = IBuybackBurnSink(sink);
         uint256 burnTokenLaunchId = readUint("launchpad.burnTokenLaunchId");
-        (PoolKey memory key, address locker) = s.launchPool(burnTokenLaunchId);
+        if (s.buybackAnchor() != 0 && s.buybackLaunchId() == burnTokenLaunchId) {
+            console.log("  [ok]   buybackBurnSink.setBuybackLaunch, anchor", s.buybackAnchor());
+            return;
+        }
+        outstanding++;
+        (, address locker) = s.launchPool(burnTokenLaunchId);
         if (locker == address(0)) {
-            console.log("  [--]   buybackPool: install the lockers first, they answer this key");
+            console.log("  [TODO] no installed locker knows launch", burnTokenLaunchId);
             return;
         }
-        (uint160 existing,,,) = ICLPoolManager(address(key.poolManager)).getSlot0(key.toId());
-        if (existing == 0) {
-            console.log("  [TODO] the burn token's pool does not exist yet - it has not graduated");
-            return;
-        }
-        console.log("  [TODO] the buyback pool is unset, so quote revenue parks");
-        console.log("           read off the burn token's locked position, launch", burnTokenLaunchId);
-        _printTimelockPayloads(sink, abi.encodeCall(BuybackBurnSink.setBuybackPool, (key)));
+        console.log("  [TODO] the buyback launch is unset, so quote revenue parks:", burnTokenLaunchId);
     }
 
     /// @dev Both halves, because matching `execute`'s arguments to the `schedule` they came
