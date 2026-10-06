@@ -28,7 +28,7 @@ import {DeploySinkAndCrankerViaTimelock} from "./13_DeploySinkAndCrankerViaTimel
  *
  * 🔑 The quoter is upstream's `CLQuoter`, unchanged. Pumex ships none, and `/route` prices a Pumex
  * pool by running OUR quoter's code against Pumex's manager - today by overriding the code of an
- * `eth_call`, which works but sends ~10 KB of bytecode with every quote and depends on the RPC
+ * `eth_call`, which works but sends ~7 KB of bytecode (14 KB of hex) with every quote and depends on the RPC
  * honouring a state override. This puts the same code at a fixed address. Its constructor reads
  * `vault()` off the manager, so it needs nothing from Pumex but the manager's address.
  *
