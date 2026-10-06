@@ -246,6 +246,62 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         _assertRouterEmpty();
     }
 
+    /// INJ is one currency at the input. A wallet holding some native and some wINJ spends both in
+    /// one route, whichever form the route starts in, and buys exactly what the same amount paid
+    /// all one way would have.
+    function test_anInjInputMayBeAnyMixOfNativeAndWinj() public {
+        uint256 amountIn = 100 ether;
+
+        // A route that starts NATIVE: the Helix book.
+        ChoiceAggregator.Step[] memory helix = new ChoiceAggregator.Step[](1);
+        helix[0] = _helix(NATIVE, address(usdc), 10_000, INJ_USDC);
+        ChoiceAggregator.RouteParams memory p = _params(NATIVE, address(usdc), amountIn, 0, helix);
+        uint256 allNative = _probeWith(p, amountIn);
+        assertEq(_probeWith(p, 40 ether), allNative, "a native-start route bought less with a mix");
+        assertEq(_probeWith(p, 0), allNative, "a native-start route bought less with all wINJ");
+
+        // A route that starts as wINJ: an AMM.
+        ChoiceAggregator.Step[] memory amm = new ChoiceAggregator.Step[](1);
+        amm[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        p = _params(address(winj), address(usdc), amountIn, 0, amm);
+        uint256 allWrapped = _probeWith(p, 0);
+        assertEq(_probeWith(p, 40 ether), allWrapped, "a wINJ-start route bought less with a mix");
+        assertEq(_probeWith(p, amountIn), allWrapped, "a wINJ-start route bought less with all native");
+
+        // And a real run takes exactly what it was told to from each balance.
+        uint256 nativeBefore = USER.balance;
+        uint256 wrappedBefore = winj.balanceOf(USER);
+        p.minimumReceive = allWrapped;
+        vm.prank(USER);
+        agg.execute{value: 40 ether}(p);
+        assertEq(USER.balance, nativeBefore - 40 ether, "wrong native spent");
+        assertEq(winj.balanceOf(USER), wrappedBefore - 60 ether, "wrong wINJ spent");
+        assertEq(usdc.balanceOf(RECIPIENT), allWrapped, "recipient was not paid");
+        _assertRouterEmpty();
+    }
+
+    function testFuzz_anyInjMixLeavesNothingBehind(uint256 value, bool startNative) public {
+        uint256 amountIn = 250 ether;
+        value = bound(value, 0, amountIn);
+        ChoiceAggregator.Step[] memory steps = new ChoiceAggregator.Step[](startNative ? 2 : 1);
+        if (startNative) {
+            steps[0] = _wrap(10_000);
+            steps[1] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        } else {
+            steps[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        }
+        ChoiceAggregator.RouteParams memory p =
+            _params(startNative ? NATIVE : address(winj), address(usdc), amountIn, 0, steps);
+
+        uint256 nativeBefore = USER.balance;
+        uint256 wrappedBefore = winj.balanceOf(USER);
+        vm.prank(USER);
+        agg.execute{value: value}(p);
+        assertEq(nativeBefore - USER.balance, value, "native spent is not the value sent");
+        assertEq(wrappedBefore - winj.balanceOf(USER), amountIn - value, "wINJ spent is not the rest");
+        _assertRouterEmpty();
+    }
+
     /// `ChoiceRouter` reverts `NotCrossVault` on this. A route entirely inside Pumex is the best
     /// USDC->INJ path on mainnet today, so here it is a route like any other.
     function test_aRouteEntirelyInsideAForeignVaultIsAllowed() public {
@@ -518,14 +574,22 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         p = _params(address(winj), address(winj), 1 ether, 0, one);
         _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.SameCurrency.selector));
 
-        p = _params(address(winj), address(usdc), 1 ether, 0, one);
+        // Value on a non-INJ input is refused outright: nothing would ever spend it.
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _solidly(address(usdt), address(winj), 10_000);
+        p = _params(address(usdt), address(winj), 1 ether, 0, s);
         _expectRevert(p, 1, abi.encodeWithSelector(ChoiceAggregator.ValueMismatch.selector, 1, 0));
 
+        // On an INJ input any part may be value, but never more than the whole.
         ChoiceAggregator.Step[] memory h = new ChoiceAggregator.Step[](1);
         h[0] = _helix(NATIVE, address(usdc), 10_000, INJ_USDC);
         p = _params(NATIVE, address(usdc), 1 ether, 0, h);
         _expectRevert(
-            p, 1 ether - 1, abi.encodeWithSelector(ChoiceAggregator.ValueMismatch.selector, 1 ether - 1, 1 ether)
+            p, 1 ether + 1, abi.encodeWithSelector(ChoiceAggregator.ValueMismatch.selector, 1 ether + 1, 1 ether)
+        );
+        p = _params(address(winj), address(usdc), 1 ether, 0, one);
+        _expectRevert(
+            p, 1 ether + 1, abi.encodeWithSelector(ChoiceAggregator.ValueMismatch.selector, 1 ether + 1, 1 ether)
         );
     }
 
@@ -638,12 +702,17 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
     /// here: the precompile mock moves native INJ with `vm.deal`, and a cheatcode write inside a
     /// call that later reverts survives the revert. Without the snapshot the next call through the
     /// same route fails `OverflowPayment` on balances the probe left behind.
-    function _probe(ChoiceAggregator.RouteParams memory p) internal returns (uint256 realised) {
+    function _probe(ChoiceAggregator.RouteParams memory p) internal returns (uint256) {
+        return _probeWith(p, p.currencyIn == NATIVE ? p.amountIn : 0);
+    }
+
+    /// `_probe`, paying `value` of an INJ input as native and the rest as wINJ.
+    function _probeWith(ChoiceAggregator.RouteParams memory p, uint256 value) internal returns (uint256 realised) {
         uint256 snap = vm.snapshotState();
         uint256 keep = p.minimumReceive;
         p.minimumReceive = type(uint256).max;
         vm.prank(USER);
-        try agg.execute{value: p.currencyIn == NATIVE ? p.amountIn : 0}(p) returns (uint256) {
+        try agg.execute{value: value}(p) returns (uint256) {
             revert("probe should not have succeeded");
         } catch (bytes memory err) {
             assertEq(bytes4(err), ChoiceAggregator.InsufficientOutput.selector, "probe reverted for another reason");

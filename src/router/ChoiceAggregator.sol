@@ -66,10 +66,15 @@ import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 /// - *The Helix precompile is a fixed address*, and its markets are allowlisted by the CHAIN
 ///   (`swap_params.allowed_markets`), not here.
 ///
-/// **Native INJ is `address(0)`, wINJ is an ERC20, and the two are never conflated.** Infinity
-/// and Solidly pools on Injective trade wINJ; the Helix precompile takes and pays NATIVE INJ and
-/// refuses wINJ. The route says which one each step spends, and `Wrap` / `Unwrap` steps convert
-/// explicitly. Native input arrives as `msg.value`; native output is sent with a plain call.
+/// **Inside a route, native INJ is `address(0)`, wINJ is an ERC20, and the two are never
+/// conflated.** Infinity and Solidly pools on Injective trade wINJ; the Helix precompile takes and
+/// pays NATIVE INJ and refuses wINJ. The route says which one each step spends, and `Wrap` /
+/// `Unwrap` steps convert explicitly. Native output is sent with a plain call.
+///
+/// **At the INPUT, INJ is one currency.** A wallet holding some of each spends both: any part of
+/// an INJ `amountIn` may arrive as `msg.value` and the rest is pulled as wINJ, then converted to
+/// the form `currencyIn` names. The calldata does not depend on the mix, so the caller picks
+/// `msg.value` from its own balances without asking for a new route.
 ///
 /// 🔴 **Two precompile behaviours the accounting is built around:** a Helix fill is floored to the
 /// market's quantity tick, and a swap larger than the book fills PARTIALLY without reverting.
@@ -129,7 +134,9 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         Hop[] hops;
     }
 
-    /// @param currencyIn what the caller pays: Permit2 for an ERC20, `msg.value` for native INJ
+    /// @param currencyIn what the caller pays: Permit2 for an ERC20. INJ - `address(0)` or wINJ -
+    /// may be paid in ANY mix of `msg.value` and wINJ through Permit2, and is converted into the
+    /// form `currencyIn` names before the first step
     /// @param currencyOut what `recipient` receives; `address(0)` is native INJ
     /// @param amountIn exact input
     /// @param minimumReceive the ONE guard on this route, measured on realised output
@@ -233,7 +240,8 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
 
     /// @notice Run `p` and send `currencyOut` to `p.recipient`.
     /// @dev For an ERC20 input the caller must have approved this contract as a Permit2 spender
-    /// and send no value; for native INJ the caller sends exactly `amountIn` as `msg.value`.
+    /// and send no value. For an INJ input (`address(0)` or wINJ) the caller sends any part of
+    /// `amountIn` as `msg.value`, and the Permit2 approval covers the wINJ rest when there is one.
     /// @return amountOut what the route actually produced, which is what the guard checked
     function execute(RouteParams calldata p) external payable nonReentrant returns (uint256 amountOut) {
         if (block.timestamp > p.deadline) revert DeadlinePassed();
@@ -251,8 +259,20 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
             if (touched[i] == NATIVE) before[i] -= msg.value;
         }
 
-        if (p.currencyIn == NATIVE) {
-            if (msg.value != p.amountIn) revert ValueMismatch(msg.value, p.amountIn);
+        if (p.currencyIn == NATIVE || p.currencyIn == address(WINJ)) {
+            // INJ is ONE currency here, whichever form the caller holds it in: any part of
+            // `amountIn` may arrive as `msg.value` and the rest is pulled as wINJ. So a wallet holding
+            // both spends both in one transaction, and the calldata does not depend on the mix -
+            // the caller chooses `msg.value` from its own balances. The input is then converted to
+            // the form `currencyIn` names, which is the form the route's first steps expect.
+            if (msg.value > p.amountIn) revert ValueMismatch(msg.value, p.amountIn);
+            uint256 wrapped = p.amountIn - msg.value;
+            if (wrapped != 0) PERMIT2.transferFrom(msg.sender, address(this), wrapped.toUint160(), address(WINJ));
+            if (p.currencyIn == NATIVE) {
+                if (wrapped != 0) WINJ.withdraw(wrapped);
+            } else if (msg.value != 0) {
+                WINJ.deposit{value: msg.value}();
+            }
         } else {
             if (msg.value != 0) revert ValueMismatch(msg.value, 0);
             PERMIT2.transferFrom(msg.sender, address(this), p.amountIn.toUint160(), p.currencyIn);
