@@ -102,11 +102,13 @@ contract DeployBuybackBurnSink is BaseScript {
     /// - `MIN_INTERVAL` 1,800 s: D20's 30-60 minutes. One fill per window, on the operator path
     ///   and the public one alike (1.8.0). 🔴 The keeper's `BUYBACK_INTERVAL_MS` defaults to five
     ///   minutes; run it at 1,800,000, or most of its passes simulate into `RateLimited`.
-    /// - `MAX_BUYBACK` 5 wINJ: about half a fee-capped fill on the mainnet burn pool (~6,716 wINJ
-    ///   deep on 2026-10-07), so one buyback moves its price ~0.15%. With `MIN_INTERVAL` this IS
-    ///   the pace: at most 240 wINJ a day. Chosen so a backlog is bought over days, not hours: the
-    ///   ~770 wINJ of buying waiting on 2026-10-07 takes ~3.2 days, where 10 wINJ every 300 s would
-    ///   have taken ~6.4 hours. Still well above steady inflow, ~20-25 wINJ a day that week.
+    /// - `MAX_BUYBACK` 10 wINJ: about one fee-capped fill on the mainnet burn pool (~6,716 wINJ
+    ///   deep on 2026-10-07), so one buyback moves its price at most ~0.3%. A CEILING, not the
+    ///   pace: the operator runs buybacks as batches and sets each batch's pace below this (an
+    ///   amount over a number of hours, at random sizes and times). With `MIN_INTERVAL` it bounds
+    ///   a batch at 480 wINJ a day; a 500 wINJ batch at full speed takes ~2.2 days once the
+    ///   operator's random waits are counted. (Briefly 5 wINJ on 2026-10-07, before batches
+    ///   existed and this was the only pace there was.)
     ///   A pump-and-JIT sandwich pays only when the tranche is over `fee * depth`: ~67 wINJ for an
     ///   outsider there, ~20 for whoever holds the burn token's creator key. Anchored sizing
     ///   closes the attack on its own. This is the second bound.
@@ -118,7 +120,7 @@ contract DeployBuybackBurnSink is BaseScript {
     uint256 internal constant MIN_BUYBACK = 0.5e18;
     uint16 internal constant MAX_IMPACT_BPS = 100;
     uint32 internal constant MIN_INTERVAL = 1800;
-    uint256 internal constant MAX_BUYBACK = 5e18;
+    uint256 internal constant MAX_BUYBACK = 10e18;
     uint32 internal constant FALLBACK_DELAY = 30 days;
 
     uint256 internal outstanding;
