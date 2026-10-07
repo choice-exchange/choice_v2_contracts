@@ -17,7 +17,10 @@ set -uo pipefail
 
 CHOICE_V2="${CHOICE_V2:-/home/dan/workspace/injective/choice_v2}"
 BOOK="$CHOICE_V2/contracts/deployments/injective_mainnet.json"
-export BLOCKSCOUT_API="${BLOCKSCOUT_API:-https://blockscout-api.injective.network}"
+# 🔴 Mainnet's API now lives on the EXPLORER host. blockscout-api.injective.network answers 404 on
+# every route since at least 2026-10-07 - including is_verified for contracts verified for weeks,
+# which reads exactly like "never verified". Testnet's separate API host still works.
+export BLOCKSCOUT_API="${BLOCKSCOUT_API:-https://blockscout.injective.network}"
 V="$CHOICE_V2/contracts/script/tools/verify-blockscout.sh"
 PASSES="${PASSES:-3}"
 INTERVAL="${INTERVAL:-60}"
