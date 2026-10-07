@@ -8,7 +8,9 @@
 #
 # 1. The API is on a DIFFERENT HOST from the explorer UI. testnet.blockscout.injective.network
 #    serves the frontend and answers every /api call with an HTML 404; the API is
-#    testnet.blockscout-api.injective.network.
+#    testnet.blockscout-api.injective.network. ⚠️ MAINNET is the other way round since at least
+#    2026-10-07: blockscout-api.injective.network is dead (404 everywhere) and the API is served
+#    from the explorer host, blockscout.injective.network - verify-all-mainnet.sh defaults to it.
 # 2. `forge verify-contract` with --constructor-args first tries to find the deployment and
 #    dies with "Could not detect deployment: The address is not a smart contract". Injective
 #    serves no receipts and no tx-by-hash, so nothing can resolve a creation transaction.
