@@ -105,6 +105,7 @@ contract MockHelixSwap {
         uint256 askDepth; // base raw
         uint256 qtyTick; // base raw
         uint256 feeE18;
+        uint256 minNotional; // quote raw; the chain's `min_notional`, $1 on the live books
         bool allowed;
     }
 
@@ -152,8 +153,12 @@ contract MockHelixSwap {
         returns (uint256 spent, uint256 out, uint256 qty)
     {
         require(tokenIn == m.base || tokenIn == m.quote, "swap: token not in market");
+        // Measured on mainnet 2026-10-07: both size checks run on the REQUESTED amount, before
+        // the book's depth caps it, and both revert - quote and swap alike.
         if (tokenIn == m.base) {
             qty = (amountIn / m.qtyTick) * m.qtyTick;
+            require(qty != 0, "swap input too small for the market's quantity tick size");
+            require((qty * m.bidE18) / 1e18 >= m.minNotional, "swap notional is below market min notional");
             if (qty > m.bidDepth) qty = m.bidDepth;
             uint256 gross = (qty * m.bidE18) / 1e18;
             out = gross - (gross * m.feeE18) / 1e18;
@@ -161,6 +166,8 @@ contract MockHelixSwap {
         } else {
             uint256 unitCost = (m.askE18 * (1e18 + m.feeE18)) / 1e18;
             qty = (((amountIn * 1e18) / unitCost) / m.qtyTick) * m.qtyTick;
+            require(qty != 0, "swap input too small for the market's quantity tick size");
+            require((qty * m.askE18) / 1e18 >= m.minNotional, "swap notional is below market min notional");
             if (qty > m.askDepth) qty = m.askDepth;
             uint256 gross = (qty * m.askE18) / 1e18;
             spent = gross + (gross * m.feeE18) / 1e18;

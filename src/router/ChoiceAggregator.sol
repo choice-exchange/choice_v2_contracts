@@ -59,6 +59,10 @@ import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 ///   deployment's governance (see `ChoiceRouter`'s notice, audit R-2: a vault owner can
 ///   `registerApp` a contract that assigns this router a debt mid-stage; `minimumReceive` is what
 ///   bounds it). The callback is bound to the exact payload handed to `lock`, single-use per lock.
+///   ⚠️ `minimumReceive` bounds the OUTPUT only. What a route hands back as dust - an unfilled
+///   Helix remainder, an unspent share - has no floor, so a hostile app on an allowlisted vault,
+///   reached through a hook in the route, could take it. Ordinary hooks cannot: a hook that takes
+///   more than its hop's output leaves the step `StepPaidNothing`.
 /// - *Solidly pairs are NOT allowlisted, deliberately.* A pair is paid exactly the step's input by
 ///   `transfer` and is never approved for anything, so the most a hostile pair can take is the one
 ///   step's input; it cannot produce `tokenOut` it does not have, and a step that produced none
@@ -81,6 +85,14 @@ import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 /// Either way the unspent input stays here as route money - the next step on that token spends
 /// it, or it is refunded to the caller with the rest of the dust - and the output shortfall is
 /// what `minimumReceive` catches.
+///
+/// 🔴 **And two it does not absorb.** Below the market's minimum notional (measured: $1 on
+/// INJ/USDC and USDC/USDT) or under one quantity tick, the precompile REVERTS, and so does the
+/// whole route. And a step whose input comes out empty reverts `StepInputEmpty` rather than being
+/// skipped - so a "fill the book, send the leftover to an AMM" route reverts whenever the book takes
+/// everything. A planner must keep every Helix leg above the market's minimums and never emit a
+/// step whose input can be zero; the backend's does both, because the precompile's QUOTE refuses
+/// the same sizes its swap does.
 contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallback {
     using CurrencyLibrary for Currency;
     using SafeERC20 for IERC20;
@@ -192,6 +204,7 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
     error NoSteps();
     error ZeroAmount();
     error ZeroRecipient();
+    error BadRecipient(address recipient);
     error SameCurrency();
     error ValueMismatch(uint256 sent, uint256 expected);
     error BadShare(uint256 stepIndex);
@@ -248,6 +261,9 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         if (p.steps.length == 0) revert NoSteps();
         if (p.amountIn == 0) revert ZeroAmount();
         if (p.recipient == address(0)) revert ZeroRecipient();
+        // Output sent here, or to wINJ (whose fallback would wrap a native payout back to THIS
+        // contract), is stranded for good: nothing here can sweep it.
+        if (p.recipient == address(this) || p.recipient == address(WINJ)) revert BadRecipient(p.recipient);
         if (p.currencyIn == p.currencyOut) revert SameCurrency();
 
         // Snapshotted BEFORE the pull, so every figure below is what THIS route moved. Native

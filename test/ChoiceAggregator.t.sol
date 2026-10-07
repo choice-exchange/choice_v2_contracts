@@ -21,6 +21,7 @@ import {BalanceDelta} from "infinity-core/src/types/BalanceDelta.sol";
 import {CLPoolManagerRouter} from "infinity-core/test/pool-cl/helpers/CLPoolManagerRouter.sol";
 import {BinLiquidityHelper} from "infinity-core/test/pool-bin/helpers/BinLiquidityHelper.sol";
 import {BinTestHelper} from "infinity-core/test/pool-bin/helpers/BinTestHelper.sol";
+import {CLReturnsDeltaHook} from "infinity-core/test/pool-cl/helpers/CLReturnsDeltaHook.sol";
 import {IWETH9} from "infinity-periphery/src/interfaces/external/IWETH9.sol";
 
 import {ChoiceAggregator} from "../src/router/ChoiceAggregator.sol";
@@ -397,7 +398,10 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
     /// went to the recipient as output or back to the caller as dust.
     function testFuzz_aSplitLeavesNoRouteMoneyBehind(uint256 amountIn, uint16 helixBps) public {
         amountIn = bound(amountIn, 10 ether, 10_000 ether);
-        helixBps = uint16(bound(helixBps, 1, 9_999));
+        // A Helix leg under the book's $1 minimum reverts the whole route, as on mainnet; the
+        // planner never sends one. Two dollars clears the minimum after the tick floor.
+        uint256 minBps = (2 ether * 10_000) / amountIn + 1;
+        helixBps = uint16(bound(helixBps, minBps, 9_999));
 
         ChoiceAggregator.RouteParams memory p = _params(NATIVE, address(usdc), amountIn, 0, _helixPumexSplit(helixBps));
         uint256 got = _run(p);
@@ -551,6 +555,180 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         agg.execute(p);
     }
 
+    // ── what the precompile refuses, and edges an independent review asked for ──
+
+    /// Measured on mainnet: below a market's minimum notional, or under one quantity tick, the
+    /// precompile REVERTS - and so does the whole route. Nothing here absorbs it; the planner keeps
+    /// every Helix leg above both, because the precompile's quote refuses the same sizes.
+    function test_aHelixLegUnderTheMarketMinimumsRevertsTheRoute() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _helix(NATIVE, address(usdc), 10_000, INJ_USDC);
+
+        ChoiceAggregator.RouteParams memory p = _params(NATIVE, address(usdc), 0.5 ether, 0, s);
+        _expectRevert(p, 0.5 ether, bytes("swap notional is below market min notional"));
+
+        p = _params(NATIVE, address(usdc), TICK - 1, 0, s);
+        _expectRevert(p, TICK - 1, bytes("swap input too small for the market's quantity tick size"));
+    }
+
+    /// A step whose input comes out empty reverts rather than being skipped. So "fill the book,
+    /// send the leftover to an AMM" works only while there IS a leftover: a tick-aligned amount the
+    /// book takes whole leaves the overflow step nothing, and the route reverts. The planner never
+    /// emits an overflow step for this reason.
+    function test_anOverflowStepRevertsWhenTheBookFillsEverything() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](3);
+        s[0] = _helix(NATIVE, address(usdc), 10_000, INJ_USDC);
+        s[1] = _wrap(10_000);
+        s[2] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+
+        ChoiceAggregator.RouteParams memory p = _params(NATIVE, address(usdc), 100 ether + TICK / 2, 1, s);
+        _run(p); // a sub-tick leftover exists: the overflow step spends it
+
+        p = _params(NATIVE, address(usdc), 100 ether, 1, s);
+        _expectRevert(p, 100 ether, abi.encodeWithSelector(ChoiceAggregator.StepInputEmpty.selector, 1));
+    }
+
+    /// Seeding a native-currency pool refunds the unused native to this contract.
+    receive() external payable {}
+
+    function _donate() internal {
+        usdc.mint(address(agg), 7 ether);
+        winj.mint(address(agg), 3 ether);
+        vm.deal(address(winj), address(winj).balance + 3 ether);
+        vm.deal(address(agg), 5 ether);
+    }
+
+    function _assertDonationsIntact() internal view {
+        assertEq(usdc.balanceOf(address(agg)), 7 ether, "a route spent the USDC donation");
+        assertEq(winj.balanceOf(address(agg)), 3 ether, "a route spent the wINJ donation");
+        assertEq(address(agg).balance, 5 ether, "a route spent the native donation");
+    }
+
+    /// A wINJ input paid partly as `msg.value` while a later step also spends NATIVE (Unwrap, then
+    /// Helix), with a donation of every form sitting in the contract: each balance pays exactly its
+    /// part, and no donation is touched.
+    function testFuzz_aWinjInputWithValueWhileNativeIsAlsoSpent(uint256 value) public {
+        uint256 amountIn = 200 ether;
+        value = bound(value, 0, amountIn);
+        _donate();
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](3);
+        s[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 5000);
+        s[1] = _unwrap(10_000);
+        s[2] = _helix(NATIVE, address(usdc), 10_000, INJ_USDC);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), amountIn, 1, s);
+
+        uint256 nativeBefore = USER.balance;
+        uint256 wrappedBefore = winj.balanceOf(USER);
+        vm.prank(USER);
+        uint256 got = agg.execute{value: value}(p);
+
+        assertEq(usdc.balanceOf(RECIPIENT), got);
+        // The Helix tick remainder comes back as native, so native spent is the value less < 1 tick.
+        assertLe(nativeBefore - USER.balance, value);
+        assertGe(nativeBefore - USER.balance + TICK, value);
+        assertEq(wrappedBefore - winj.balanceOf(USER), amountIn - value);
+        _assertDonationsIntact();
+    }
+
+    /// A native input paid partly in wINJ while a later step also spends wINJ (Helix 30%, then Wrap
+    /// and an AMM), with donations of every form present.
+    function testFuzz_aNativeInputWithWinjWhileWinjIsAlsoSpent(uint256 value) public {
+        uint256 amountIn = 200 ether;
+        value = bound(value, 0, amountIn);
+        _donate();
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](3);
+        s[0] = _helix(NATIVE, address(usdc), 3000, INJ_USDC);
+        s[1] = _wrap(10_000);
+        s[2] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(NATIVE, address(usdc), amountIn, 1, s);
+
+        uint256 nativeBefore = USER.balance;
+        uint256 wrappedBefore = winj.balanceOf(USER);
+        vm.prank(USER);
+        agg.execute{value: value}(p);
+
+        assertEq(nativeBefore - USER.balance, value);
+        assertEq(wrappedBefore - winj.balanceOf(USER), amountIn - value);
+        _assertDonationsIntact();
+    }
+
+    /// An Infinity pool keyed on NATIVE INJ, both ways: `settle{value}` in, and a native `take`
+    /// through `receive()` out - with a mixed input and donations present.
+    function test_aNativeInfinityPoolBothWays() public {
+        PoolKey memory k = PoolKey(
+            Currency.wrap(address(0)),
+            Currency.wrap(address(usdc)),
+            IHooks(address(0)),
+            IPoolManager(address(clB)),
+            FEE,
+            bytes32(0).setTickSpacing(SPACING)
+        );
+        clB.initialize(k, SQRT_1_1);
+        usdc.mint(address(this), 100_000 ether);
+        usdc.approve(address(seedB), type(uint256).max);
+        vm.deal(address(this), 200_000 ether);
+        seedB.modifyPosition{value: 100_000 ether}(
+            k, ICLPoolManager.ModifyLiquidityParams(-887220, 887220, int256(50_000 ether), bytes32(0)), ""
+        );
+        _donate();
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, k, false, NATIVE, address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(NATIVE, address(usdc), 100 ether, 1, s);
+        vm.prank(USER);
+        uint256 got = agg.execute{value: 40 ether}(p);
+        assertEq(usdc.balanceOf(RECIPIENT), got);
+        _assertDonationsIntact();
+
+        s[0] = _infinity(vaultB, k, false, address(usdc), NATIVE, 10_000);
+        p = _params(address(usdc), NATIVE, 50 ether, 1, s);
+        uint256 recipientBefore = RECIPIENT.balance;
+        vm.prank(USER);
+        got = agg.execute(p);
+        assertEq(RECIPIENT.balance - recipientBefore, got);
+        _assertDonationsIntact();
+    }
+
+    /// A hook that returns a delta taking MORE than its hop's output cannot make up the difference
+    /// from money sitting in the contract: the step reverts `StepPaidNothing`.
+    function test_aDeltaReturningHookCannotSpendWhatTheContractHolds() public {
+        CLReturnsDeltaHook hook = new CLReturnsDeltaHook(vaultB, clB);
+        (address c0, address c1) = _sorted(address(winj), address(usdc));
+        PoolKey memory hk = PoolKey(
+            Currency.wrap(c0),
+            Currency.wrap(c1),
+            IHooks(address(hook)),
+            IPoolManager(address(clB)),
+            FEE,
+            bytes32(uint256(hook.getHooksRegistrationBitmap())).setTickSpacing(SPACING)
+        );
+        clB.initialize(hk, SQRT_1_1);
+        winj.mint(address(this), 100_000 ether);
+        usdc.mint(address(this), 100_000 ether);
+        winj.approve(address(seedB), type(uint256).max);
+        usdc.approve(address(seedB), type(uint256).max);
+        seedB.modifyPosition(
+            hk,
+            ICLPoolManager.ModifyLiquidityParams(-887220, 887220, int256(50_000 ether), bytes32(0)),
+            abi.encode(int256(0))
+        );
+        _donate();
+
+        ChoiceAggregator.Hop[] memory h = new ChoiceAggregator.Hop[](1);
+        h[0] = _hopFor(hk, false, address(winj), 10_000);
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = ChoiceAggregator.Step(ChoiceAggregator.Kind.Infinity, address(winj), address(usdc), 10_000, "");
+        h[0].hookData = abi.encode(int128(0), int128(0), int128(0));
+        s[0].data = abi.encode(ChoiceAggregator.InfinityStage(vaultB, h));
+        uint256 honest = _probeWith(_params(address(winj), address(usdc), 10 ether, 0, s), 0);
+
+        h[0].hookData = abi.encode(int128(0), int128(0), int128(int256(honest + 5 ether)));
+        s[0].data = abi.encode(ChoiceAggregator.InfinityStage(vaultB, h));
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 10 ether, 0, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.StepPaidNothing.selector, 0));
+        _assertDonationsIntact();
+    }
+
     // ── malformed routes ──────────────────────────────────────────────────
 
     function test_malformedEnvelopesAreRefused() public {
@@ -570,6 +748,13 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         p = _params(address(winj), address(usdc), 1 ether, 0, one);
         p.recipient = address(0);
         _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.ZeroRecipient.selector));
+
+        // Output the contract itself, or wINJ's wrapping fallback, would strand for good.
+        p = _params(address(winj), address(usdc), 1 ether, 0, one);
+        p.recipient = address(agg);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadRecipient.selector, address(agg)));
+        p.recipient = address(winj);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadRecipient.selector, address(winj)));
 
         p = _params(address(winj), address(winj), 1 ether, 0, one);
         _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.SameCurrency.selector));
@@ -836,6 +1021,7 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
             askDepth: 1_000_000 ether,
             qtyTick: TICK,
             feeE18: 1e15,
+            minNotional: 1 ether,
             allowed: allowed
         });
     }

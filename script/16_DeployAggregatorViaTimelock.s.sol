@@ -79,6 +79,7 @@ contract DeployAggregatorViaTimelock is DeploySinkAndCrankerViaTimelock {
         bool quoterLanded = w.quoter == address(0) || w.quoter.code.length != 0;
         if (aggregatorLanded && quoterLanded) {
             _checkDeployed(w);
+            _checkCode(w);
             writeAddress("choice.aggregator", w.aggregator);
             if (w.quoter != address(0)) writeAddress("choice.pumexClQuoter", w.quoter);
             console.log("");
@@ -105,6 +106,7 @@ contract DeployAggregatorViaTimelock is DeploySinkAndCrankerViaTimelock {
         _buildAggregatorBatch(factory, w, !aggregatorLanded, !quoterLanded, bracket);
         _simulateAndPrint(w.timelock, AGGREGATOR_BATCH_SALT, bracket);
         _checkDeployed(w);
+        _checkCode(w);
 
         require(factory.owner() == factoryOwner, "the batch moved the factory's owner");
         require(
@@ -218,8 +220,40 @@ contract DeployAggregatorViaTimelock is DeploySinkAndCrankerViaTimelock {
         console.log("  [ok]   quoter: Pumex's CL pool manager, on Pumex's vault");
     }
 
+    /// @dev The code at each CREATE3 address must be what THIS source builds, byte for byte. The
+    /// wiring checks above cannot tell an old build from a new one, and the timelock's executor
+    /// role is OPEN: a batch scheduled from an older build can be executed by anyone once its
+    /// delay passes, and its salt is then spent on the old code. So a reference copy is built here,
+    /// in this script's local fork only (nothing is broadcast), and the runtime hashes compared -
+    /// identical, because both carry the same immutables.
+    function _checkCode(Wiring memory w) internal {
+        require(
+            _builtCodehash(_aggregatorPayload(w)) == w.aggregator.codehash,
+            "the aggregator on chain is NOT this build - a batch from an older source was executed; do not write the book, bump AGGREGATOR_SALT"
+        );
+        if (w.quoter != address(0)) {
+            require(
+                _builtCodehash(abi.encodePacked(type(CLQuoter).creationCode, abi.encode(w.pumexManager)))
+                    == w.quoter.codehash,
+                "the Pumex quoter on chain is NOT this build - do not write the book, bump PUMEX_QUOTER_SALT"
+            );
+        }
+        console.log("  [ok]   code: the deployed runtime is this build's, byte for byte");
+    }
+
+    function _builtCodehash(bytes memory creation) internal returns (bytes32) {
+        address built;
+        assembly ("memory-safe") {
+            built := create(0, add(creation, 0x20), mload(creation))
+        }
+        require(built != address(0), "could not build a reference copy");
+        return built.codehash;
+    }
+
     function _printNextSteps(bool bracket) internal view override {
         console.log("3. Re-run this script WITHOUT --broadcast: it finds both, checks them, writes the book.");
+        console.log("   If this source changes before step 2, the Safe must timelock.cancel(id) and schedule anew:");
+        console.log("   the executor role is open, and an executed stale batch spends both salts on old code.");
         if (!bracket) console.log("4. The factory's owner removes the timelock from the whitelist again.");
         console.log("");
         console.log("Nothing routes through the aggregator until choice.aggregator is in the book and synced:");
