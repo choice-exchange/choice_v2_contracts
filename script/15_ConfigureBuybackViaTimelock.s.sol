@@ -5,7 +5,7 @@ import "forge-std/Script.sol";
 import {Create3Factory} from "pancake-create3-factory/src/Create3Factory.sol";
 
 import {IBuybackBurnSink} from "../src/interfaces/IBuybackBurnSink.sol";
-import {DeploySinkAndCrankerViaTimelock} from "./13_DeploySinkAndCrankerViaTimelock.s.sol";
+import {DeploySinkAndCrankerViaTimelock, ITimelockBatch} from "./13_DeploySinkAndCrankerViaTimelock.s.sol";
 
 /**
  * Turn the buyback ON: the sink's whole configuration as ONE timelock batch.
@@ -31,6 +31,19 @@ import {DeploySinkAndCrankerViaTimelock} from "./13_DeploySinkAndCrankerViaTimel
  * A step whose value is already in place is left out, so a re-run after a partial change
  * schedules only what differs. The values are script 09's constants, so its report and this
  * batch cannot disagree.
+ *
+ * 🔑 **A retune needs its own salt.** A timelock operation id is a hash of the calls and the
+ * salt, and an executed id can never be scheduled again. So the second time the SAME change is
+ * made (cap 10 -> 5 -> 10 -> 5), the batch hashes to an id that is already done. Set
+ * `TURN_ON_SALT_TAG` to anything new for each retune, the date is enough
+ * (`TURN_ON_SALT_TAG=2026-10-20`). Leave it unset for the first turn-on, whose id is the one
+ * the 2026-10-08 review printed. The script refuses an id that has already executed rather
+ * than printing a schedule the timelock would reject.
+ *
+ * ⚠️ Schedule this only once script 13's batch has EXECUTED. The script refuses before the sink
+ * has code, but the calls themselves are fixed, so a hand-built copy scheduled earlier could be
+ * executed (by anyone, the executor role is open) against an empty address. Every call would
+ * succeed doing nothing, and the id would be spent.
  *
  * Like 13, it broadcasts nothing. It runs the batch through the real Safe and the real timelock
  * in this script's fork, asserts the result, and prints both calldatas and the gas each one
@@ -110,8 +123,25 @@ contract ConfigureBuybackViaTimelock is DeploySinkAndCrankerViaTimelock {
             return;
         }
 
-        _simulateAndPrint(timelock, rehearsal ? _rehearsalSalt(tag, "turn-on") : TURN_ON_SALT, true);
+        bytes32 salt = _turnOnSalt(rehearsal, tag, vm.envOr("TURN_ON_SALT_TAG", string("")));
+        _refuseSpentId(ITimelockBatch(timelock), salt);
+        _simulateAndPrint(timelock, salt, true);
         _checkConfigured(s, operator, launchId);
+    }
+
+    /// @dev The first turn-on keeps `TURN_ON_SALT` itself. A retune appends its tag.
+    function _turnOnSalt(bool rehearsal, string memory tag, string memory retuneTag) internal pure returns (bytes32) {
+        bytes32 base = rehearsal ? _rehearsalSalt(tag, "turn-on") : TURN_ON_SALT;
+        return bytes(retuneTag).length == 0 ? base : keccak256(abi.encodePacked(base, "/", retuneTag));
+    }
+
+    function _refuseSpentId(ITimelockBatch tl, bytes32 salt) internal view {
+        bytes32 id = tl.hashOperationBatch(targets, new uint256[](targets.length), payloads, bytes32(0), salt);
+        if (tl.isOperationDone(id)) {
+            console.log("Operation id already executed:");
+            console.logBytes32(id);
+            revert("this exact batch already ran under this salt - set TURN_ON_SALT_TAG to something new");
+        }
     }
 
     function _printNextSteps(bool) internal view override {
