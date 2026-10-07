@@ -131,6 +131,19 @@ run_pass() {
        "$(CA 'address,address,address,address,address' \
             "$PADCORE" "$CLPM" "$TL" "$SETTLER" "$SINK")"
 
+  # ChoiceAggregator 1.0.0 and the Pumex CLQuoter, both from script 16's timelock batch. CREATE3,
+  # so v2 endpoint only. The quoter is upstream's CLQuoter BUILT HERE (this repo's profile, from
+  # lib/), not from the periphery fork the way infinity.clQuoter was, so it verifies against
+  # `contracts`. Skipped until script 16's re-run writes them into the book.
+  AGG=$(b .choice.aggregator)
+  PCLQ=$(b .choice.pumexClQuoter)
+  PUMEX_VAULT=$(b .external.pumexVault)
+  PUMEX_CLPM=$(b .external.pumexClPoolManager)
+  [ "$AGG" != null ] && "$V" contracts "$AGG" src/router/ChoiceAggregator.sol:ChoiceAggregator \
+       "$(CA 'address,address,address,address[]' "$TL" "$P2" "$WETH" "[$VAULT,$PUMEX_VAULT]")"
+  [ "$PCLQ" != null ] && "$V" contracts "$PCLQ" lib/infinity-periphery/src/pool-cl/lens/CLQuoter.sol:CLQuoter \
+       "$(CA address "$PUMEX_CLPM")"
+
   # OpenZeppelin's TimelockController, deployed by script 01 from this repo's lib.
   # proposers = [safe]; executors = [address(0)] (open role); admin = address(0).
   "$V" contracts "$TL" \
