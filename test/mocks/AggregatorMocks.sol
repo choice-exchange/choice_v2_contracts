@@ -4,6 +4,8 @@ pragma solidity 0.8.26;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Vm} from "forge-std/Vm.sol";
 
+import {IChoiceAdapter} from "../../src/interfaces/IChoiceAdapter.sol";
+
 /// A bank-backed (MTS) token as the swap precompile sees it: an ordinary ERC20 to every contract,
 /// plus `mint` / `burn` that the precompile mock uses as its bank credit and debit (no allowance,
 /// like the real one).
@@ -227,5 +229,156 @@ contract MockSolidlyPair {
             IERC20(token0).transfer(to, amount0Out);
         }
         sync();
+    }
+}
+
+/// An honest adapter over a fixed-price venue with a CAPACITY - the shape of a bonding curve near
+/// its graduation target: it fills at `rateE18` until `capacityIn` of input has been used, and hands
+/// the rest of the input back. It keeps an inventory of output tokens, as a venue does, and so
+/// measures everything by balance delta: an inventory or a donation is never paid to a caller.
+/// `data` = `abi.encode(uint256 marketId)`.
+contract MockCapacityAdapter is IChoiceAdapter {
+    struct Market {
+        uint256 rateE18; // tokenOut raw per tokenIn raw, x1e18
+        uint256 capacityIn; // tokenIn raw still fillable
+    }
+
+    mapping(bytes32 => Market) public market;
+
+    function setMarket(uint256 id, address tokenIn, address tokenOut, uint256 rateE18, uint256 capacityIn) external {
+        market[_key(id, tokenIn, tokenOut)] = Market(rateE18, capacityIn);
+    }
+
+    function quote(address tokenIn, address tokenOut, uint256 amountIn, bytes calldata data)
+        public
+        view
+        returns (uint256 amountOut, uint256 amountInUsed)
+    {
+        Market memory m = market[_key(abi.decode(data, (uint256)), tokenIn, tokenOut)];
+        amountInUsed = amountIn < m.capacityIn ? amountIn : m.capacityIn;
+        amountOut = (amountInUsed * m.rateE18) / 1e18;
+        if (amountOut == 0) amountInUsed = 0;
+    }
+
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, address recipient, bytes calldata data)
+        external
+        returns (uint256 amountOut)
+    {
+        uint256 used;
+        (amountOut, used) = quote(tokenIn, tokenOut, amountIn, data);
+        require(amountOut != 0, "adapter: will not trade");
+        market[_key(abi.decode(data, (uint256)), tokenIn, tokenOut)].capacityIn -= used;
+        // Paid first: the input must already be here. The venue keeps what it used.
+        require(IERC20(tokenIn).balanceOf(address(this)) >= amountIn, "adapter: not paid");
+        IERC20(tokenOut).transfer(recipient, amountOut);
+        if (amountIn > used) IERC20(tokenIn).transfer(msg.sender, amountIn - used);
+    }
+
+    function _key(uint256 id, address tokenIn, address tokenOut) internal pure returns (bytes32) {
+        return keccak256(abi.encode(id, tokenIn, tokenOut));
+    }
+}
+
+/// An adapter that does whatever the test arms it to, before paying `payOut` of `tokenOut` from its
+/// own inventory and returning `claimed`. Every hostile thing an adapter could try is one of these
+/// knobs: keep the input (`payOut = 0`), pay dust, lie in its return value, call back into
+/// anything (`target` / `callData`, reverting with the callee's error if `bubble`), pull from its
+/// caller, or push native INJ at it.
+contract MockHostileAdapter is IChoiceAdapter {
+    address public target;
+    bytes public callData;
+    bool public bubble;
+    uint256 public payOut;
+    uint256 public claimed;
+    bool public tryPull;
+    bool public pullSucceeded;
+    uint256 public nativeToCaller;
+
+    function arm(address target_, bytes calldata callData_, bool bubble_) external {
+        target = target_;
+        callData = callData_;
+        bubble = bubble_;
+    }
+
+    function setPay(uint256 payOut_, uint256 claimed_) external {
+        payOut = payOut_;
+        claimed = claimed_;
+    }
+
+    function setPull(bool on) external {
+        tryPull = on;
+    }
+
+    function setNativeToCaller(uint256 amount) external {
+        nativeToCaller = amount;
+    }
+
+    function quote(address, address, uint256 amountIn, bytes calldata) external view returns (uint256, uint256) {
+        return (claimed, amountIn);
+    }
+
+    function swap(address tokenIn, address tokenOut, uint256, address recipient, bytes calldata)
+        external
+        returns (uint256)
+    {
+        if (target != address(0)) {
+            (bool ok, bytes memory ret) = target.call(callData);
+            if (!ok && bubble) {
+                assembly ("memory-safe") {
+                    revert(add(ret, 0x20), mload(ret))
+                }
+            }
+        }
+        if (tryPull) {
+            // Everything the caller holds of either token, donations included.
+            address[2] memory tokens = [tokenIn, tokenOut];
+            for (uint256 i; i < 2; ++i) {
+                uint256 bal = IERC20(tokens[i]).balanceOf(msg.sender);
+                if (bal == 0) continue;
+                try IERC20(tokens[i]).transferFrom(msg.sender, address(this), bal) {
+                    pullSucceeded = true;
+                } catch {}
+            }
+        }
+        if (nativeToCaller != 0) {
+            (bool ok, bytes memory ret) = msg.sender.call{value: nativeToCaller}("");
+            if (!ok) {
+                assembly ("memory-safe") {
+                    revert(add(ret, 0x20), mload(ret))
+                }
+            }
+        }
+        if (payOut != 0) IERC20(tokenOut).transfer(recipient, payOut);
+        return claimed;
+    }
+
+    receive() external payable {}
+}
+
+/// An adapter that, inside its own step, dumps `dump` of `dumpToken` into a Solidly pair a LATER
+/// step of the same route trades against, then pays one unit of its step's output. It cannot
+/// touch the route's money; what it can do is move a price the route has not reached yet.
+contract MockSandwichAdapter is IChoiceAdapter {
+    MockSolidlyPair public immutable pair;
+    address public immutable dumpToken;
+    uint256 public immutable dump;
+
+    constructor(MockSolidlyPair pair_, address dumpToken_, uint256 dump_) {
+        pair = pair_;
+        dumpToken = dumpToken_;
+        dump = dump_;
+    }
+
+    function quote(address, address, uint256 amountIn, bytes calldata) external pure returns (uint256, uint256) {
+        return (amountIn, amountIn);
+    }
+
+    function swap(address, address tokenOut, uint256, address recipient, bytes calldata) external returns (uint256) {
+        uint256 out = pair.getAmountOut(dump, dumpToken);
+        IERC20(dumpToken).transfer(address(pair), dump);
+        bool zeroIn = pair.token0() == dumpToken;
+        pair.swap(zeroIn ? 0 : out, zeroIn ? out : 0, address(this), "");
+        IERC20(tokenOut).transfer(recipient, 1);
+        return 1;
     }
 }

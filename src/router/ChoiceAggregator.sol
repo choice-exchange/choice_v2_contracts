@@ -17,13 +17,18 @@ import {IBinPoolManager} from "infinity-core/src/pool-bin/interfaces/IBinPoolMan
 import {TickMath} from "infinity-core/src/pool-cl/libraries/TickMath.sol";
 import {IWETH9} from "infinity-periphery/src/interfaces/external/IWETH9.sol";
 
+import {IChoiceAdapter} from "../interfaces/IChoiceAdapter.sol";
 import {IHelixSwap} from "../interfaces/IHelixSwap.sol";
 import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 
 /// @title ChoiceAggregator
 /// @notice Executes ONE exact-input swap route across every kind of liquidity Injective EVM has -
-/// Infinity vaults (Choice's and Pumex's, CL and Bin), Solidly pairs (Pumex V2) and the Helix
-/// orderbook through the `0x68` swap precompile - under a single end-to-end `minimumReceive`.
+/// Infinity vaults (Choice's and Pumex's, CL and Bin), Solidly pairs (Pumex V2), the Helix
+/// orderbook through the `0x68` swap precompile, and any venue an `IChoiceAdapter` wraps - under a
+/// single end-to-end `minimumReceive`.
+///
+/// **1.1.0** adds the `Adapter` step, an optional fee on the output (`feeBps` / `feeRecipient`)
+/// and `executeWithPermit`. Everything 1.0.0 did, it does the same way.
 ///
 /// **Why it exists.** Measured on mainnet 2026-10-07, the deepest INJ/USD liquidity on Injective
 /// EVM sat in three places no Choice router could reach: the Helix INJ/USDC book, Pumex's Infinity
@@ -52,6 +57,15 @@ import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 /// guard at all - the frontend must refuse one; the contract does not, because a floor expressed
 /// in output units is a quote, and quoting is not this contract's job.
 ///
+/// **An optional fee on the output.** `feeBps` of what the route realised in `currencyOut` goes to
+/// `feeRecipient`, and `minimumReceive` is checked on what is left - which is exactly what
+/// `recipient` receives. The fee is set by whoever builds the route, so which routes carry one
+/// (a venue's legs, an integrator's flow) is a planner's policy. It is not keyed on venues here
+/// because a fee the contract imposed per venue would bind only callers who chose this contract
+/// anyway: those venues can be traded directly. What the contract guarantees is the ceiling -
+/// no route charges more than `MAX_FEE_BPS` - and a frontend checks the rate and the recipient
+/// against what it showed the user, as it checks the minimum.
+///
 /// **Trust, per kind:**
 ///
 /// - *Infinity vaults are allowlisted, and that is the whole trust boundary for that kind.* A
@@ -67,6 +81,17 @@ import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 ///   `transfer` and is never approved for anything, so the most a hostile pair can take is the one
 ///   step's input; it cannot produce `tokenOut` it does not have, and a step that produced none
 ///   reverts. A new Pumex pair needs no governance batch to become routable.
+/// - *Adapters are NOT allowlisted either, for the same reason.* An adapter is paid exactly the
+///   step's input by `transfer`, is never approved, and is called with THIS contract as the
+///   recipient. Whatever code runs inside it holds no allowance from here, cannot re-enter
+///   `execute`, and is not a vault `lockAcquired` will answer - so of what this contract holds
+///   it can take that one step's input and nothing else, and a step that produced none of its
+///   `tokenOut` reverts. Its return value is decoded but never trusted; output is the balance
+///   delta, as for every kind. ⚠️ Like any venue code that runs mid-route - a hostile Solidly
+///   pair included - it can also MOVE PRICES a later step trades against, since steps run
+///   unguarded; `minimumReceive` is what bounds that, as it bounds every other way a route can
+///   underdeliver. So a planner lists only adapters it has read, and a frontend that does not
+///   trust its planner checks the adapter addresses too.
 /// - *The Helix precompile is a fixed address*, and its markets are allowlisted by the CHAIN
 ///   (`swap_params.allowed_markets`), not here.
 ///
@@ -109,7 +134,10 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         /// one swap through a Solidly pair; `data` = `abi.encode(address pair, bool zeroForOne)`
         Solidly,
         /// one swap through the `0x68` precompile; `data` = `abi.encode(string marketId)`
-        Helix
+        Helix,
+        /// one swap through an `IChoiceAdapter`; `data` = `abi.encode(address adapter, bytes
+        /// adapterData)`, `adapterData` passed through verbatim
+        Adapter
     }
 
     /// @param tokenIn what the step spends; `address(0)` is native INJ
@@ -151,9 +179,12 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
     /// form `currencyIn` names before the first step
     /// @param currencyOut what `recipient` receives; `address(0)` is native INJ
     /// @param amountIn exact input
-    /// @param minimumReceive the ONE guard on this route, measured on realised output
+    /// @param minimumReceive the ONE guard on this route, measured on what `recipient` receives -
+    /// realised output less the fee
     /// @param recipient who receives `currencyOut`; dust returns to `msg.sender`
     /// @param deadline unix seconds; also handed to every Helix step
+    /// @param feeBps of realised output, paid to `feeRecipient`; 0..`MAX_FEE_BPS`
+    /// @param feeRecipient who receives the fee; set if and only if `feeBps` is
     /// @param steps in execution order
     struct RouteParams {
         address currencyIn;
@@ -162,6 +193,8 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         uint256 minimumReceive;
         address recipient;
         uint256 deadline;
+        uint16 feeBps;
+        address feeRecipient;
         Step[] steps;
     }
 
@@ -176,6 +209,11 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
     uint256 private constant STAGE_PAYLOAD_SLOT = 0xbd74014f058beb366b185ec0ddc5288621cbbba0a9f626076702bc8a4fe16b2b;
 
     uint16 private constant BPS = 10_000;
+
+    /// @notice The most any route may pay in fees: 1% of its realised output.
+    uint16 public constant MAX_FEE_BPS = 100;
+
+    string public constant VERSION = "1.1.0";
 
     address internal constant NATIVE = address(0);
 
@@ -199,6 +237,8 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         uint256 amountIn,
         uint256 amountOut
     );
+    /// @notice Emitted beside `Routed` when a route paid a fee; `Routed.amountOut` is net of it.
+    event FeePaid(address indexed feeRecipient, address indexed currency, uint256 amount);
 
     error DeadlinePassed();
     error NoSteps();
@@ -222,6 +262,7 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
     error HopInputMismatch(uint256 stepIndex, uint256 hopIndex);
     error StageOverAllocated(uint256 stepIndex);
     error NothingToChain(uint256 stepIndex, uint256 hopIndex);
+    error BadFee();
 
     constructor(address _owner, IAllowanceTransfer _permit2, IWETH9 _winj, IVault[] memory _vaults) Ownable(_owner) {
         PERMIT2 = _permit2;
@@ -255,15 +296,40 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
     /// @dev For an ERC20 input the caller must have approved this contract as a Permit2 spender
     /// and send no value. For an INJ input (`address(0)` or wINJ) the caller sends any part of
     /// `amountIn` as `msg.value`, and the Permit2 approval covers the wINJ rest when there is one.
-    /// @return amountOut what the route actually produced, which is what the guard checked
+    /// @return amountOut what `recipient` received - the route's realised output less the fee -
+    /// which is what the guard checked
     function execute(RouteParams calldata p) external payable nonReentrant returns (uint256 amountOut) {
+        return _execute(p);
+    }
+
+    /// @notice `execute`, with a Permit2 allowance for this contract granted by signature in the
+    /// same transaction - so a wallet's first route through this aggregator (or its first after an
+    /// allowance expired) needs no separate approval transaction.
+    /// @dev The permit is tried and its failure ignored. A signed permit is public once broadcast,
+    /// and anyone may submit it to Permit2 first; the allowance then exists and only this call's
+    /// copy fails. Whether the allowance is really there is decided by the pull, which reverts on
+    /// its own terms if it is not.
+    function executeWithPermit(
+        RouteParams calldata p,
+        IAllowanceTransfer.PermitSingle calldata permitSingle,
+        bytes calldata signature
+    ) external payable nonReentrant returns (uint256 amountOut) {
+        try PERMIT2.permit(msg.sender, permitSingle, signature) {} catch {}
+        return _execute(p);
+    }
+
+    function _execute(RouteParams calldata p) private returns (uint256 amountOut) {
         if (block.timestamp > p.deadline) revert DeadlinePassed();
         if (p.steps.length == 0) revert NoSteps();
         if (p.amountIn == 0) revert ZeroAmount();
         if (p.recipient == address(0)) revert ZeroRecipient();
         // Output sent here, or to wINJ (whose fallback would wrap a native payout back to THIS
-        // contract), is stranded for good: nothing here can sweep it.
+        // contract), is stranded for good: nothing here can sweep it. The same holds for a fee.
         if (p.recipient == address(this) || p.recipient == address(WINJ)) revert BadRecipient(p.recipient);
+        if (p.feeBps > MAX_FEE_BPS || (p.feeBps == 0) != (p.feeRecipient == address(0))) revert BadFee();
+        if (p.feeRecipient == address(this) || p.feeRecipient == address(WINJ)) {
+            revert BadRecipient(p.feeRecipient);
+        }
         if (p.currencyIn == p.currencyOut) revert SameCurrency();
 
         // Snapshotted BEFORE the pull, so every figure below is what THIS route moved. Native
@@ -298,7 +364,20 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
             _runStep(p.steps[i], i, touched, before, p.deadline);
         }
 
-        amountOut = _held(p.currencyOut, touched, before);
+        amountOut = _payOut(p, touched, before);
+        emit Routed(msg.sender, p.recipient, p.currencyOut, p.currencyIn, p.amountIn, amountOut);
+    }
+
+    /// Output to `recipient`, the fee to `feeRecipient`, and every other currency's remainder back
+    /// to the caller. A function of its own only to keep `_execute`'s frame inside the stack.
+    function _payOut(RouteParams calldata p, address[] memory touched, uint256[] memory before)
+        private
+        returns (uint256 amountOut)
+    {
+        // Rounded down, so the user is never charged a wei more than the rate.
+        uint256 realised = _held(p.currencyOut, touched, before);
+        uint256 fee = (realised * p.feeBps) / BPS;
+        amountOut = realised - fee;
         if (amountOut < p.minimumReceive) revert InsufficientOutput(amountOut, p.minimumReceive);
 
         // Every other currency's remainder - unspent input, a Helix leg's tick-floored change, a
@@ -310,11 +389,13 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         }
 
         _send(p.currencyOut, p.recipient, amountOut);
+        if (fee != 0) {
+            _send(p.currencyOut, p.feeRecipient, fee);
+            emit FeePaid(p.feeRecipient, p.currencyOut, fee);
+        }
         for (uint256 i; i < touched.length; ++i) {
             if (dust[i] != 0) _send(touched[i], msg.sender, dust[i]);
         }
-
-        emit Routed(msg.sender, p.recipient, p.currencyOut, p.currencyIn, p.amountIn, amountOut);
     }
 
     /// @inheritdoc ILockCallback
@@ -357,8 +438,10 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
             _runInfinity(s, i, amount);
         } else if (s.kind == Kind.Solidly) {
             _runSolidly(s, i, amount);
-        } else {
+        } else if (s.kind == Kind.Helix) {
             _runHelix(s, i, amount, deadline);
+        } else {
+            _runAdapter(s, i, amount);
         }
 
         if (_balance(s.tokenOut) <= outBefore) revert StepPaidNothing(i);
@@ -417,6 +500,22 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
         if (s.tokenIn == address(WINJ) || s.tokenOut == address(WINJ)) revert BadStep(i);
         string memory marketId = abi.decode(s.data, (string));
         HELIX.swapExactInputV1(s.tokenIn, marketId, amount, 0, address(this), deadline);
+    }
+
+    /// Paid first, then asked - the Solidly shape, generalised: the adapter is sent exactly this
+    /// step's input and told to deliver here. What it sends back of `tokenIn` (a capped or partial
+    /// fill) is route money again, spent by a later step or refunded as dust; what it delivers of
+    /// `tokenOut` is measured by `_runStep`, never taken from its return value (which is decoded,
+    /// so an adapter must return one). Anything it sends of a third token is outside `_touched`
+    /// and stays here for good. Native INJ is refused on both sides: `receive()` takes it only
+    /// from senders this contract trusts, and an adapter is not one.
+    function _runAdapter(Step calldata s, uint256 i, uint256 amount) private {
+        if (s.tokenIn == NATIVE || s.tokenOut == NATIVE) revert BadStep(i);
+        (address adapter, bytes memory adapterData) = abi.decode(s.data, (address, bytes));
+        if (adapter.code.length == 0) revert BadStep(i);
+
+        IERC20(s.tokenIn).safeTransfer(adapter, amount);
+        IChoiceAdapter(adapter).swap(s.tokenIn, s.tokenOut, amount, address(this), adapterData);
     }
 
     // ── Infinity internals ────────────────────────────────────────────────
