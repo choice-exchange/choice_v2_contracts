@@ -83,12 +83,15 @@ import {ISolidlyPair} from "../interfaces/ISolidlyPair.sol";
 ///   reverts. A new Pumex pair needs no governance batch to become routable.
 /// - *Adapters are NOT allowlisted either, for the same reason.* An adapter is paid exactly the
 ///   step's input by `transfer`, is never approved, and is called with THIS contract as the
-///   recipient. Whatever code runs inside it, it holds no allowance from here, cannot re-enter
-///   `execute`, and is not a vault `lockAcquired` will answer - so it can take that one step's
-///   input and nothing else, and a step that produced none of its `tokenOut` reverts. Its return
-///   value is ignored; output is the balance delta, as for every kind. So a venue behind an
-///   adapter is routable the moment a planner lists it, and a frontend that wants to may refuse
-///   adapters it does not know.
+///   recipient. Whatever code runs inside it holds no allowance from here, cannot re-enter
+///   `execute`, and is not a vault `lockAcquired` will answer - so of what this contract holds
+///   it can take that one step's input and nothing else, and a step that produced none of its
+///   `tokenOut` reverts. Its return value is decoded but never trusted; output is the balance
+///   delta, as for every kind. ⚠️ Like any venue code that runs mid-route - a hostile Solidly
+///   pair included - it can also MOVE PRICES a later step trades against, since steps run
+///   unguarded; `minimumReceive` is what bounds that, as it bounds every other way a route can
+///   underdeliver. So a planner lists only adapters it has read, and a frontend that does not
+///   trust its planner checks the adapter addresses too.
 /// - *The Helix precompile is a fixed address*, and its markets are allowlisted by the CHAIN
 ///   (`swap_params.allowed_markets`), not here.
 ///
@@ -502,9 +505,10 @@ contract ChoiceAggregator is Ownable2Step, ReentrancyGuardTransient, ILockCallba
     /// Paid first, then asked - the Solidly shape, generalised: the adapter is sent exactly this
     /// step's input and told to deliver here. What it sends back of `tokenIn` (a capped or partial
     /// fill) is route money again, spent by a later step or refunded as dust; what it delivers of
-    /// `tokenOut` is measured by `_runStep`, never read from its return value. Native INJ is
-    /// refused on both sides: `receive()` takes it only from senders this contract trusts, and an
-    /// adapter is not one.
+    /// `tokenOut` is measured by `_runStep`, never taken from its return value (which is decoded,
+    /// so an adapter must return one). Anything it sends of a third token is outside `_touched`
+    /// and stays here for good. Native INJ is refused on both sides: `receive()` takes it only
+    /// from senders this contract trusts, and an adapter is not one.
     function _runAdapter(Step calldata s, uint256 i, uint256 amount) private {
         if (s.tokenIn == NATIVE || s.tokenOut == NATIVE) revert BadStep(i);
         (address adapter, bytes memory adapterData) = abi.decode(s.data, (address, bytes));

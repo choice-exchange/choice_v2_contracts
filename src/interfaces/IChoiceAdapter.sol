@@ -13,9 +13,11 @@ pragma solidity ^0.8.24;
 /// - spend at most `amountIn`, and send every unit of it that it did not spend back to
 ///   `msg.sender` before returning (a venue that fills partially, or caps a fill, leaves some);
 /// - send its output to `recipient`;
-/// - measure both by balance delta, never by "everything I hold". Between transactions an adapter
-///   should hold nothing, and whatever it does hold - a donation, a stray send - must not be paid
-///   out to whoever calls next;
+/// - measure both by balance delta, never by "everything I hold", so a stray balance is never
+///   ADDED to someone's trade. Between transactions an adapter should hold nothing. ⚠️ Paid-first
+///   means a stray balance (a donation, a mistaken send) can still be SPENT as input by anyone
+///   who calls `swap` naming it, exactly as a Solidly pair's excess can be skimmed: never send
+///   an adapter anything outside the transaction that swaps it;
 /// - send no native INJ: both tokens are ERC20s, and a caller may refuse native it did not ask for.
 ///
 /// **What a caller must assume.** An adapter is code someone else deployed. Measure what it

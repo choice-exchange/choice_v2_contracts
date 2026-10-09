@@ -354,3 +354,31 @@ contract MockHostileAdapter is IChoiceAdapter {
 
     receive() external payable {}
 }
+
+/// An adapter that, inside its own step, dumps `dump` of `dumpToken` into a Solidly pair a LATER
+/// step of the same route trades against, then pays one unit of its step's output. It cannot
+/// touch the route's money; what it can do is move a price the route has not reached yet.
+contract MockSandwichAdapter is IChoiceAdapter {
+    MockSolidlyPair public immutable pair;
+    address public immutable dumpToken;
+    uint256 public immutable dump;
+
+    constructor(MockSolidlyPair pair_, address dumpToken_, uint256 dump_) {
+        pair = pair_;
+        dumpToken = dumpToken_;
+        dump = dump_;
+    }
+
+    function quote(address, address, uint256 amountIn, bytes calldata) external pure returns (uint256, uint256) {
+        return (amountIn, amountIn);
+    }
+
+    function swap(address, address tokenOut, uint256, address recipient, bytes calldata) external returns (uint256) {
+        uint256 out = pair.getAmountOut(dump, dumpToken);
+        IERC20(dumpToken).transfer(address(pair), dump);
+        bool zeroIn = pair.token0() == dumpToken;
+        pair.swap(zeroIn ? 0 : out, zeroIn ? out : 0, address(this), "");
+        IERC20(tokenOut).transfer(recipient, 1);
+        return 1;
+    }
+}

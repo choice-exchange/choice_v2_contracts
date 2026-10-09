@@ -62,8 +62,9 @@ contract DeployAggregatorV1_1ViaTimelock is DeploySinkAndCrankerViaTimelock {
         if (w.legacy != address(0)) console.log("ChoiceAggregator 1.0.0 (stays, unpointed) ->", w.legacy);
 
         if (w.aggregator.code.length != 0) {
-            _checkDeployed(w);
+            // Code first: an older build at this salt may not even answer VERSION().
             _checkCode(w);
+            _checkDeployed(w);
             if (w.legacy != address(0)) writeAddress("choice.aggregatorLegacy", w.legacy);
             writeAddress("choice.aggregator", w.aggregator);
             console.log("");
@@ -90,8 +91,8 @@ contract DeployAggregatorV1_1ViaTimelock is DeploySinkAndCrankerViaTimelock {
 
         _buildBatch(factory, w, bracket);
         _simulateAndPrint(w.timelock, AGGREGATOR_BATCH_SALT, bracket);
-        _checkDeployed(w);
         _checkCode(w);
+        _checkDeployed(w);
 
         require(factory.owner() == factoryOwner, "the batch moved the factory's owner");
         require(

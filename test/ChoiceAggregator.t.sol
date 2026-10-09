@@ -33,7 +33,8 @@ import {
     MockHelixSwap,
     MockSolidlyPair,
     MockCapacityAdapter,
-    MockHostileAdapter
+    MockHostileAdapter,
+    MockSandwichAdapter
 } from "./mocks/AggregatorMocks.sol";
 
 /// A pool manager that swaps NOTHING and touches no ledger, so a stage can run to completion
@@ -1070,6 +1071,28 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 100 ether, 1, r);
         _run(p);
         _assertDonationsIntact();
+    }
+
+    /// What an adapter CAN do with its turn: move a price a later step trades against (any venue
+    /// code running mid-route can, a Solidly pair's included). It costs the route output, never
+    /// the router's money - and `minimumReceive` is what bounds it: the same route under the
+    /// honest route's minimum reverts.
+    function test_aHostileAdapterCanMoveALaterStepAndTheMinimumBoundsIt() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](2);
+        s[0] = _adapter(address(adapter), address(winj), address(meme), 1000);
+        s[1] = _solidly(address(winj), address(usdt), 10_000);
+        uint256 honest = _probe(_params(address(winj), address(usdt), 100 ether, 0, s));
+
+        MockSandwichAdapter h = new MockSandwichAdapter(pair, address(winj), 100_000 ether);
+        winj.mint(address(h), 100_000 ether);
+        meme.mint(address(h), 1 ether);
+        s[0] = _adapter(address(h), address(winj), address(meme), 1000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdt), 100 ether, 0, s);
+        uint256 hostile = _probe(p);
+        assertLt(hostile, (honest * 90) / 100, "the later step was not moved");
+
+        p.minimumReceive = honest;
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.InsufficientOutput.selector, hostile, honest));
     }
 
     function test_malformedAdapterStepsAreRefused() public {
