@@ -24,8 +24,17 @@ import {BinTestHelper} from "infinity-core/test/pool-bin/helpers/BinTestHelper.s
 import {CLReturnsDeltaHook} from "infinity-core/test/pool-cl/helpers/CLReturnsDeltaHook.sol";
 import {IWETH9} from "infinity-periphery/src/interfaces/external/IWETH9.sol";
 
+import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+
 import {ChoiceAggregator} from "../src/router/ChoiceAggregator.sol";
-import {MockBankERC20, MockWINJ, MockHelixSwap, MockSolidlyPair} from "./mocks/AggregatorMocks.sol";
+import {
+    MockBankERC20,
+    MockWINJ,
+    MockHelixSwap,
+    MockSolidlyPair,
+    MockCapacityAdapter,
+    MockHostileAdapter
+} from "./mocks/AggregatorMocks.sol";
 
 /// A pool manager that swaps NOTHING and touches no ledger, so a stage can run to completion
 /// without any vault lock existing - which is what lets `HostileStageVault` drive a first callback
@@ -84,7 +93,9 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
     address internal constant TIMELOCK = address(0x71E);
     address internal constant USER = address(0xBEEF);
     address internal constant RECIPIENT = address(0xCAFE);
+    address internal constant FEE_SINK = address(0xFEE5);
     address internal constant NATIVE = address(0);
+    uint256 internal constant MARKET = 10_042;
     address internal constant HELIX = 0x0000000000000000000000000000000000000068;
     string internal constant INJ_USDC = "0xinj-usdc";
     string internal constant INJ_USDT_UNLISTED = "0xinj-usdt";
@@ -111,6 +122,8 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
     MockBankERC20 internal usdc;
     MockBankERC20 internal usdt;
     MockSolidlyPair internal pair; // wINJ / USDT, "Pumex V2"
+    MockBankERC20 internal meme; // a token only an adapter's venue trades
+    MockCapacityAdapter internal adapter; // wINJ <-> meme at a fixed rate, up to a capacity
 
     PoolKey internal poolA; // wINJ / USDC CL on Choice - thin
     PoolKey internal binPoolA; // wINJ / USDC Bin on Choice
@@ -154,6 +167,14 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         usdt.mint(address(pair), 1_000_000 ether);
         pair.sync();
 
+        // 1 wINJ buys 1000 meme, for up to 500 wINJ of input; meme sells back at 1/1000 + a spread.
+        meme = new MockBankERC20("MEME", "MEME", 18);
+        adapter = new MockCapacityAdapter();
+        adapter.setMarket(MARKET, address(winj), address(meme), 1000e18, 500 ether);
+        adapter.setMarket(MARKET, address(meme), address(winj), 0.00099e18, type(uint256).max);
+        meme.mint(address(adapter), 10_000_000 ether);
+        winj.mint(address(adapter), 10_000 ether);
+
         vm.etch(HELIX, address(new MockHelixSwap()).code);
         MockHelixSwap(HELIX).setMarket(INJ_USDC, _market(address(usdc), true));
         MockHelixSwap(HELIX).setMarket(INJ_USDT_UNLISTED, _market(address(usdt), false));
@@ -163,7 +184,7 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         vm.deal(address(winj), winj.totalSupply() + 1_000_000 ether);
 
         vm.deal(USER, 1_000_000 ether);
-        address[3] memory tokens = [address(winj), address(usdc), address(usdt)];
+        address[4] memory tokens = [address(winj), address(usdc), address(usdt), address(meme)];
         for (uint256 i; i < tokens.length; ++i) {
             MockBankERC20(tokens[i]).mint(USER, 1_000_000 ether);
             vm.startPrank(USER);
@@ -851,6 +872,402 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         assertTrue(active != payload, "the two gates would share one word");
     }
 
+    // ── adapters ──────────────────────────────────────────────────────────
+
+    /// An adapter is paid the step's input, delivers here, and the route pays its quote exactly.
+    function test_anAdapterStepPaysItsQuote() public {
+        uint256 amountIn = 100 ether;
+        (uint256 quoted, uint256 used) = adapter.quote(address(winj), address(meme), amountIn, abi.encode(MARKET));
+        assertEq(used, amountIn, "a fill inside capacity should use all of it");
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(adapter), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), amountIn, quoted, s);
+
+        assertEq(_run(p), quoted, "the adapter did not pay its own quote");
+        assertEq(meme.balanceOf(RECIPIENT), quoted, "recipient was not paid");
+        assertEq(winj.balanceOf(USER), 1_000_000 ether - amountIn, "wrong amount was pulled");
+        _assertRouterEmpty();
+    }
+
+    /// INJ is one currency at the input, so a native INJ buy through an ERC20-only adapter needs no
+    /// Wrap step: the route names wINJ and the caller pays it as `msg.value`.
+    function test_aNativeInjBuyThroughAnAdapterNeedsNoWrapStep() public {
+        uint256 amountIn = 50 ether;
+        (uint256 quoted,) = adapter.quote(address(winj), address(meme), amountIn, abi.encode(MARKET));
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(adapter), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), amountIn, quoted, s);
+
+        uint256 nativeBefore = USER.balance;
+        vm.prank(USER);
+        assertEq(agg.execute{value: amountIn}(p), quoted);
+        assertEq(nativeBefore - USER.balance, amountIn, "the native INJ was not what paid");
+        assertEq(winj.balanceOf(USER), 1_000_000 ether, "wINJ was spent although native covered it");
+        _assertRouterEmpty();
+    }
+
+    /// The other way: an adapter sell, then an unwrap, so the recipient gets native INJ.
+    function test_anAdapterSellThenUnwrapPaysNativeInj() public {
+        uint256 amountIn = 20_000 ether;
+        (uint256 quoted,) = adapter.quote(address(meme), address(winj), amountIn, abi.encode(MARKET));
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](2);
+        s[0] = _adapter(address(adapter), address(meme), address(winj), 10_000);
+        s[1] = _unwrap(10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(meme), NATIVE, amountIn, quoted, s);
+
+        uint256 recipientBefore = RECIPIENT.balance;
+        assertEq(_run(p), quoted);
+        assertEq(RECIPIENT.balance - recipientBefore, quoted, "recipient was not paid native INJ");
+        _assertRouterEmpty();
+    }
+
+    /// A venue that caps the fill - a bonding curve at its graduation target - hands the unused
+    /// input back. It is route money again, and with no later step on it, it is the caller's dust.
+    /// The quote said how much would be used, so a planner can size the step to it.
+    function test_aCappedAdapterFillRefundsTheUnusedInput() public {
+        uint256 amountIn = 800 ether; // capacity is 500
+        (uint256 quoted, uint256 used) = adapter.quote(address(winj), address(meme), amountIn, abi.encode(MARKET));
+        assertEq(used, 500 ether);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(adapter), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), amountIn, quoted, s);
+
+        assertEq(_run(p), quoted);
+        assertEq(winj.balanceOf(USER), 1_000_000 ether - used, "the unused 300 wINJ did not come back");
+        _assertRouterEmpty();
+    }
+
+    /// The same capped fill with a later step on the input token: the refund is spent there instead
+    /// of coming back, and the route ends empty.
+    function test_anAdapterRefundIsSpentByTheNextStep() public {
+        adapter.setMarket(MARKET, address(winj), address(usdc), 1e18, 300 ether);
+        usdc.mint(address(adapter), 1_000 ether);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](2);
+        s[0] = _adapter(address(adapter), address(winj), address(usdc), 10_000);
+        s[1] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 1000 ether, 0, s);
+
+        uint256 realised = _probe(p);
+        assertGt(realised, 300 ether, "the Pumex step did not spend the refund");
+        p.minimumReceive = realised;
+        assertEq(_run(p), realised);
+        assertEq(winj.balanceOf(USER), 1_000_000 ether - 1000 ether, "dust came back although a step spent it");
+        _assertRouterEmpty();
+    }
+
+    function testFuzz_anAdapterSplitLeavesNoRouteMoneyBehind(uint256 amountIn, uint16 adapterBps) public {
+        amountIn = bound(amountIn, 1 ether, 2_000 ether);
+        adapterBps = uint16(bound(adapterBps, 1, 9_999));
+        adapter.setMarket(MARKET, address(winj), address(usdc), 0.99e18, 700 ether);
+        usdc.mint(address(adapter), 1_000 ether);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](2);
+        s[0] = _adapter(address(adapter), address(winj), address(usdc), adapterBps);
+        s[1] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), amountIn, 0, s);
+
+        uint256 got = _run(p);
+        assertEq(usdc.balanceOf(RECIPIENT), got);
+        assertEq(winj.balanceOf(USER), 1_000_000 ether - amountIn, "the whole input should have been spent");
+        _assertRouterEmpty();
+    }
+
+    /// An adapter that keeps the input and pays nothing reverts the step on the spot.
+    function test_anAdapterThatKeepsTheInputReverts() public {
+        MockHostileAdapter h = _hostile();
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(h), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), 10 ether, 1, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.StepPaidNothing.selector, 0));
+    }
+
+    /// One that pays dust and CLAIMS a fortune is measured, not believed: the end-to-end minimum
+    /// catches it on what actually arrived.
+    function test_anAdapterIsMeasuredNotBelieved() public {
+        MockHostileAdapter h = _hostile();
+        h.setPay(1, 1_000_000 ether);
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(h), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), 10 ether, 5000 ether, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.InsufficientOutput.selector, 1, 5000 ether));
+    }
+
+    /// Re-entering `execute` from inside an adapter fails, and takes the whole route with it.
+    function test_anAdapterCannotReenter() public {
+        MockHostileAdapter h = _hostile();
+        h.setPay(1 ether, 1 ether);
+        ChoiceAggregator.Step[] memory inner = new ChoiceAggregator.Step[](1);
+        inner[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        h.arm(
+            address(agg),
+            abi.encodeCall(ChoiceAggregator.execute, (_params(address(winj), address(usdc), 1 ether, 0, inner))),
+            true
+        );
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(h), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), 10 ether, 1, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector));
+    }
+
+    /// Nor is an adapter a vault in the middle of a lock: the callback refuses it.
+    function test_anAdapterCannotDriveTheVaultCallback() public {
+        MockHostileAdapter h = _hostile();
+        h.setPay(1 ether, 1 ether);
+        h.arm(address(agg), abi.encodeCall(ChoiceAggregator.lockAcquired, (bytes(""))), true);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(h), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), 10 ether, 1, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.NotVault.selector));
+    }
+
+    /// An adapter holds no allowance from the router, so it cannot pull a donation, another step's
+    /// money, or anything beyond the one input it was sent - and the route around it still settles.
+    function test_anAdapterCannotPullFromTheRouter() public {
+        MockHostileAdapter h = _hostile();
+        h.setPay(10 ether, 10 ether);
+        h.setPull(true);
+        _donate();
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](2);
+        s[0] = _adapter(address(h), address(winj), address(meme), 5000);
+        s[1] = _adapter(address(adapter), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), 100 ether, 1, s);
+        _run(p);
+
+        assertFalse(h.pullSucceeded(), "an adapter pulled from the router");
+        assertEq(winj.balanceOf(address(h)), 1_000 ether + 50 ether, "the adapter got more than its step's input");
+        _assertDonationsIntact();
+    }
+
+    /// Native INJ pushed at the router by an adapter is refused, so a route cannot be made to hold
+    /// native it did not ask for.
+    function test_anAdapterCannotPushNativeIntoTheRouter() public {
+        MockHostileAdapter h = _hostile();
+        h.setPay(1 ether, 1 ether);
+        h.setNativeToCaller(1 ether);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(h), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), 10 ether, 1, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.NativeNotAccepted.selector, address(h)));
+    }
+
+    /// Donations of every form survive an adapter route, as they survive every other kind.
+    function test_anAdapterRouteLeavesDonationsAlone() public {
+        _donate();
+        // Into meme and back out through the adapter, then on to USDC through Pumex.
+        ChoiceAggregator.Step[] memory r = new ChoiceAggregator.Step[](3);
+        r[0] = _adapter(address(adapter), address(winj), address(meme), 10_000);
+        r[1] = _adapter(address(adapter), address(meme), address(winj), 10_000);
+        r[2] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 100 ether, 1, r);
+        _run(p);
+        _assertDonationsIntact();
+    }
+
+    function test_malformedAdapterStepsAreRefused() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        ChoiceAggregator.RouteParams memory p;
+
+        // Native INJ on either side: adapters are ERC20-only.
+        s[0] = _adapter(address(adapter), NATIVE, address(meme), 10_000);
+        p = _params(NATIVE, address(meme), 1 ether, 0, s);
+        _expectRevert(p, 1 ether, abi.encodeWithSelector(ChoiceAggregator.BadStep.selector, 0));
+
+        s[0] = _adapter(address(adapter), address(meme), NATIVE, 10_000);
+        p = _params(address(meme), NATIVE, 1 ether, 0, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadStep.selector, 0));
+
+        // An "adapter" with no code would just keep the input.
+        s[0] = _adapter(address(0xDEAD), address(winj), address(meme), 10_000);
+        p = _params(address(winj), address(meme), 1 ether, 0, s);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadStep.selector, 0));
+    }
+
+    // ── fees ──────────────────────────────────────────────────────────────
+
+    /// The fee comes off the realised output, the minimum is checked on what is left, and the two
+    /// add up to the route's output exactly.
+    function test_aFeeComesOffTheOutputAndTheMinimumIsNet() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 1000 ether, 0, s);
+        uint256 gross = _probe(p);
+
+        p.feeBps = 30;
+        p.feeRecipient = FEE_SINK;
+        uint256 fee = (gross * 30) / 10_000;
+        p.minimumReceive = gross - fee;
+
+        vm.expectEmit(true, true, false, true, address(agg));
+        emit ChoiceAggregator.FeePaid(FEE_SINK, address(usdc), fee);
+        assertEq(_run(p), gross - fee, "the return value is not net of the fee");
+        assertEq(usdc.balanceOf(RECIPIENT), gross - fee, "recipient was not paid the net");
+        assertEq(usdc.balanceOf(FEE_SINK), fee, "the fee was not paid");
+        _assertRouterEmpty();
+    }
+
+    /// A minimum only the GROSS output meets is not met.
+    function test_aMinimumOnTheGrossIsNotMet() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 1000 ether, 0, s);
+        uint256 gross = _probe(p);
+
+        p.feeBps = 100;
+        p.feeRecipient = FEE_SINK;
+        p.minimumReceive = gross;
+        uint256 net = gross - (gross * 100) / 10_000;
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.InsufficientOutput.selector, net, gross));
+    }
+
+    /// A native output pays its fee in native INJ.
+    function test_aFeeOnANativeOutputIsPaidInNativeInj() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](2);
+        s[0] = _solidly(address(usdt), address(winj), 10_000);
+        s[1] = _unwrap(10_000);
+        uint256 gross = pair.getAmountOut(500 ether, address(usdt));
+        ChoiceAggregator.RouteParams memory p = _params(address(usdt), NATIVE, 500 ether, 0, s);
+        p.feeBps = 25;
+        p.feeRecipient = FEE_SINK;
+        uint256 fee = (gross * 25) / 10_000;
+        p.minimumReceive = gross - fee;
+
+        uint256 recipientBefore = RECIPIENT.balance;
+        _run(p);
+        assertEq(RECIPIENT.balance - recipientBefore, gross - fee);
+        assertEq(FEE_SINK.balance, fee, "the native fee was not paid");
+        _assertRouterEmpty();
+    }
+
+    function testFuzz_aFeeAndTheNetAddUpToTheOutput(uint16 feeBps, uint256 amountIn) public {
+        feeBps = uint16(bound(feeBps, 1, 100));
+        amountIn = bound(amountIn, 1 ether, 400 ether);
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _adapter(address(adapter), address(winj), address(meme), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(meme), amountIn, 1, s);
+        (uint256 gross,) = adapter.quote(address(winj), address(meme), amountIn, abi.encode(MARKET));
+        p.feeBps = feeBps;
+        p.feeRecipient = FEE_SINK;
+
+        uint256 got = _run(p);
+        assertEq(got + meme.balanceOf(FEE_SINK), gross, "net + fee is not the realised output");
+        assertLe(meme.balanceOf(FEE_SINK), (gross * feeBps) / 10_000, "charged above the rate");
+        _assertRouterEmpty();
+    }
+
+    function test_malformedFeesAreRefused() public {
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, poolB, false, address(winj), address(usdc), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(winj), address(usdc), 1 ether, 0, s);
+
+        // Above the ceiling.
+        p.feeBps = 101;
+        p.feeRecipient = FEE_SINK;
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadFee.selector));
+
+        // A rate with nobody to pay, and somebody to pay with no rate.
+        p.feeBps = 30;
+        p.feeRecipient = address(0);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadFee.selector));
+        p.feeBps = 0;
+        p.feeRecipient = FEE_SINK;
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadFee.selector));
+
+        // A fee paid to the router itself or to wINJ would strand.
+        p.feeBps = 30;
+        p.feeRecipient = address(agg);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadRecipient.selector, address(agg)));
+        p.feeRecipient = address(winj);
+        _expectRevert(p, 0, abi.encodeWithSelector(ChoiceAggregator.BadRecipient.selector, address(winj)));
+    }
+
+    // ── executeWithPermit ─────────────────────────────────────────────────
+
+    /// A wallet that has approved Permit2 for the token but never granted this aggregator an
+    /// allowance trades in ONE transaction: the allowance arrives by signature inside it.
+    function test_aPermitInTheSameTransactionReplacesTheApproval() public {
+        (address signer, uint256 pk) = makeAddrAndKey("fresh wallet");
+        usdc.mint(signer, 1000 ether);
+        vm.prank(signer);
+        usdc.approve(address(permit2), type(uint256).max);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, poolB, false, address(usdc), address(winj), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(usdc), address(winj), 1000 ether, 1, s);
+
+        vm.prank(signer);
+        vm.expectRevert(); // no allowance: the plain entry point cannot pull
+        agg.execute(p);
+
+        IAllowanceTransfer.PermitSingle memory permit = _permitFor(address(usdc), 0);
+        bytes memory sig = _signPermit(permit, pk);
+        vm.prank(signer);
+        uint256 got = agg.executeWithPermit(p, permit, sig);
+
+        assertGt(got, 0);
+        assertEq(usdc.balanceOf(signer), 0, "the input was not pulled");
+        assertEq(winj.balanceOf(RECIPIENT), got);
+        _assertRouterEmpty();
+    }
+
+    /// The signed permit is public once broadcast. If someone submits it to Permit2 first, the
+    /// allowance exists anyway: this call's copy fails, and the route still runs.
+    function test_aFrontRunPermitDoesNotBlockTheRoute() public {
+        (address signer, uint256 pk) = makeAddrAndKey("front-run wallet");
+        usdc.mint(signer, 1000 ether);
+        vm.prank(signer);
+        usdc.approve(address(permit2), type(uint256).max);
+
+        IAllowanceTransfer.PermitSingle memory permit = _permitFor(address(usdc), 0);
+        bytes memory sig = _signPermit(permit, pk);
+        permit2.permit(signer, permit, sig); // anyone can
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, poolB, false, address(usdc), address(winj), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(usdc), address(winj), 1000 ether, 1, s);
+        vm.prank(signer);
+        assertGt(agg.executeWithPermit(p, permit, sig), 0);
+        _assertRouterEmpty();
+    }
+
+    /// A permit that fails for a real reason is not papered over: with no allowance, the pull
+    /// reverts on Permit2's own terms.
+    function test_aBadPermitFallsThroughToThePull() public {
+        (address signer,) = makeAddrAndKey("bad-sig wallet");
+        (, uint256 otherPk) = makeAddrAndKey("someone else");
+        usdc.mint(signer, 1000 ether);
+        vm.prank(signer);
+        usdc.approve(address(permit2), type(uint256).max);
+
+        IAllowanceTransfer.PermitSingle memory permit = _permitFor(address(usdc), 0);
+        bytes memory sig = _signPermit(permit, otherPk);
+
+        ChoiceAggregator.Step[] memory s = new ChoiceAggregator.Step[](1);
+        s[0] = _infinity(vaultB, poolB, false, address(usdc), address(winj), 10_000);
+        ChoiceAggregator.RouteParams memory p = _params(address(usdc), address(winj), 1000 ether, 1, s);
+        vm.prank(signer);
+        vm.expectRevert(abi.encodeWithSelector(IAllowanceTransfer.AllowanceExpired.selector, 0));
+        agg.executeWithPermit(p, permit, sig);
+    }
+
+    function _permitFor(address token, uint48 nonce) internal view returns (IAllowanceTransfer.PermitSingle memory) {
+        return IAllowanceTransfer.PermitSingle({
+            details: IAllowanceTransfer.PermitDetails({
+                token: token, amount: type(uint160).max, expiration: type(uint48).max, nonce: nonce
+            }),
+            spender: address(agg),
+            sigDeadline: block.timestamp + 1 hours
+        });
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────
 
     /// Native INJ -> `helixBps` on the Helix book, the rest wrapped and sold on Pumex's CL pool.
@@ -918,6 +1335,7 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
         assertEq(winj.balanceOf(address(agg)), 0, "wINJ left in the router");
         assertEq(usdc.balanceOf(address(agg)), 0, "USDC left in the router");
         assertEq(usdt.balanceOf(address(agg)), 0, "USDT left in the router");
+        assertEq(meme.balanceOf(address(agg)), 0, "meme left in the router");
     }
 
     function _body(bytes memory err) internal pure returns (bytes memory out) {
@@ -941,8 +1359,58 @@ contract ChoiceAggregatorTest is BinTestHelper, DeployPermit2 {
             minimumReceive: minimumReceive,
             recipient: RECIPIENT,
             deadline: block.timestamp + 1,
+            feeBps: 0,
+            feeRecipient: address(0),
             steps: steps
         });
+    }
+
+    function _adapter(address venue, address tokenIn, address tokenOut, uint16 shareBps)
+        internal
+        pure
+        returns (ChoiceAggregator.Step memory)
+    {
+        return ChoiceAggregator.Step({
+            kind: ChoiceAggregator.Kind.Adapter,
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            shareBps: shareBps,
+            data: abi.encode(venue, abi.encode(MARKET))
+        });
+    }
+
+    function _hostile() internal returns (MockHostileAdapter h) {
+        h = new MockHostileAdapter();
+        meme.mint(address(h), 1_000_000 ether);
+        winj.mint(address(h), 1_000 ether);
+        vm.deal(address(h), 10 ether);
+    }
+
+    /// The EIP-712 digest Permit2 checks for a `PermitSingle`, computed here rather than through
+    /// Permit2's own test helper, which imports an OpenZeppelin path this checkout does not have.
+    function _signPermit(IAllowanceTransfer.PermitSingle memory permit, uint256 pk)
+        internal
+        view
+        returns (bytes memory)
+    {
+        bytes32 detailsHash = keccak256(
+            abi.encode(
+                keccak256("PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)"), permit.details
+            )
+        );
+        bytes32 structHash = keccak256(
+            abi.encode(
+                keccak256(
+                    "PermitSingle(PermitDetails details,address spender,uint256 sigDeadline)PermitDetails(address token,uint160 amount,uint48 expiration,uint48 nonce)"
+                ),
+                detailsHash,
+                permit.spender,
+                permit.sigDeadline
+            )
+        );
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", permit2.DOMAIN_SEPARATOR(), structHash));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, digest);
+        return bytes.concat(r, s, bytes1(v));
     }
 
     function _helix(address tokenIn, address tokenOut, uint16 shareBps, string memory market)

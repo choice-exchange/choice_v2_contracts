@@ -13,6 +13,10 @@ import {ChoiceAggregator} from "../src/router/ChoiceAggregator.sol";
 import {DeploySinkAndCrankerViaTimelock} from "./13_DeploySinkAndCrankerViaTimelock.s.sol";
 
 /**
+ * ✅ HISTORICAL: this batch deployed 1.0.0 on mainnet 2026-10-07. The source it builds is now 1.1.0
+ * (script 17), so a re-run here reports the deployed aggregator as "NOT this build" - true, and
+ * expected. Read 1.0.0's source at the commit the book's `choice.aggregatorNote` names.
+ *
  * `ChoiceAggregator`, and a `CLQuoter` over Pumex's CL pool manager, deployed BY THE TIMELOCK in
  * ONE batch:
  *
