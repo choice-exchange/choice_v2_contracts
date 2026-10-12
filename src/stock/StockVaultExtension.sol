@@ -8,9 +8,10 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {Currency} from "infinity-core/src/types/Currency.sol";
 
 import {MarketCalendar} from "./MarketCalendar.sol";
+import {StockFixing} from "./StockFixing.sol";
 import {StockLib} from "./StockLib.sol";
 import {StockOps} from "./StockOps.sol";
-import {StockConfig, StockContext, StockLayout, StockState, StockStorage} from "./StockTypes.sol";
+import {FixingConfig, StockConfig, StockContext, StockLayout, StockState, StockStorage} from "./StockTypes.sol";
 
 /// @title StockVaultExtension
 /// @notice The cold half of every `StockVault`: settings, keeper actions, the hedge triggers and the
@@ -37,6 +38,7 @@ contract StockVaultExtension is ReentrancyGuardTransient {
     event Paused(uint8 flags, address indexed by);
     event Unpaused(uint8 flags);
     event ConfigUpdated();
+    event FixingConfigUpdated();
     event RolesUpdated(address keeper, address guardian, address issuer);
     event CalendarUpdated(address calendar);
     event DepositorUpdated(address indexed depositor, bool allowed);
@@ -170,7 +172,8 @@ contract StockVaultExtension is ReentrancyGuardTransient {
         StockLib.lock(ctx, StockLib.OP_FROM_CLAIMS, isCash ? ctx.cash : ctx.stock, amount);
     }
 
-    /// @notice Pause `flags` (fills 1, deposits 2, withdrawals 4, restock 8). Guardian, keeper or owner.
+    /// @notice Pause `flags` (fills 1, deposits 2, withdrawals 4, restock 8, fixing 16). Guardian,
+    /// keeper or owner. A fixing batch that cannot settle while paused lapses and is refunded.
     function pause(uint8 flags) external delegated {
         StockLayout storage l = StockStorage.layout();
         if (msg.sender != l.guardian && msg.sender != l.keeper && msg.sender != IOwnerOf(address(this)).owner()) {
@@ -188,6 +191,14 @@ contract StockVaultExtension is ReentrancyGuardTransient {
         StockLib.checkConfig(config_);
         StockStorage.layout().config = config_;
         emit ConfigUpdated();
+    }
+
+    /// @notice Open (a nonzero `interval`), tune or close the fixing lane. A batch already opened
+    /// keeps its tick and deadline.
+    function setFixingConfig(FixingConfig calldata fixing_) external onlyOwner {
+        StockFixing.checkConfig(fixing_);
+        StockStorage.layout().fixing = fixing_;
+        emit FixingConfigUpdated();
     }
 
     function setRoles(address keeper_, address guardian_, address issuer_) external onlyOwner {

@@ -2,7 +2,7 @@
 pragma solidity ^0.8.26;
 
 import {MarketCalendar} from "../stock/MarketCalendar.sol";
-import {StockConfig, StockContext, StockState} from "../stock/StockTypes.sol";
+import {FixingConfig, StockConfig, StockContext, StockState} from "../stock/StockTypes.sol";
 
 /// @notice The functions a `StockVault` answers through its fallback (`StockVaultExtension`). Call
 /// them on the vault's address; the vault's own ABI plus this one is the whole surface.
@@ -33,6 +33,7 @@ interface IStockVaultExtension {
 
     // owner
     function setConfig(StockConfig calldata config_) external;
+    function setFixingConfig(FixingConfig calldata fixing_) external;
     function setRoles(address keeper_, address guardian_, address issuer_) external;
     function setCalendar(MarketCalendar calendar_) external;
     function setAllowlist(bool on) external;

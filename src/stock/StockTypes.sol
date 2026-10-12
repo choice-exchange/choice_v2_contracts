@@ -67,6 +67,9 @@ struct StockConfig {
 /// sending it, and fills stop.
 /// @param shortConfirmed the short read back from the position, 1e18 units (positive = short)
 /// @param pendingQty the last hedge order's signed size (positive adds to the short), until confirmed
+/// @param cashOwed and `stockOwed`: what the vault holds for fixing-lane requesters (inputs in
+/// escrow, outputs and refunds not yet claimed). Never the vault's: kept out of its value, its free
+/// cash and its stock.
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -94,6 +97,70 @@ struct StockState {
     uint64 restockWindowStart;
     uint96 restockUsed;
     uint256 lastSharePrice;
+    uint128 cashOwed;
+    uint128 stockOwed;
+}
+
+/// @notice The fixing lane's tunables, set by the owner inside the limits in `StockFixing`. A batch
+/// keeps the tick and deadline it was opened with, so a change here never moves a committed one.
+/// @param interval seconds between boundaries, aligned to the Unix epoch; zero closes the lane to
+/// new requests
+/// @param delayMs the fixing tick is this long after the boundary, on the 200 ms grid
+/// @param settleWindow seconds after the tick a settlement is accepted; after it the batch lapses
+/// @param spreadBps the base spread; the confidence, market-spread and size terms, the keeper widen
+/// and the re-anchor widen add to it, with no age term
+/// @param sizeBps the size term at a net of `maxNet`
+/// @param maxSpreadBps a fixing that would need more is refused (and its batch lapses)
+/// @param minRequest smallest request, cash value
+/// @param maxSide most one side of a batch may carry, cash value
+/// @param maxNet most of a batch's net the vault takes on, cash value; beyond it the larger side
+/// fills pro rata. It is also the most exposure one fixing can leave unhedged until the hedge
+/// follows, so size it to what the perp book takes in one order.
+struct FixingConfig {
+    uint32 interval;
+    uint32 delayMs;
+    uint32 settleWindow;
+    uint16 spreadBps;
+    uint16 sizeBps;
+    uint16 maxSpreadBps;
+    uint96 minRequest;
+    uint96 maxSide;
+    uint96 maxNet;
+}
+
+/// @notice One side of a batch. Committed amounts until settlement; after it, what is left to claim:
+/// each claim takes its share of what remains, so the last one takes the rounding dust and the side
+/// ends at zero.
+/// @param amountIn input committed (left to claim, after settlement)
+/// @param filled the part of `amountIn` that filled; the rest is refunded
+/// @param out the output owed for `filled`
+struct FixingSide {
+    uint128 amountIn;
+    uint128 filled;
+    uint128 out;
+}
+
+/// @notice Every request committed for one boundary: one total per side, settled at one price.
+/// @param buy cash in, stock out
+/// @param sell stock in, cash out
+/// @param tickMs the fixing tick, Unix milliseconds: the one update a settlement may use
+/// @param deadline the last second a settlement is accepted
+/// @param price the fixing, 1e18 cash per whole stock unit; zero until settled
+struct FixingBatch {
+    FixingSide buy;
+    FixingSide sell;
+    uint64 tickMs;
+    uint64 deadline;
+    uint128 price;
+    uint16 spreadBps;
+    bool settled;
+}
+
+struct FixingRequest {
+    address recipient;
+    uint64 boundary;
+    bool cashIn;
+    uint128 amountIn;
 }
 
 /// @notice What `StockLib` needs of the vault it runs inside.
@@ -179,6 +246,10 @@ struct StockLayout {
     mapping(address depositor => bool allowed) isDepositor;
     StockConfig config;
     StockState state;
+    FixingConfig fixing;
+    uint256 nextRequestId;
+    mapping(uint64 boundary => FixingBatch) batches;
+    mapping(uint256 id => FixingRequest) requests;
 }
 
 library StockStorage {

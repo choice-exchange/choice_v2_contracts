@@ -30,10 +30,14 @@ import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManage
 
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
+import {StockFixing} from "./StockFixing.sol";
 import {StockLib} from "./StockLib.sol";
 import {StockOps} from "./StockOps.sol";
 import {
     Fill,
+    FixingBatch,
+    FixingConfig,
+    FixingRequest,
     Refusal,
     StockConfig,
     StockContext,
@@ -48,18 +52,24 @@ import {
 /// plus a spread, through the one Choice pool it is the hook of, and holds a perp short against its
 /// stock so a depositor's return is the spread and the funding, not the stock's moves.
 ///
-/// **One address, four code bodies.** This contract is the hook, the share token and the fill path.
-/// Pricing, guards, hedging and valuation are in `StockLib`; bookkeeping (what a fill changes, the
-/// restock order, the checks before shares are priced) in `StockOps`; settings, keeper actions,
-/// the hedge triggers and the views in `StockVaultExtension`, which every selector this contract
-/// does not know reaches through `fallback`. All three run by DELEGATECALL, as this contract, on
-/// its storage, which sits at one fixed slot (`StockStorage`). There is no trust boundary inside a
-/// vault, and none of the three can be swapped out: their addresses are fixed at deployment.
+/// **One address, five code bodies.** This contract is the hook, the share token and the entry to
+/// both fill lanes. Pricing, guards, hedging and valuation are in `StockLib`; bookkeeping (what a
+/// fill changes, the restock order, the checks before shares are priced) in `StockOps`; the fixing
+/// lane in `StockFixing`; settings, keeper actions, the hedge triggers and the views in
+/// `StockVaultExtension`, which every selector this contract does not know reaches through
+/// `fallback`. All four run by DELEGATECALL, as this contract, on its storage, which sits at one
+/// fixed slot (`StockStorage`). There is no trust boundary inside a vault, and none of the four can
+/// be swapped out: their addresses are fixed at deployment.
 ///
 /// **What a depositor owns.** Shares of the cash, the booked stock at the stored price, the short at
-/// margin plus PnL, and the cash of an open restock order (`totalAssets`). Deposits and withdrawals
+/// margin plus PnL, and the cash of an open restock order (`totalAssets`); never what the vault
+/// holds for fixing-lane requesters. Deposits and withdrawals
 /// are in cash, priced only while the market is open and the price fresh, after settling the
 /// short's funding into its margin. Withdrawals are paid from cash on hand above the reserve.
+///
+/// **Two lanes.** The instant lane is any swap through the pool. The fixing lane (`commitFixing`,
+/// `settleFixing`, `claimFixing`) fills larger committed requests at the one signed update stamped
+/// at a fixed tick after each boundary; see `StockFixing`.
 ///
 /// **How it fills.** `beforeSwap` takes the newer of the stored price and a signed update handed in
 /// as `hookData`, prices the whole swap off it, and returns a delta that leaves the pool's curve
@@ -310,6 +320,43 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return (ICLHooks.beforeSwap.selector, toBeforeSwapDelta(specified, unspecified), 0);
     }
 
+    // -------------------------------------------------------------------------------------
+    // Fixing lane (see `StockFixing`)
+    // -------------------------------------------------------------------------------------
+
+    /// @notice Commit `amountIn` (cash when `cashIn`, else stock) to the next boundary's fixing;
+    /// `boundary` must be that next one. The input is taken now and held until `claimFixing`.
+    /// @return id the request
+    function commitFixing(uint64 boundary, bool cashIn, uint256 amountIn, address recipient)
+        external
+        nonReentrant
+        returns (uint256 id)
+    {
+        return StockFixing.commit(StockStorage.layout(), boundary, cashIn, amountIn, recipient);
+    }
+
+    /// @notice Fill the batch for `boundary` at the signed update stamped exactly at its tick.
+    function settleFixing(uint64 boundary, bytes calldata update) external nonReentrant {
+        StockFixing.settle(StockStorage.layout(), boundary, update);
+    }
+
+    /// @notice Pay request `id` to its recipient, once its batch has settled or lapsed.
+    function claimFixing(uint256 id) external nonReentrant returns (uint256 out, uint256 refund) {
+        return StockFixing.claim(StockStorage.layout(), id);
+    }
+
+    function fixingConfig() external view returns (FixingConfig memory) {
+        return StockStorage.layout().fixing;
+    }
+
+    function fixingBatch(uint64 boundary) external view returns (FixingBatch memory) {
+        return StockStorage.layout().batches[boundary];
+    }
+
+    function fixingRequest(uint256 id) external view returns (FixingRequest memory) {
+        return StockStorage.layout().requests[id];
+    }
+
     /// @inheritdoc ILockCallback
     function lockAcquired(bytes calldata data) external override returns (bytes memory) {
         if (msg.sender != address(VAULT) || !StockLib.lockOpen()) revert UnexpectedLock();
@@ -405,8 +452,9 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     }
 
     function _freeCash() internal view returns (uint256) {
-        uint256 cash = IERC20(Currency.unwrap(CASH)).balanceOf(address(this)) + VAULT.balanceOf(address(this), CASH);
-        uint256 reserve = StockStorage.layout().config.cashReserve;
+        StockLayout storage l = StockStorage.layout();
+        uint256 cash = StockLib.ownCash(l.state, _ctx());
+        uint256 reserve = l.config.cashReserve;
         return cash > reserve ? cash - reserve : 0;
     }
 

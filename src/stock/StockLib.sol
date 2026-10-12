@@ -32,6 +32,7 @@ library StockLib {
     uint8 internal constant PAUSE_DEPOSITS = 2;
     uint8 internal constant PAUSE_WITHDRAWALS = 4;
     uint8 internal constant PAUSE_RESTOCK = 8;
+    uint8 internal constant PAUSE_FIXING = 16;
 
     // Hard limits on the owner's tunables, so a captured owner still cannot price a fill at any
     // number it likes, run the hedge at any leverage, or let a price of any age through.
@@ -60,6 +61,7 @@ library StockLib {
     error HedgePending();
     error HedgeTooSoon(uint256 allowedAt);
     error MarginHealthy();
+    error CashShort(uint256 needed, uint256 own);
 
     event HedgeOrdered(bool sell, uint256 quantity, uint256 worstPrice, uint256 margin, string orderHash);
     event HedgeConfirmed(int256 shortQty);
@@ -91,7 +93,7 @@ library StockLib {
         if (s.anchorPrice != 0 && deviationBps(r.price, s.anchorPrice) > c.maxJumpBps) {
             return _refuse(f, Refusal.Jump);
         }
-        if (holding(ctx, ctx.stock) < s.stockBooked) return _refuse(f, Refusal.Deficit);
+        if (ownStock(s, ctx) < s.stockBooked) return _refuse(f, Refusal.Deficit);
 
         uint256 scale = 10 ** (uint256(ctx.stockDecimals) + 18 - ctx.cashDecimals);
         (uint256 maxTrade, uint256 windowCap) =
@@ -243,7 +245,7 @@ library StockLib {
             }
             // The cash left must cover the reserve plus the margin to hedge what comes in.
             uint256 margin = stockToCash(ctx, f.amountIn, f.price, Math.Rounding.Ceil) * 10 / c.leverageX10;
-            if (holding(ctx, ctx.cash) < f.amountOut + c.cashReserve + margin) return Refusal.Reserve;
+            if (ownCash(s, ctx) < f.amountOut + c.cashReserve + margin) return Refusal.Reserve;
         }
         if (_widensExposure(c, s, ctx, bookedAfter, f.price)) return Refusal.Unhedged;
         if (!withinLimit(w.zeroForOne, f.amountIn, f.amountOut, w.sqrtPriceLimitX96)) return Refusal.PriceLimit;
@@ -378,7 +380,7 @@ library StockLib {
                 * c.priceTick;
         uint256 margin = sell ? Math.mulDiv(qty, worst, 1e18) * 10 / c.leverageX10 : 0;
         // The margin hold also covers the taker fee; 1% over is far above any fee tier.
-        if (margin != 0) ensureToken(ctx, ctx.cash, fromApi(ctx, margin, Math.Rounding.Ceil) * 101 / 100 + 1);
+        if (margin != 0) spendOwnCash(s, ctx, fromApi(ctx, margin, Math.Rounding.Ceil) * 101 / 100 + 1);
 
         string memory sub = subaccount();
         string memory orderHash =
@@ -437,7 +439,7 @@ library StockLib {
         uint256 target = Math.mulDiv(p.quantity, markPrice(ctx), 1e18) * 10 / c.leverageX10;
         if (p.margin * 10 >= target * 7) revert MarginHealthy();
         uint256 amount = target - p.margin;
-        ensureToken(ctx, ctx.cash, fromApi(ctx, amount, Math.Rounding.Ceil) + 1);
+        spendOwnCash(s, ctx, fromApi(ctx, amount, Math.Rounding.Ceil) + 1);
         string memory sub = subaccount();
         EXCHANGE.increasePositionMargin(address(this), sub, sub, s.marketId, amount);
         emit MarginAdded(amount);
@@ -448,12 +450,13 @@ library StockLib {
     // -------------------------------------------------------------------------------------
 
     /// @notice Cash, plus the booked stock (never more than is held) at the stored price, plus the
-    /// short at margin plus PnL, plus the cash of an open restock order. ⚠️ Funding reaches the
-    /// margin only when it settles; deposits and withdrawals settle it first.
+    /// short at margin plus PnL, plus the cash of an open restock order. What the vault holds for
+    /// fixing-lane requesters is not its own and is left out. ⚠️ Funding reaches the margin only
+    /// when it settles; deposits and withdrawals settle it first.
     function value(StockState storage s, StockContext memory ctx) external view returns (uint256 total) {
         uint256 price = markPrice(ctx);
-        total = holding(ctx, ctx.cash) + (s.orderOpen ? s.orderCash : 0);
-        total += stockToCash(ctx, Math.min(s.stockBooked, holding(ctx, ctx.stock)), price, Math.Rounding.Floor);
+        total = ownCash(s, ctx) + (s.orderOpen ? s.orderCash : 0);
+        total += stockToCash(ctx, Math.min(s.stockBooked, ownStock(s, ctx)), price, Math.Rounding.Floor);
         (bool found, IExchangeDerivatives.DerivativePosition memory p) = position(s);
         if (found) total += positionValue(ctx, p, price);
     }
@@ -519,6 +522,26 @@ library StockLib {
     /// @notice What the vault holds of `currency`: the token itself plus its Choice vault claims.
     function holding(StockContext memory ctx, Currency currency) internal view returns (uint256) {
         return IERC20(Currency.unwrap(currency)).balanceOf(address(this)) + ctx.vault.balanceOf(address(this), currency);
+    }
+
+    /// @notice The cash held less what is held for fixing-lane requesters.
+    function ownCash(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        uint256 h = holding(ctx, ctx.cash);
+        return h > s.cashOwed ? h - s.cashOwed : 0;
+    }
+
+    /// @notice The stock held less what is held for fixing-lane requesters.
+    function ownStock(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        uint256 h = holding(ctx, ctx.stock);
+        return h > s.stockOwed ? h - s.stockOwed : 0;
+    }
+
+    /// @dev Make `amount` of cash available as the token for the vault to spend, refusing to dip
+    /// into what it holds for fixing-lane requesters.
+    function spendOwnCash(StockState storage s, StockContext memory ctx, uint256 amount) internal {
+        uint256 own = ownCash(s, ctx);
+        if (own < amount) revert CashShort(amount, own);
+        ensureToken(ctx, ctx.cash, amount);
     }
 
     function position(StockState storage s)

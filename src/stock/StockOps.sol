@@ -107,7 +107,7 @@ library StockOps {
         if (cash > remaining) revert RestockCapExceeded(cash, remaining);
         s.restockUsed += cash.toUint96();
 
-        StockLib.ensureToken(ctx, ctx.cash, cash);
+        StockLib.spendOwnCash(s, ctx, cash);
         s.orderOpen = true;
         s.orderCash = cash.toUint96();
         s.orderMinOut = minStockOut.toUint128();
@@ -180,8 +180,9 @@ library StockOps {
         StockLib.requireUsable(StockLib.storedReference(c, ctx));
     }
 
+    /// @dev Stock held beyond the booked stock and what is held for fixing-lane requesters.
     function unbooked(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
-        uint256 held = StockLib.holding(ctx, ctx.stock);
+        uint256 held = StockLib.ownStock(s, ctx);
         return held > s.stockBooked ? held - s.stockBooked : 0;
     }
 }
