@@ -1,0 +1,80 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+pragma solidity ^0.8.26;
+
+/// @notice The `0x65` exchange-precompile methods a contract needs to hold a perpetual position
+/// for itself.
+/// @dev Signatures taken from injective-core's abigen bindings
+/// (`injective-chain/modules/evm/precompiles/bindings/cosmos/precompile/exchange`):
+/// `createDerivativeMarketOrder` `0xb84857a1`, `subaccountPositions` `0x9bb15b3c`,
+/// `increasePositionMargin` `0x8ff96af4`. Kept apart from `IExchangeModule`, which the burn leg
+/// uses and which stays exactly the two methods it needs.
+///
+/// **What a caller must know:**
+/// - `sender` is the caller's own address. Trading for oneself needs no authz grant; trading for
+///   another account needs one.
+/// - Order `price`, `quantity` and `margin`, and every field `subaccountPositions` returns, are in
+///   the 18-decimal API format: the human value times 1e18 (a price of 312.5 USDC is
+///   `312.5e18`). Margin amounts on `increasePositionMargin` are the same format.
+/// - A market order is NOT executed in the transaction that places it. It is queued and matched
+///   in the block's EndBlocker; the response carries only `orderHash` and `cid`, every quantity
+///   in it is zero. Read the resulting position in a later block.
+/// - `price` on a market order is the WORST price accepted. An order that cannot fill within it
+///   is dropped at the end of the block, and its margin hold is released.
+/// - `margin` zero makes an order reduce-only.
+/// - The default subaccount (nonce 0) trades straight off the account's bank balance: no deposit,
+///   and every credit to it is swept back to bank.
+/// - Only `buy`, `sell`, `buyPostOnly` and `sellPostOnly` order types exist here; atomic orders
+///   cannot be sent through this precompile.
+interface IExchangeDerivatives {
+    struct DerivativeOrder {
+        string marketID;
+        string subaccountID;
+        string feeRecipient;
+        uint256 price;
+        uint256 quantity;
+        string cid;
+        string orderType;
+        uint256 margin;
+        uint256 triggerPrice;
+    }
+
+    struct CreateDerivativeMarketOrderResponse {
+        string orderHash;
+        string cid;
+        uint256 quantity;
+        uint256 price;
+        uint256 fee;
+        uint256 payout;
+        uint256 deltaExecutionQuantity;
+        uint256 deltaExecutionMargin;
+        uint256 deltaExecutionPrice;
+        bool deltaIsLong;
+    }
+
+    struct DerivativePosition {
+        string subaccountID;
+        string marketID;
+        bool isLong;
+        uint256 quantity;
+        uint256 entryPrice;
+        uint256 margin;
+        uint256 cumulativeFundingEntry;
+    }
+
+    function createDerivativeMarketOrder(address sender, DerivativeOrder calldata order)
+        external
+        returns (CreateDerivativeMarketOrderResponse memory response);
+
+    function increasePositionMargin(
+        address sender,
+        string calldata sourceSubaccountID,
+        string calldata destinationSubaccountID,
+        string calldata marketID,
+        uint256 amount
+    ) external returns (bool success);
+
+    function subaccountPositions(string calldata subaccountID)
+        external
+        view
+        returns (DerivativePosition[] memory positions);
+}
