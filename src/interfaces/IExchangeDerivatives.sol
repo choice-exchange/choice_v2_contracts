@@ -73,6 +73,18 @@ interface IExchangeDerivatives {
         uint256 amount
     ) external returns (bool success);
 
+    /// @dev `decreasePositionMargin` `0xaf78360b` moves margin back to a subaccount. 🔑 It APPLIES the
+    /// position's accrued funding first, in the same transaction, which `increasePositionMargin`
+    /// does not; a one-unit decrease is how a contract settles funding without trading. It needs
+    /// the market's oracle under 60 s old and margin left at or above the maintenance ratio.
+    function decreasePositionMargin(
+        address sender,
+        string calldata sourceSubaccountID,
+        string calldata destinationSubaccountID,
+        string calldata marketID,
+        uint256 amount
+    ) external returns (bool success);
+
     function subaccountPositions(string calldata subaccountID)
         external
         view
