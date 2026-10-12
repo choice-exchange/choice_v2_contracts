@@ -15,10 +15,13 @@ import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 import {IWETH9} from "infinity-periphery/src/interfaces/external/IWETH9.sol";
 import {IStockVaultExtension} from "../src/interfaces/IStockVaultExtension.sol";
 import {ChoiceAggregator} from "../src/router/ChoiceAggregator.sol";
-import {StockLib} from "../src/stock/StockLib.sol";
 import {StockOps} from "../src/stock/StockOps.sol";
+import {StockModule} from "../src/stock/StockModule.sol";
+import {StockPublic} from "../src/stock/StockPublic.sol";
+import {StockAdmin} from "../src/stock/StockAdmin.sol";
+import {StockHedge} from "../src/stock/StockHedge.sol";
+import {StockLib} from "../src/stock/StockLib.sol";
 import {StockVault} from "../src/stock/StockVault.sol";
-import {StockVaultExtension} from "../src/stock/StockVaultExtension.sol";
 import {Fill, Refusal, StockConfig, StockState} from "../src/stock/StockTypes.sol";
 import {LazerBuilder} from "./utils/LazerBuilder.sol";
 import {MockStockExchange} from "./mocks/StockMocks.sol";
@@ -161,7 +164,7 @@ contract StockVaultTest is StockVaultHarness {
     }
 
     function test_onlyTheKeeperWidens() public {
-        vm.expectRevert(StockVaultExtension.NotKeeper.selector);
+        vm.expectRevert(StockModule.NotKeeper.selector);
         x.widen(20, 600);
     }
 
@@ -420,7 +423,7 @@ contract StockVaultTest is StockVaultHarness {
         _swap(true, true, 300e6);
 
         vm.prank(KEEPER);
-        vm.expectRevert(StockVaultExtension.NotOwner.selector);
+        vm.expectRevert(StockModule.NotOwner.selector);
         x.unpause(StockLib.PAUSE_FILLS);
 
         vm.prank(OWNER);
@@ -428,7 +431,7 @@ contract StockVaultTest is StockVaultHarness {
         _swap(true, true, 300e6);
 
         vm.prank(TRADER);
-        vm.expectRevert(StockVaultExtension.NotPauser.selector);
+        vm.expectRevert(StockModule.NotPauser.selector);
         x.pause(1);
     }
 
@@ -459,17 +462,21 @@ contract StockVaultTest is StockVaultHarness {
         );
     }
 
-    function test_theExtensionRefusesDirectCalls() public {
-        StockVaultExtension ext = StockVaultExtension(sv.EXTENSION());
-        vm.expectRevert(StockVaultExtension.NotDelegated.selector);
-        ext.config();
-        vm.expectRevert(StockVaultExtension.NotDelegated.selector);
-        ext.setConfig(_cfg());
+    function test_theModulesRefuseDirectCalls() public {
+        StockPublic pub = StockPublic(sv.MODULES());
+        StockAdmin admin = StockAdmin(pub.NEXT());
+        vm.expectRevert(StockModule.NotDelegated.selector);
+        pub.config();
+        // An admin selector sent to the first module is refused there, before its fallback.
+        vm.expectRevert(StockModule.NotDelegated.selector);
+        IStockVaultExtension(address(pub)).setConfig(_cfg());
+        vm.expectRevert(StockModule.NotDelegated.selector);
+        admin.setConfig(_cfg());
     }
 
     function test_onlyTheOwnerSetsConfigAndHardLimitsHold() public {
         vm.prank(KEEPER);
-        vm.expectRevert(StockVaultExtension.NotOwner.selector);
+        vm.expectRevert(StockModule.NotOwner.selector);
         x.setConfig(_cfg());
 
         StockConfig memory c = _cfg();
@@ -493,9 +500,9 @@ contract StockVaultTest is StockVaultHarness {
 
     function test_theOwnerCannotSweepWhatDepositorsOwn() public {
         vm.startPrank(OWNER);
-        vm.expectRevert(abi.encodeWithSelector(StockVaultExtension.ProtectedToken.selector, address(cash)));
+        vm.expectRevert(abi.encodeWithSelector(StockAdmin.ProtectedToken.selector, address(cash)));
         x.sweep(address(cash), OWNER, 1);
-        vm.expectRevert(abi.encodeWithSelector(StockVaultExtension.ProtectedToken.selector, address(stock)));
+        vm.expectRevert(abi.encodeWithSelector(StockAdmin.ProtectedToken.selector, address(stock)));
         x.sweep(address(stock), OWNER, 1);
         MockERC20 stray = new MockERC20("X", "X", 18);
         stray.mint(address(sv), 5);
@@ -568,7 +575,7 @@ contract StockVaultTest is StockVaultHarness {
         vm.prank(KEEPER);
         x.syncHedge();
         vm.prank(KEEPER);
-        vm.expectRevert(StockLib.HedgePending.selector);
+        vm.expectRevert(StockHedge.HedgePending.selector);
         x.syncHedge();
     }
 
@@ -578,7 +585,7 @@ contract StockVaultTest is StockVaultHarness {
         _swap(true, false, 5 ether);
         vm.prank(GUARDIAN);
         x.pause(StockLib.PAUSE_RESTOCK);
-        vm.expectPartialRevert(StockLib.HedgeTooSoon.selector);
+        vm.expectPartialRevert(StockHedge.HedgeTooSoon.selector);
         x.syncHedge();
         vm.warp(block.timestamp + 300);
         _price(MANTISSA);
@@ -614,7 +621,7 @@ contract StockVaultTest is StockVaultHarness {
 
     function test_topUpMargin() public {
         _hedge(PRICE);
-        vm.expectRevert(StockLib.MarginHealthy.selector);
+        vm.expectRevert(StockHedge.MarginHealthy.selector);
         x.topUpMargin();
         exchange.setMargin(_sub(), MARKET, 1_000e18); // a third of the 3,000 it should be
         x.topUpMargin();
@@ -801,7 +808,7 @@ contract StockVaultTest is StockVaultHarness {
     }
 
     function test_onlyTheKeeperRestocks() public {
-        vm.expectRevert(StockVaultExtension.NotKeeper.selector);
+        vm.expectRevert(StockModule.NotKeeper.selector);
         x.restock(1_000e6, 3.3 ether, "");
     }
 

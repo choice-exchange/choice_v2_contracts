@@ -23,8 +23,9 @@ import {IStockVaultExtension} from "../../src/interfaces/IStockVaultExtension.so
 import {SubaccountLib} from "../../src/libraries/SubaccountLib.sol";
 import {MarketCalendar} from "../../src/stock/MarketCalendar.sol";
 import {PriceStore} from "../../src/stock/PriceStore.sol";
+import {StockPublic} from "../../src/stock/StockPublic.sol";
+import {StockAdmin} from "../../src/stock/StockAdmin.sol";
 import {StockVault} from "../../src/stock/StockVault.sol";
-import {StockVaultExtension} from "../../src/stock/StockVaultExtension.sol";
 import {Refusal, StockConfig} from "../../src/stock/StockTypes.sol";
 import {LazerBuilder} from "./LazerBuilder.sol";
 import {MockStockExchange} from "../mocks/StockMocks.sol";
@@ -92,7 +93,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
                 poolManager: ICLPoolManager(address(manager)),
                 store: store,
                 calendar: calendar,
-                extension: address(new StockVaultExtension()),
+                modules: address(new StockPublic(address(new StockAdmin()))),
                 feedId: FEED,
                 marketId: MARKET,
                 owner: OWNER,

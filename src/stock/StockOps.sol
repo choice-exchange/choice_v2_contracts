@@ -176,6 +176,42 @@ library StockOps {
         s.lastSharePrice = price;
     }
 
+    // -------------------------------------------------------------------------------------
+    // Config
+    // -------------------------------------------------------------------------------------
+
+    /// @notice Revert unless every tunable is inside the hard limits in `StockLib`.
+    function checkConfig(StockConfig memory c) external pure {
+        if (c.maxSpread > StockLib.MAX_SPREAD_LIMIT || c.minSpread == 0 || c.minSpread > c.maxSpread) {
+            revert StockLib.BadConfig();
+        }
+        if (
+            c.spreadRegular > c.maxSpread || c.spreadExtended > c.maxSpread || c.spreadOvernight > c.maxSpread
+                || c.spreadClosed > c.maxSpread
+        ) revert StockLib.BadConfig();
+        // The lean must stay inside the spread, so neither side ever crosses the reference.
+        if (c.skewBps >= c.minSpread) revert StockLib.BadConfig();
+        if (c.maxJumpBps == 0 || c.maxJumpBps > StockLib.MAX_JUMP_LIMIT) revert StockLib.BadConfig();
+        if (c.hedgeSlippageBps > StockLib.MAX_HEDGE_SLIPPAGE || c.restockSlippageBps > StockLib.MAX_RESTOCK_SLIPPAGE) {
+            revert StockLib.BadConfig();
+        }
+        if (c.navJumpBps == 0 || c.navJumpBps > StockLib.MAX_NAV_JUMP) revert StockLib.BadConfig();
+        if (c.leverageX10 < StockLib.MIN_LEVERAGE_X10 || c.leverageX10 > StockLib.MAX_LEVERAGE_X10) {
+            revert StockLib.BadConfig();
+        }
+        if (
+            c.maxAgeMs == 0 || c.maxAgeMs > StockLib.MAX_AGE_MS_LIMIT || c.closeTolerance > StockLib.MAX_CLOSE_TOLERANCE
+        ) {
+            revert StockLib.BadConfig();
+        }
+        if (c.window < StockLib.MIN_WINDOW || c.reanchorDelay < StockLib.MIN_REANCHOR_DELAY) {
+            revert StockLib.BadConfig();
+        }
+        if (c.restockDeadline == 0 || c.restockDeadline > StockLib.MAX_RESTOCK_DEADLINE) revert StockLib.BadConfig();
+        if (c.makerTimeout > StockLib.MAX_MAKER_TIMEOUT) revert StockLib.BadConfig();
+        if (c.targetInventory > c.maxInventory || c.qtyTick == 0 || c.priceTick == 0) revert StockLib.BadConfig();
+    }
+
     function requireNavPrice(StockConfig storage c, StockContext memory ctx) internal view {
         StockLib.requireUsable(StockLib.storedReference(c, ctx));
     }

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.26;
 
-import {ReentrancyGuardTransient} from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
@@ -9,28 +8,18 @@ import {Currency} from "infinity-core/src/types/Currency.sol";
 
 import {MarketCalendar} from "./MarketCalendar.sol";
 import {StockFixing} from "./StockFixing.sol";
+import {StockHedge} from "./StockHedge.sol";
 import {StockLib} from "./StockLib.sol";
+import {StockModule} from "./StockModule.sol";
 import {StockOps} from "./StockOps.sol";
 import {FixingConfig, StockConfig, StockContext, StockLayout, StockState, StockStorage} from "./StockTypes.sol";
 
-/// @title StockVaultExtension
-/// @notice The cold half of every `StockVault`: settings, keeper actions, the hedge triggers and the
-/// views. A vault reaches it through its fallback by DELEGATECALL, so every function here runs as
-/// that vault, on its storage (`StockStorage`). One deployment serves every vault; called directly
-/// it refuses everything, so its own (empty) storage can never matter.
-///
-/// The owner is the vault's own `owner()`, read back from the vault: there is one owner record, in
-/// the vault's `Ownable2Step`.
-contract StockVaultExtension is ReentrancyGuardTransient {
+/// @title StockAdmin
+/// @notice The last module in a `StockVault`'s chain: what the owner, the keeper and the guardian do.
+/// Reached through `StockPublic`'s fallback, as the vault. One deployment serves every vault.
+contract StockAdmin is StockModule {
     using SafeERC20 for IERC20;
 
-    address private immutable SELF;
-
-    error NotDelegated();
-    error NotOwner();
-    error NotKeeper();
-    error NotPauser();
-    error ZeroAddress();
     error SpreadWidenTooLarge();
     error ProtectedToken(address token);
 
@@ -48,95 +37,6 @@ contract StockVaultExtension is ReentrancyGuardTransient {
     event NavAccepted();
     event Swept(address indexed token, address indexed to, uint256 amount);
 
-    constructor() {
-        SELF = address(this);
-    }
-
-    modifier delegated() {
-        _delegated();
-        _;
-    }
-
-    modifier onlyOwner() {
-        _onlyOwner();
-        _;
-    }
-
-    modifier onlyKeeper() {
-        _onlyKeeper();
-        _;
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Views
-    // -------------------------------------------------------------------------------------
-
-    function config() external view delegated returns (StockConfig memory) {
-        return StockStorage.layout().config;
-    }
-
-    function state() external view delegated returns (StockState memory) {
-        return StockStorage.layout().state;
-    }
-
-    function context() external view delegated returns (StockContext memory) {
-        return StockStorage.layout().ctx;
-    }
-
-    function roles() external view delegated returns (address keeper, address guardian, address issuer) {
-        StockLayout storage l = StockStorage.layout();
-        return (l.keeper, l.guardian, l.issuer);
-    }
-
-    function isDepositor(address depositor) external view delegated returns (bool) {
-        StockLayout storage l = StockStorage.layout();
-        return !l.allowlistOn || l.isDepositor[depositor];
-    }
-
-    function stock() external view delegated returns (address) {
-        return Currency.unwrap(StockStorage.layout().ctx.stock);
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Permissionless
-    // -------------------------------------------------------------------------------------
-
-    /// @notice Store a signed update, so the calls after it in a `multicall` see it.
-    function pushPrice(bytes calldata update) external delegated returns (uint256) {
-        return StockStorage.layout().ctx.store.update(update);
-    }
-
-    function poke() external delegated nonReentrant {
-        StockLayout storage l = StockStorage.layout();
-        StockLib.poke(l.config, l.state, l.ctx);
-    }
-
-    function confirmHedge() external delegated nonReentrant {
-        StockLib.confirmHedge(StockStorage.layout().state);
-    }
-
-    function syncHedge() external delegated nonReentrant returns (bool) {
-        StockLayout storage l = StockStorage.layout();
-        return StockLib.syncHedge(l.config, l.state, l.ctx, _restockOpen(l), msg.sender == l.keeper);
-    }
-
-    function topUpMargin() external delegated nonReentrant {
-        StockLayout storage l = StockStorage.layout();
-        StockLib.topUpMargin(l.config, l.state, l.ctx);
-    }
-
-    /// @notice Book the open restock order's delivery, or expire it past its deadline.
-    function settleRestock() external delegated nonReentrant {
-        StockLayout storage l = StockStorage.layout();
-        StockOps.settleRestock(l.state, l.ctx);
-    }
-
-    /// @notice Book stock that arrived with no order open.
-    function syncWindfall() external delegated nonReentrant {
-        StockLayout storage l = StockStorage.layout();
-        StockOps.syncWindfall(l.state, l.ctx);
-    }
-
     // -------------------------------------------------------------------------------------
     // Keeper
     // -------------------------------------------------------------------------------------
@@ -146,6 +46,14 @@ contract StockVaultExtension is ReentrancyGuardTransient {
     function restock(uint256 cash, uint256 minStockOut, bytes calldata memo) external onlyKeeper nonReentrant {
         StockLayout storage l = StockStorage.layout();
         StockOps.restock(l.config, l.state, l.ctx, l.issuer, _restockOpen(l), cash, minStockOut, memo);
+    }
+
+    /// @notice Rest a post-only hedge order at `price` for the gap `syncHedge` would cross the book
+    /// for, replacing any resting one. See `StockHedge.placeMaker`.
+    /// @return placed whether an order went out (false inside the band)
+    function placeMaker(uint256 price) external onlyKeeper nonReentrant returns (bool placed) {
+        StockLayout storage l = StockStorage.layout();
+        return StockHedge.placeMaker(l.config, l.state, l.ctx, _restockOpen(l), price);
     }
 
     /// @notice Add `bps` to every fill's spread for `duration` seconds (earnings, the open, news).
@@ -176,9 +84,7 @@ contract StockVaultExtension is ReentrancyGuardTransient {
     /// keeper or owner. A fixing batch that cannot settle while paused lapses and is refunded.
     function pause(uint8 flags) external delegated {
         StockLayout storage l = StockStorage.layout();
-        if (msg.sender != l.guardian && msg.sender != l.keeper && msg.sender != IOwnerOf(address(this)).owner()) {
-            revert NotPauser();
-        }
+        if (msg.sender != l.guardian && msg.sender != l.keeper && msg.sender != _owner()) revert NotPauser();
         l.state.paused |= flags;
         emit Paused(flags, msg.sender);
     }
@@ -188,7 +94,7 @@ contract StockVaultExtension is ReentrancyGuardTransient {
     // -------------------------------------------------------------------------------------
 
     function setConfig(StockConfig calldata config_) external onlyOwner {
-        StockLib.checkConfig(config_);
+        StockOps.checkConfig(config_);
         StockStorage.layout().config = config_;
         emit ConfigUpdated();
     }
@@ -253,36 +159,4 @@ contract StockVaultExtension is ReentrancyGuardTransient {
         IERC20(token).safeTransfer(to, amount);
         emit Swept(token, to, amount);
     }
-
-    // -------------------------------------------------------------------------------------
-    // Internals
-    // -------------------------------------------------------------------------------------
-
-    function _restockOpen(StockLayout storage l) internal view returns (bool) {
-        return l.issuer != address(0) && !l.state.restockHalted && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
-    }
-
-    function _delegated() internal view {
-        if (address(this) == SELF) revert NotDelegated();
-    }
-
-    function _onlyOwner() internal view {
-        _delegated();
-        if (msg.sender != IOwnerOf(address(this)).owner()) revert NotOwner();
-    }
-
-    function _onlyKeeper() internal view {
-        _delegated();
-        if (msg.sender != StockStorage.layout().keeper) revert NotKeeper();
-    }
-
-    function _keeperOrOwner() internal view {
-        if (msg.sender != StockStorage.layout().keeper && msg.sender != IOwnerOf(address(this)).owner()) {
-            revert NotKeeper();
-        }
-    }
-}
-
-interface IOwnerOf {
-    function owner() external view returns (address);
 }

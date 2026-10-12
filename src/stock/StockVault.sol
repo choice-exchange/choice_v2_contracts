@@ -30,14 +30,12 @@ import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManage
 
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
-import {StockFixing} from "./StockFixing.sol";
+import {StockHedge} from "./StockHedge.sol";
 import {StockLib} from "./StockLib.sol";
 import {StockOps} from "./StockOps.sol";
+import {StockPricing} from "./StockPricing.sol";
 import {
     Fill,
-    FixingBatch,
-    FixingConfig,
-    FixingRequest,
     Refusal,
     StockConfig,
     StockContext,
@@ -52,14 +50,14 @@ import {
 /// plus a spread, through the one Choice pool it is the hook of, and holds a perp short against its
 /// stock so a depositor's return is the spread and the funding, not the stock's moves.
 ///
-/// **One address, five code bodies.** This contract is the hook, the share token and the entry to
-/// both fill lanes. Pricing, guards, hedging and valuation are in `StockLib`; bookkeeping (what a
-/// fill changes, the restock order, the checks before shares are priced) in `StockOps`; the fixing
-/// lane in `StockFixing`; settings, keeper actions, the hedge triggers and the views in
-/// `StockVaultExtension`, which every selector this contract does not know reaches through
-/// `fallback`. All four run by DELEGATECALL, as this contract, on its storage, which sits at one
-/// fixed slot (`StockStorage`). There is no trust boundary inside a vault, and none of the four can
-/// be swapped out: their addresses are fixed at deployment.
+/// **One address, several code bodies.** This contract is the hook and the share token. The instant
+/// lane's pricing and guards are in `StockPricing`; the short and valuation in `StockHedge`;
+/// bookkeeping (what a fill changes, the restock order, the checks before shares are priced) in
+/// `StockOps`; the fixing lane in `StockFixing`. Every selector this contract does not know goes
+/// through `fallback` to a chain of modules: `StockPublic` (views, permissionless triggers, the fixing
+/// lane), then `StockAdmin` (owner, keeper and guardian). All of them run by DELEGATECALL, as this
+/// contract, on its storage, which sits at one fixed slot (`StockStorage`). There is no trust boundary
+/// inside a vault, and none of them can be swapped out: their addresses are fixed at deployment.
 ///
 /// **What a depositor owns.** Shares of the cash, the booked stock at the stored price, the short at
 /// margin plus PnL, and the cash of an open restock order (`totalAssets`); never what the vault
@@ -68,8 +66,8 @@ import {
 /// short's funding into its margin. Withdrawals are paid from cash on hand above the reserve.
 ///
 /// **Two lanes.** The instant lane is any swap through the pool. The fixing lane (`commitFixing`,
-/// `settleFixing`, `claimFixing`) fills larger committed requests at the one signed update stamped
-/// at a fixed tick after each boundary; see `StockFixing`.
+/// `settleFixing`, `claimFixing`, in `StockPublic`) fills larger committed requests at the one signed
+/// update stamped at a fixed tick after each boundary; see `StockFixing`.
 ///
 /// **How it fills.** `beforeSwap` takes the newer of the stored price and a signed update handed in
 /// as `hookData`, prices the whole swap off it, and returns a delta that leaves the pool's curve
@@ -104,7 +102,8 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     ICLPoolManager public immutable POOL_MANAGER;
     IVault public immutable VAULT;
     IPriceStore public immutable PRICE_STORE;
-    address public immutable EXTENSION;
+    /// @notice The first module of the chain every selector this contract does not know reaches.
+    address public immutable MODULES;
     uint32 public immutable FEED_ID;
     Currency internal immutable CASH;
     Currency internal immutable STOCK;
@@ -120,7 +119,6 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     error NotFillable(Refusal reason);
     error NotDepositor(address caller);
     error UnexpectedLock();
-    error NotKeeper();
 
     event PoolRegistered(PoolId indexed poolId, bool stockIsCurrency0);
     event FillRefused(Refusal reason);
@@ -131,7 +129,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         ICLPoolManager poolManager;
         IPriceStore store;
         MarketCalendar calendar;
-        address extension;
+        address modules;
         uint32 feedId;
         string marketId;
         address owner;
@@ -147,14 +145,14 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         if (
             address(init.cash) == address(0) || address(init.stock) == address(0)
                 || address(init.poolManager) == address(0) || address(init.store) == address(0)
-                || address(init.calendar) == address(0) || init.extension.code.length == 0
+                || address(init.calendar) == address(0) || init.modules.code.length == 0
                 || bytes(init.marketId).length == 0
         ) revert ZeroAddress();
-        StockLib.checkConfig(config_);
+        StockOps.checkConfig(config_);
         POOL_MANAGER = init.poolManager;
         VAULT = IProtocolFees(address(init.poolManager)).vault();
         PRICE_STORE = init.store;
-        EXTENSION = init.extension;
+        MODULES = init.modules;
         FEED_ID = init.feedId;
         CASH = Currency.wrap(address(init.cash));
         STOCK = Currency.wrap(address(init.stock));
@@ -177,10 +175,10 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         l.config = config_;
     }
 
-    /// @notice Every selector this contract does not define runs in `StockVaultExtension`, as this
-    /// contract: settings, keeper actions, hedge triggers and views.
+    /// @notice Every selector this contract does not define runs in the module chain (`StockPublic`,
+    /// then `StockAdmin`), as this contract.
     fallback() external {
-        address ext = EXTENSION;
+        address ext = MODULES;
         assembly ("memory-safe") {
             calldatacopy(0, 0, calldatasize())
             let ok := delegatecall(gas(), ext, 0, calldatasize(), 0, 0)
@@ -205,7 +203,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     /// funding: when it is owed to the short, a deposit mints a little less than `previewDeposit`.
     /// Read `navReady` before trusting this mid-block.
     function totalAssets() public view override returns (uint256) {
-        return StockLib.value(StockStorage.layout().state, _ctx());
+        return StockHedge.value(StockStorage.layout().state, _ctx());
     }
 
     /// @notice Whether `totalAssets` is exact right now: no hedge order pending in this block and
@@ -225,7 +223,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         SwapRequest memory w = SwapRequest({
             cashIn: cashIn, exactInput: exactInput, zeroForOne: false, sqrtPriceLimitX96: 0, amount: amountSpecified
         });
-        return StockLib.quote(l.config, l.state, _ctx(), w, hookData);
+        return StockPricing.quote(l.config, l.state, _ctx(), w, hookData);
     }
 
     /// @notice The short to add (positive) or cover (negative) to reach the target, 1e18 units,
@@ -299,7 +297,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             amount: exactInput ? uint256(-params.amountSpecified) : uint256(params.amountSpecified)
         });
         StockContext memory ctx = _ctx();
-        Fill memory f = StockLib.quote(l.config, l.state, ctx, w, hookData);
+        Fill memory f = StockPricing.quote(l.config, l.state, ctx, w, hookData);
         if (f.reason != Refusal.None) {
             // 🔴 The pool checks a swap's price limit against the CURVE's price before it sees that
             // the hook took the whole swap. A refused swap that fell through to an empty curve would
@@ -319,65 +317,6 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             ? (f.amountIn.toInt256().toInt128(), -f.amountOut.toInt256().toInt128())
             : (-f.amountOut.toInt256().toInt128(), f.amountIn.toInt256().toInt128());
         return (ICLHooks.beforeSwap.selector, toBeforeSwapDelta(specified, unspecified), 0);
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Maker hedging (see `StockLib.placeMaker`)
-    // -------------------------------------------------------------------------------------
-
-    /// @notice Rest a post-only hedge order at `price` for the gap `syncHedge` would cross the book
-    /// for, replacing any resting one. Keeper only.
-    /// @return placed whether an order went out (false inside the band)
-    function placeMaker(uint256 price) external nonReentrant returns (bool placed) {
-        StockLayout storage l = StockStorage.layout();
-        if (msg.sender != l.keeper) revert NotKeeper();
-        bool restockOpen =
-            l.issuer != address(0) && !l.state.restockHalted && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
-        return StockLib.placeMaker(l.config, l.state, _ctx(), restockOpen, price);
-    }
-
-    /// @notice Cancel the resting maker hedge: the keeper any time, anyone once it has rested
-    /// `makerTimeout`.
-    function cancelMaker() external nonReentrant {
-        StockLayout storage l = StockStorage.layout();
-        StockLib.cancelMaker(l.config, l.state, msg.sender == l.keeper);
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Fixing lane (see `StockFixing`)
-    // -------------------------------------------------------------------------------------
-
-    /// @notice Commit `amountIn` (cash when `cashIn`, else stock) to the next boundary's fixing;
-    /// `boundary` must be that next one. The input is taken now and held until `claimFixing`.
-    /// @return id the request
-    function commitFixing(uint64 boundary, bool cashIn, uint256 amountIn, address recipient)
-        external
-        nonReentrant
-        returns (uint256 id)
-    {
-        return StockFixing.commit(StockStorage.layout(), boundary, cashIn, amountIn, recipient);
-    }
-
-    /// @notice Fill the batch for `boundary` at the signed update stamped exactly at its tick.
-    function settleFixing(uint64 boundary, bytes calldata update) external nonReentrant {
-        StockFixing.settle(StockStorage.layout(), boundary, update);
-    }
-
-    /// @notice Pay request `id` to its recipient, once its batch has settled or lapsed.
-    function claimFixing(uint256 id) external nonReentrant returns (uint256 out, uint256 refund) {
-        return StockFixing.claim(StockStorage.layout(), id);
-    }
-
-    function fixingConfig() external view returns (FixingConfig memory) {
-        return StockStorage.layout().fixing;
-    }
-
-    function fixingBatch(uint64 boundary) external view returns (FixingBatch memory) {
-        return StockStorage.layout().batches[boundary];
-    }
-
-    function fixingRequest(uint256 id) external view returns (FixingRequest memory) {
-        return StockStorage.layout().requests[id];
     }
 
     /// @inheritdoc ILockCallback

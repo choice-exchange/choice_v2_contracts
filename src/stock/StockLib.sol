@@ -6,20 +6,18 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {Currency} from "infinity-core/src/types/Currency.sol";
-import {TickMath} from "infinity-core/src/pool-cl/libraries/TickMath.sol";
 
 import {IExchangeDerivatives} from "../interfaces/IExchangeDerivatives.sol";
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {SubaccountLib} from "../libraries/SubaccountLib.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
 import {PythLazerLib} from "./PythLazerLib.sol";
-import {Fill, Reference, Refusal, StockConfig, StockContext, StockState, SwapRequest} from "./StockTypes.sol";
+import {Reference, Refusal, StockConfig, StockContext, StockState} from "./StockTypes.sol";
 
 /// @title StockLib
-/// @notice The pricing, guards, hedge and valuation of a `StockVault`, kept out of the vault's own
-/// bytecode. Its external functions run by DELEGATECALL, so they act as the vault: the perp position
-/// they trade is the vault's, the Choice vault lock they take calls the vault back, and their events
-/// are the vault's.
+/// @notice What every body of a `StockVault` shares: the hard limits and flags, the errors more than one
+/// raises, the reference price, the hedge gap, and the helpers (valuation inputs, conversions, the
+/// Choice vault lock). Internal only, so it is inlined into each body that uses it and never deployed.
 library StockLib {
     using SafeCast for uint256;
     using SafeCast for int256;
@@ -59,92 +57,11 @@ library StockLib {
     error BadConfig();
     error PriceNotUsable(Refusal reason);
     error OracleMissing();
-    error HedgePending();
-    error HedgeTooSoon(uint256 allowedAt);
-    error MarginHealthy();
     error CashShort(uint256 needed, uint256 own);
-    error MakerOff();
-    error NoMaker();
-    error MakerResting(uint256 replaceableAt);
-    error MakerPriceOutOfBand(uint256 price, uint256 low, uint256 high);
-
-    event HedgeOrdered(bool sell, uint256 quantity, uint256 worstPrice, uint256 margin, string orderHash);
-    event MakerPlaced(bool sell, uint256 quantity, uint256 price, uint256 margin, string orderHash);
-    event MakerCancelled(string orderHash, uint256 fillableLeft);
-    event HedgeConfirmed(int256 shortQty);
-    event MarginAdded(uint256 amount);
-    event Anchored(uint256 price);
-    event JumpSeen(uint256 price, uint256 anchor);
-    event Reanchored(uint256 price, uint256 wideUntil);
 
     // -------------------------------------------------------------------------------------
-    // Fills
+    // The reference price
     // -------------------------------------------------------------------------------------
-
-    /// @notice The fill for one swap, or the reason there is none. Every amount rounds the vault's
-    /// way: output down, input up.
-    function quote(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        SwapRequest memory w,
-        bytes calldata hookData
-    ) external view returns (Fill memory f) {
-        if (s.paused & PAUSE_FILLS != 0) return _refuse(f, Refusal.Paused);
-        if (!s.poolRegistered) return _refuse(f, Refusal.Disabled);
-        Reference memory r = referencePrice(c, ctx, pickPrice(ctx, hookData));
-        f.price = r.price;
-        f.closed = r.closed;
-        if (r.reason != Refusal.None) return _refuse(f, r.reason);
-        if (r.closed && !c.weekendFills) return _refuse(f, Refusal.Closed);
-        if (s.anchorPrice != 0 && deviationBps(r.price, s.anchorPrice) > c.maxJumpBps) {
-            return _refuse(f, Refusal.Jump);
-        }
-        if (ownStock(s, ctx) < s.stockBooked) return _refuse(f, Refusal.Deficit);
-
-        uint256 scale = 10 ** (uint256(ctx.stockDecimals) + 18 - ctx.cashDecimals);
-        (uint256 maxTrade, uint256 windowCap) =
-            r.closed ? (uint256(c.maxTradeClosed), uint256(c.windowCapClosed)) : (c.maxTrade, c.windowCap);
-        uint256 used = windowUsedNow(c, s);
-        {
-            // The size terms read the trade at the reference price, before the spread is known.
-            uint256 cashEstimate = w.cashIn == w.exactInput ? w.amount : Math.mulDiv(w.amount, r.price, scale);
-            f.spreadBps = spread(c, s, r, cashEstimate, used, maxTrade, windowCap);
-        }
-        if (f.spreadBps > c.maxSpread) return _refuse(f, Refusal.Spread);
-
-        int256 lean = skew(c, s, ctx, r.price);
-        if (w.cashIn) {
-            // forge-lint: disable-next-line(unsafe-typecast) - |lean| < minSpread <= spread.
-            uint256 ask = Math.mulDiv(r.price, uint256(int256(BPS + f.spreadBps) + lean), BPS, Math.Rounding.Ceil);
-            (f.amountIn, f.amountOut) = w.exactInput
-                ? (w.amount, Math.mulDiv(w.amount, scale, ask))
-                : (Math.mulDiv(w.amount, ask, scale, Math.Rounding.Ceil), w.amount);
-        } else {
-            // forge-lint: disable-next-line(unsafe-typecast) - |lean| < minSpread <= spread < BPS.
-            uint256 bid = r.price * uint256(int256(BPS - f.spreadBps) + lean) / BPS;
-            (f.amountIn, f.amountOut) = w.exactInput
-                ? (w.amount, Math.mulDiv(w.amount, bid, scale))
-                : (Math.mulDiv(w.amount, scale, bid, Math.Rounding.Ceil), w.amount);
-        }
-        Refusal g = guards(c, s, ctx, w, f, maxTrade, windowCap, used);
-        if (g != Refusal.None) return _refuse(f, g);
-    }
-
-    /// @notice The newer of the stored price and a signed update handed in with the swap. A bad
-    /// update is ignored, never fatal.
-    function pickPrice(StockContext memory ctx, bytes calldata hookData)
-        internal
-        view
-        returns (IPriceStore.Price memory p)
-    {
-        p = ctx.store.latest(ctx.feedId);
-        if (hookData.length != 0) {
-            try ctx.store.verify(hookData, ctx.feedId) returns (IPriceStore.Price memory q) {
-                if (q.price > 0 && q.timestampUs > p.timestampUs) p = q;
-            } catch {}
-        }
-    }
 
     /// @notice The reference off the stored price alone.
     function storedReference(StockConfig storage c, StockContext memory ctx) internal view returns (Reference memory) {
@@ -191,345 +108,16 @@ library StockLib {
         }
     }
 
-    /// @notice The spread for a fill, before the inventory lean, floored at `minSpread`.
-    function spread(
-        StockConfig storage c,
-        StockState storage s,
-        Reference memory r,
-        uint256 cashEstimate,
-        uint256 used,
-        uint256 maxTrade,
-        uint256 windowCap
-    ) internal view returns (uint256 bps) {
-        if (r.closed) {
-            bps = c.spreadClosed;
-        } else {
-            if (r.session == MarketCalendar.Session.Regular) bps = c.spreadRegular;
-            else if (r.session == MarketCalendar.Session.Overnight) bps = c.spreadOvernight;
-            else bps = c.spreadExtended;
-            bps += Math.mulDiv(c.agePerSecondBps, r.ageMs, 1000, Math.Rounding.Ceil);
-            if (r.session == MarketCalendar.Session.Regular && block.timestamp < r.sessionStart + c.openWindow) {
-                bps += c.openBps;
-            }
-        }
-        bps += r.hasQuote ? r.quoteBps : c.quoteMissingBps;
-        bps += r.hasConfidence ? r.confidenceBps : c.confidenceMissingBps;
-        if (maxTrade != 0) {
-            bps += Math.mulDiv(c.sizeBps, Math.min(cashEstimate, maxTrade), maxTrade, Math.Rounding.Ceil);
-        }
-        if (windowCap != 0) {
-            bps += Math.mulDiv(c.windowBps, Math.min(used + cashEstimate, windowCap), windowCap, Math.Rounding.Ceil);
-        }
-        if (block.timestamp < s.widenUntil) bps += s.widenBps;
-        if (block.timestamp < s.wideUntil) bps += c.reanchorBps;
-        if (bps < c.minSpread) bps = c.minSpread;
-    }
-
-    /// @dev Every guard a priced fill must pass. A failure is a refusal, never a revert.
-    function guards(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        SwapRequest memory w,
-        Fill memory f,
-        uint256 maxTrade,
-        uint256 windowCap,
-        uint256 used
-    ) internal view returns (Refusal) {
-        uint256 cashLeg = w.cashIn ? f.amountIn : f.amountOut;
-        if (f.amountIn == 0 || f.amountOut == 0 || cashLeg > maxTrade) return Refusal.Size;
-        uint256 outValue = w.cashIn ? stockToCash(ctx, f.amountOut, f.price, Math.Rounding.Ceil) : f.amountOut;
-        if (used + outValue > windowCap) return Refusal.Window;
-        // Fills pay out of claims only.
-        if (ctx.vault.balanceOf(address(this), w.cashIn ? ctx.stock : ctx.cash) < f.amountOut) {
-            return Refusal.Inventory;
-        }
-        if (w.cashIn && f.amountOut > s.stockBooked) return Refusal.Inventory;
-        uint256 bookedAfter = w.cashIn ? s.stockBooked - f.amountOut : s.stockBooked + f.amountIn;
-        if (!w.cashIn) {
-            if (stockToCash(ctx, bookedAfter, f.price, Math.Rounding.Ceil) > c.maxInventory) {
-                return Refusal.InventoryCap;
-            }
-            // The cash left must cover the reserve plus the margin to hedge what comes in.
-            uint256 margin = stockToCash(ctx, f.amountIn, f.price, Math.Rounding.Ceil) * 10 / c.leverageX10;
-            if (ownCash(s, ctx) < f.amountOut + c.cashReserve + margin) return Refusal.Reserve;
-        }
-        if (_widensExposure(c, s, ctx, bookedAfter, f.price)) return Refusal.Unhedged;
-        if (!withinLimit(w.zeroForOne, f.amountIn, f.amountOut, w.sqrtPriceLimitX96)) return Refusal.PriceLimit;
-        return Refusal.None;
-    }
-
-    /// @dev Exposure may grow only up to `maxUnhedged`, judged against the confirmed short and
-    /// against the short a pending hedge, or what may still fill of a resting maker order, would
-    /// leave: until it is read back, it might not have filled, and it might have. (A market hedge
-    /// cancels any maker order first, so at most one of the two is ever open.)
-    function _widensExposure(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        uint256 bookedAfter,
-        uint256 price
-    ) internal view returns (bool) {
-        int256 inTransit = s.orderOpen ? toUnits(s.orderMinOut, ctx.stockDecimals).toInt256() : int256(0);
-        int256 before = toUnits(s.stockBooked, ctx.stockDecimals).toInt256() + inTransit;
-        int256 next = toUnits(bookedAfter, ctx.stockDecimals).toInt256() + inTransit;
-        int256 resting = s.makerSell ? s.makerFillable.toInt256() : -s.makerFillable.toInt256();
-        for (uint256 k; k < 2; ++k) {
-            int256 short_ = k == 0 ? s.shortConfirmed : s.shortConfirmed + s.pendingQty + resting;
-            uint256 b = abs(before - short_);
-            uint256 a = abs(next - short_);
-            if (a > b && unitsToCash(ctx, a, price) > c.maxUnhedged) return true;
-        }
-        return false;
-    }
-
-    /// @dev The lean in bps from the holding before the fill: `+skewBps` holding nothing,
-    /// `-skewBps` holding twice the target or more, zero on target or with no target.
-    function skew(StockConfig storage c, StockState storage s, StockContext memory ctx, uint256 price)
-        internal
-        view
-        returns (int256)
-    {
-        if (c.skewBps == 0 || c.targetInventory == 0) return 0;
-        uint256 held = stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor);
-        int256 bps = BPS.toInt256();
-        int256 target = uint256(c.targetInventory).toInt256();
-        int256 deviation = (target - held.toInt256()) * bps / target;
-        if (deviation < -bps) deviation = -bps;
-        return deviation * uint256(c.skewBps).toInt256() / bps;
-    }
-
-    /// @dev The swapper's price limit, applied to the fill's own rate. A limit at either end of
-    /// the price range is the routers' "no limit" and always passes.
-    function withinLimit(bool zeroForOne, uint256 amountIn, uint256 amountOut, uint160 sqrtPriceLimitX96)
-        internal
-        pure
-        returns (bool)
-    {
-        if (sqrtPriceLimitX96 <= TickMath.MIN_SQRT_RATIO + 1 || sqrtPriceLimitX96 >= TickMath.MAX_SQRT_RATIO - 1) {
-            return true;
-        }
-        uint256 limitX96 = Math.mulDiv(sqrtPriceLimitX96, sqrtPriceLimitX96, 1 << 96);
-        return zeroForOne
-            ? amountOut >= Math.mulDiv(amountIn, limitX96, 1 << 96)
-            : amountIn <= Math.mulDiv(amountOut, limitX96, 1 << 96);
-    }
-
-    // -------------------------------------------------------------------------------------
-    // The anchor
-    // -------------------------------------------------------------------------------------
-
-    /// @notice Keep the jump breaker's anchor on the feed. A move within the breaker re-anchors at
-    /// once; a jump is noted, and re-anchored only once it has stood for `reanchorDelay`, after
-    /// which fills pay `reanchorBps` more for `reanchorWide`. Permissionless: it can only follow
-    /// a signed price, and only slowly across a jump.
-    function poke(StockConfig storage c, StockState storage s, StockContext memory ctx) external {
-        Reference memory r = storedReference(c, ctx);
-        if (r.reason != Refusal.None || r.closed) revert PriceNotUsable(r.reason);
-        if (s.anchorPrice == 0 || deviationBps(r.price, s.anchorPrice) <= c.maxJumpBps) {
-            s.anchorPrice = r.price.toUint128();
-            s.jumpSince = 0;
-            emit Anchored(r.price);
-        } else if (s.jumpSince == 0) {
-            s.jumpSince = uint64(block.timestamp);
-            emit JumpSeen(r.price, s.anchorPrice);
-        } else if (block.timestamp >= uint256(s.jumpSince) + c.reanchorDelay) {
-            s.anchorPrice = r.price.toUint128();
-            s.jumpSince = 0;
-            s.wideUntil = uint64(block.timestamp + c.reanchorWide);
-            emit Reanchored(r.price, s.wideUntil);
-        }
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Hedge
-    // -------------------------------------------------------------------------------------
-
-    /// @notice Read the short back from the position: the truth a pending order is judged against.
-    /// A resting maker order is read back too: what may still fill, or cleared once it is gone.
-    function confirmHedge(StockState storage s) public {
-        if (s.hedgeBlock == block.number) revert HedgePending();
-        (bool found, IExchangeDerivatives.DerivativePosition memory p) = position(s);
-        s.shortConfirmed = !found ? int256(0) : (p.isLong ? -p.quantity.toInt256() : p.quantity.toInt256());
-        s.pendingQty = 0;
-        if (bytes(s.makerHash).length != 0) {
-            (bool live, IExchangeDerivatives.TrimmedDerivativeLimitOrder memory o) = makerOrder(s);
-            if (live) s.makerFillable = o.fillable;
-            else _clearMaker(s);
-        }
-        emit HedgeConfirmed(s.shortConfirmed);
-    }
-
-    /// @notice Confirm the short, then move it toward the target exposure in one market order if
-    /// it has drifted past the band. Keeper any time; anyone else `publicHedgeDelay` after the last.
-    /// A resting maker order is cancelled first: by the keeper any time, by anyone once it has
-    /// rested `makerTimeout`.
-    /// @param restockOpen whether the issuer can be ordered from now: then the short tracks the
-    /// target inventory and the issuer closes the gap; otherwise it tracks what the vault holds.
-    /// @return ordered whether an order went out
-    function syncHedge(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        bool restockOpen,
-        bool isKeeper
-    ) external returns (bool ordered) {
-        confirmHedge(s);
-        if (bytes(s.makerHash).length != 0) {
-            _requireMakerReplaceable(c, s, isKeeper);
-            _cancelMaker(s);
-        }
-        Reference memory r = storedReference(c, ctx);
+    /// @notice Revert unless a deposit, withdrawal or restock may act on `r`: the market open for
+    /// this vault and the price fresh.
+    function requireUsable(Reference memory r) internal pure {
         if (r.reason != Refusal.None) revert PriceNotUsable(r.reason);
-
-        (bool sell, uint256 qty) = _hedgeOrder(c, s, ctx, r, restockOpen);
-        if (qty == 0) return false;
-        if (!isKeeper && block.timestamp < uint256(s.lastHedgeTime) + c.publicHedgeDelay) {
-            revert HedgeTooSoon(uint256(s.lastHedgeTime) + c.publicHedgeDelay);
-        }
-
-        uint256 worst = sell
-            ? r.price * (BPS - c.hedgeSlippageBps) / BPS / c.priceTick * c.priceTick
-            : Math.ceilDiv(Math.mulDiv(r.price, BPS + c.hedgeSlippageBps, BPS, Math.Rounding.Ceil), c.priceTick)
-                * c.priceTick;
-        uint256 margin = _holdMargin(c, s, ctx, sell, qty, worst);
-
-        string memory sub = subaccount();
-        string memory orderHash =
-            EXCHANGE.createDerivativeMarketOrder(
-            address(this),
-            IExchangeDerivatives.DerivativeOrder({
-                marketID: s.marketId,
-                subaccountID: sub,
-                feeRecipient: "",
-                price: worst,
-                quantity: qty,
-                cid: "",
-                orderType: sell ? "sell" : "buy",
-                margin: margin,
-                triggerPrice: 0
-            })
-        )
-        .orderHash;
-        s.hedgeBlock = uint64(block.number);
-        s.lastHedgeTime = uint64(block.timestamp);
-        s.pendingQty = sell ? qty.toInt256() : -qty.toInt256();
-        emit HedgeOrdered(sell, qty, worst, margin, orderHash);
-        return true;
+        if (r.closed) revert PriceNotUsable(Refusal.Closed);
     }
 
-    /// @notice Rest a post-only order at `price` for the same gap `syncHedge` would cross the book
-    /// for, replacing any maker order already resting. The keeper picks the price, inside
-    /// `hedgeSlippageBps` of the reference on either side and on the market's tick; post-only means
-    /// it can only ever fill as maker, and an order that would cross reverts. Until it fills or is
-    /// cancelled the vault's exposure is judged both with and without what may still fill.
-    /// @return placed whether an order went out (false inside the band)
-    function placeMaker(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        bool restockOpen,
-        uint256 price
-    ) external returns (bool placed) {
-        if (c.makerTimeout == 0) revert MakerOff();
-        confirmHedge(s);
-        if (bytes(s.makerHash).length != 0) _cancelMaker(s);
-        Reference memory r = storedReference(c, ctx);
-        if (r.reason != Refusal.None) revert PriceNotUsable(r.reason);
-
-        (bool sell, uint256 qty) = _hedgeOrder(c, s, ctx, r, restockOpen);
-        if (qty == 0) return false;
-        uint256 low = r.price * (BPS - c.hedgeSlippageBps) / BPS;
-        uint256 high = Math.mulDiv(r.price, BPS + c.hedgeSlippageBps, BPS, Math.Rounding.Ceil);
-        if (price < low || price > high || price % c.priceTick != 0) revert MakerPriceOutOfBand(price, low, high);
-        uint256 margin = _holdMargin(c, s, ctx, sell, qty, price);
-
-        string memory orderHash =
-            EXCHANGE.createDerivativeLimitOrder(
-            address(this),
-            IExchangeDerivatives.DerivativeOrder({
-                marketID: s.marketId,
-                subaccountID: subaccount(),
-                feeRecipient: "",
-                price: price,
-                quantity: qty,
-                cid: "",
-                orderType: sell ? "sellPostOnly" : "buyPostOnly",
-                margin: margin,
-                triggerPrice: 0
-            })
-        )
-        .orderHash;
-        s.makerHash = orderHash;
-        s.makerSell = sell;
-        s.makerFillable = qty;
-        s.makerPlacedAt = uint64(block.timestamp);
-        emit MakerPlaced(sell, qty, price, margin, orderHash);
-        return true;
-    }
-
-    /// @notice Cancel the resting maker order: the keeper any time, anyone once it has rested
-    /// `makerTimeout` (so a stalled keeper cannot leave one resting at a stale price).
-    function cancelMaker(StockConfig storage c, StockState storage s, bool isKeeper) external {
-        if (bytes(s.makerHash).length == 0) revert NoMaker();
-        _requireMakerReplaceable(c, s, isKeeper);
-        confirmHedge(s);
-        if (bytes(s.makerHash).length != 0) _cancelMaker(s);
-    }
-
-    /// @dev The order that would bring the short to target: which way, and how much, rounded to
-    /// the tick; zero inside the band or under the minimum. A buy only ever reduces a short.
-    function _hedgeOrder(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        Reference memory r,
-        bool restockOpen
-    ) private view returns (bool sell, uint256 qty) {
-        int256 gap = hedgeGap(c, s, ctx, r.price, restockOpen && !r.closed);
-        uint256 mag = abs(gap);
-        if (unitsToCash(ctx, mag, r.price) < c.hedgeBand) return (false, 0);
-        sell = gap > 0;
-        qty = mag / c.qtyTick * c.qtyTick;
-        // forge-lint: disable-next-line(unsafe-typecast) - sign tested.
-        if (!sell) qty = Math.min(qty, s.shortConfirmed > 0 ? uint256(s.shortConfirmed) : 0);
-        if (qty == 0 || unitsToCash(ctx, qty, r.price) < c.minHedge) qty = 0;
-    }
-
-    /// @dev An opening order's margin at `price`, made available out of the vault's own cash; a
-    /// reducing order carries none (reduce-only).
-    function _holdMargin(
-        StockConfig storage c,
-        StockState storage s,
-        StockContext memory ctx,
-        bool sell,
-        uint256 qty,
-        uint256 price
-    ) private returns (uint256 margin) {
-        if (!sell) return 0;
-        margin = Math.mulDiv(qty, price, 1e18) * 10 / c.leverageX10;
-        // The margin hold also covers the fee; 1% over is far above any fee tier.
-        spendOwnCash(s, ctx, fromApi(ctx, margin, Math.Rounding.Ceil) * 101 / 100 + 1);
-    }
-
-    function _requireMakerReplaceable(StockConfig storage c, StockState storage s, bool isKeeper) private view {
-        uint256 at = uint256(s.makerPlacedAt) + c.makerTimeout;
-        if (!isKeeper && block.timestamp < at) revert MakerResting(at);
-    }
-
-    /// @dev Cancel the resting order, which `confirmHedge` has just seen live in this transaction.
-    function _cancelMaker(StockState storage s) private {
-        EXCHANGE.cancelDerivativeOrder(address(this), s.marketId, subaccount(), s.makerHash, 1, "");
-        emit MakerCancelled(s.makerHash, s.makerFillable);
-        _clearMaker(s);
-    }
-
-    function _clearMaker(StockState storage s) private {
-        delete s.makerHash;
-        s.makerSell = false;
-        s.makerFillable = 0;
-        s.makerPlacedAt = 0;
-    }
+    // -------------------------------------------------------------------------------------
+    // The hedge gap
+    // -------------------------------------------------------------------------------------
 
     /// @notice The short the vault should add (positive) or cover (negative), 1e18 units, against
     /// the confirmed short.
@@ -556,78 +144,8 @@ library StockLib {
         return units.toInt256() - s.shortConfirmed;
     }
 
-    /// @notice Bring the short back to its target leverage once its margin is below 70% of what
-    /// that leverage needs. Permissionless: it only adds the vault's own cash to its own position.
-    function topUpMargin(StockConfig storage c, StockState storage s, StockContext memory ctx) external {
-        (bool found, IExchangeDerivatives.DerivativePosition memory p) = position(s);
-        if (!found) revert MarginHealthy();
-        uint256 target = Math.mulDiv(p.quantity, markPrice(ctx), 1e18) * 10 / c.leverageX10;
-        if (p.margin * 10 >= target * 7) revert MarginHealthy();
-        uint256 amount = target - p.margin;
-        spendOwnCash(s, ctx, fromApi(ctx, amount, Math.Rounding.Ceil) + 1);
-        string memory sub = subaccount();
-        EXCHANGE.increasePositionMargin(address(this), sub, sub, s.marketId, amount);
-        emit MarginAdded(amount);
-    }
-
     // -------------------------------------------------------------------------------------
-    // Value
-    // -------------------------------------------------------------------------------------
-
-    /// @notice Cash, plus the booked stock (never more than is held) at the stored price, plus the
-    /// short at margin plus PnL, plus the cash of an open restock order, plus the margin a resting
-    /// maker order still holds (not its fee hold, which is small and may be a rebate). What the
-    /// vault holds for fixing-lane requesters is not its own and is left out. ⚠️ Funding reaches the margin only
-    /// when it settles; deposits and withdrawals settle it first.
-    function value(StockState storage s, StockContext memory ctx) external view returns (uint256 total) {
-        uint256 price = markPrice(ctx);
-        total = ownCash(s, ctx) + (s.orderOpen ? s.orderCash : 0);
-        total += stockToCash(ctx, Math.min(s.stockBooked, ownStock(s, ctx)), price, Math.Rounding.Floor);
-        (bool found, IExchangeDerivatives.DerivativePosition memory p) = position(s);
-        if (found) total += positionValue(ctx, p, price);
-        if (bytes(s.makerHash).length != 0) {
-            // The margin still held by what may fill; a filled part's margin is in the position.
-            (bool live, IExchangeDerivatives.TrimmedDerivativeLimitOrder memory o) = makerOrder(s);
-            if (live && o.quantity != 0) {
-                total += fromApi(ctx, Math.mulDiv(o.margin, o.fillable, o.quantity), Math.Rounding.Floor);
-            }
-        }
-    }
-
-    /// @notice Revert unless a deposit, withdrawal or restock may act on `r`: the market open for
-    /// this vault and the price fresh.
-    function requireUsable(Reference memory r) internal pure {
-        if (r.reason != Refusal.None) revert PriceNotUsable(r.reason);
-        if (r.closed) revert PriceNotUsable(Refusal.Closed);
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Config
-    // -------------------------------------------------------------------------------------
-
-    function checkConfig(StockConfig memory c) external pure {
-        if (c.maxSpread > MAX_SPREAD_LIMIT || c.minSpread == 0 || c.minSpread > c.maxSpread) revert BadConfig();
-        if (
-            c.spreadRegular > c.maxSpread || c.spreadExtended > c.maxSpread || c.spreadOvernight > c.maxSpread
-                || c.spreadClosed > c.maxSpread
-        ) revert BadConfig();
-        // The lean must stay inside the spread, so neither side ever crosses the reference.
-        if (c.skewBps >= c.minSpread) revert BadConfig();
-        if (c.maxJumpBps == 0 || c.maxJumpBps > MAX_JUMP_LIMIT) revert BadConfig();
-        if (c.hedgeSlippageBps > MAX_HEDGE_SLIPPAGE || c.restockSlippageBps > MAX_RESTOCK_SLIPPAGE) revert BadConfig();
-        if (c.navJumpBps == 0 || c.navJumpBps > MAX_NAV_JUMP) revert BadConfig();
-        if (c.leverageX10 < MIN_LEVERAGE_X10 || c.leverageX10 > MAX_LEVERAGE_X10) revert BadConfig();
-        if (c.maxAgeMs == 0 || c.maxAgeMs > MAX_AGE_MS_LIMIT || c.closeTolerance > MAX_CLOSE_TOLERANCE) {
-            revert BadConfig();
-        }
-        if (c.window < MIN_WINDOW || c.reanchorDelay < MIN_REANCHOR_DELAY) revert BadConfig();
-        if (c.restockDeadline == 0 || c.restockDeadline > MAX_RESTOCK_DEADLINE) revert BadConfig();
-        if (c.makerTimeout > MAX_MAKER_TIMEOUT) revert BadConfig();
-        if (c.targetInventory > c.maxInventory || c.qtyTick == 0 || c.priceTick == 0) revert BadConfig();
-    }
-
-    // -------------------------------------------------------------------------------------
-    // Helpers (inlined into whichever side calls them)
+    // Helpers
     // -------------------------------------------------------------------------------------
 
     function windowUsedNow(StockConfig storage c, StockState storage s) internal view returns (uint256) {
@@ -787,12 +305,5 @@ library StockLib {
         assembly ("memory-safe") {
             open := tload(LOCK_OPEN_SLOT)
         }
-    }
-
-    function _refuse(Fill memory f, Refusal reason) private pure returns (Fill memory) {
-        f.reason = reason;
-        f.amountIn = 0;
-        f.amountOut = 0;
-        return f;
     }
 }

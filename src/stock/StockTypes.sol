@@ -240,10 +240,10 @@ enum Refusal {
 }
 
 /// @notice Everything a stock vault stores besides its share token and owner, at one fixed slot,
-/// so the vault and its extension (`StockVaultExtension`, reached through the vault's fallback by
+/// so the vault and its modules (`StockPublic`, `StockAdmin`, reached through the vault's fallback by
 /// DELEGATECALL) read the same storage without sharing an inheritance chain.
 /// @param ctx the vault's fixed facts, copied from its immutables at construction for the
-/// extension's use; only `ctx.calendar` ever changes (`setCalendar`)
+/// modules' use; only `ctx.calendar` ever changes (`setCalendar`)
 struct StockLayout {
     StockContext ctx;
     address keeper;
