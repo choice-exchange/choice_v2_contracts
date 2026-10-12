@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 pragma solidity 0.8.26;
 
+import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {MockERC20} from "solmate/src/test/utils/mocks/MockERC20.sol";
 
 import {IExchangeDerivatives} from "../../src/interfaces/IExchangeDerivatives.sol";
@@ -11,6 +12,10 @@ import {IExchangeDerivatives} from "../../src/interfaces/IExchangeDerivatives.so
 /// off the books (`accrueFunding`) and reaches the margin only when `decreasePositionMargin` runs,
 /// as on chain. Margin moves by minting and burning the cash mock, which is how the real precompile
 /// debits a bank balance without an approval.
+///
+/// Post-only limit orders rest at once, as on chain: checked against the book's best bid and ask
+/// (`setBook`) and reverted if they would cross, visible to `derivativeOrdersByHashes` in the same
+/// transaction, filled as maker by `fillResting` and cancelled by matching with `matchCancel`.
 contract MockStockExchange {
     struct Order {
         address sender;
@@ -38,6 +43,104 @@ contract MockStockExchange {
     uint256 public ordersPlaced;
     uint256 public decreases;
     bool public failDecrease;
+
+    struct Resting {
+        address sender;
+        string subaccountID;
+        string marketID;
+        bool isBuy;
+        uint256 price;
+        uint256 quantity;
+        uint256 margin;
+        uint256 fillable;
+    }
+
+    mapping(bytes32 hash => Resting) internal _resting;
+    uint256 public bestBid;
+    uint256 public bestAsk;
+    uint256 public limitOrdersPlaced;
+    uint256 public cancels;
+
+    function setBook(uint256 bid, uint256 ask) external {
+        (bestBid, bestAsk) = (bid, ask);
+    }
+
+    function createDerivativeLimitOrder(address sender, IExchangeDerivatives.DerivativeOrder calldata o)
+        external
+        returns (IExchangeDerivatives.CreateDerivativeLimitOrderResponse memory r)
+    {
+        require(msg.sender == sender, "authz");
+        bool isBuy = keccak256(bytes(o.orderType)) == keccak256("buyPostOnly");
+        require(isBuy || keccak256(bytes(o.orderType)) == keccak256("sellPostOnly"), "order type");
+        require(isBuy ? (bestAsk == 0 || o.price < bestAsk) : o.price > bestBid, "exceeds top of book");
+        if (o.margin != 0) cash.burn(sender, _toCash(o.margin, true));
+        r.orderHash = Strings.toHexString(uint256(keccak256(abi.encode(address(this), ++limitOrdersPlaced))), 32);
+        _resting[keccak256(bytes(r.orderHash))] =
+            Resting(sender, o.subaccountID, o.marketID, isBuy, o.price, o.quantity, o.margin, o.quantity);
+    }
+
+    function cancelDerivativeOrder(
+        address sender,
+        string calldata,
+        string calldata,
+        string calldata orderHash,
+        int32,
+        string calldata
+    ) external returns (bool) {
+        require(msg.sender == sender, "authz");
+        Resting storage o = _resting[keccak256(bytes(orderHash))];
+        require(o.fillable != 0, "order doesnt exist");
+        uint256 refund = o.margin * o.fillable / o.quantity;
+        if (refund != 0) cash.mint(o.sender, _toCash(refund, false));
+        delete _resting[keccak256(bytes(orderHash))];
+        cancels++;
+        return true;
+    }
+
+    function derivativeOrdersByHashes(IExchangeDerivatives.DerivativeOrdersRequest calldata q)
+        external
+        view
+        returns (IExchangeDerivatives.TrimmedDerivativeLimitOrder[] memory out)
+    {
+        uint256 n;
+        for (uint256 k; k < q.orderHashes.length; ++k) {
+            if (_resting[keccak256(bytes(q.orderHashes[k]))].fillable != 0) n++;
+        }
+        out = new IExchangeDerivatives.TrimmedDerivativeLimitOrder[](n);
+        uint256 j;
+        for (uint256 k; k < q.orderHashes.length; ++k) {
+            Resting storage o = _resting[keccak256(bytes(q.orderHashes[k]))];
+            if (o.fillable == 0) continue;
+            out[j++] = IExchangeDerivatives.TrimmedDerivativeLimitOrder({
+                price: o.price,
+                quantity: o.quantity,
+                margin: o.margin,
+                fillable: o.fillable,
+                isBuy: o.isBuy,
+                orderHash: q.orderHashes[k],
+                cid: ""
+            });
+        }
+    }
+
+    /// @notice Fill `quantity` of a resting order at its own price, as the EndBlocker would match
+    /// a taker against it: the filled part's margin moves into the position.
+    function fillResting(string calldata orderHash, uint256 quantity) external {
+        Resting storage o = _resting[keccak256(bytes(orderHash))];
+        require(quantity <= o.fillable, "overfill");
+        uint256 marginShare = o.margin * quantity / o.quantity;
+        _apply(Order(o.sender, o.subaccountID, o.marketID, o.isBuy, o.price, quantity, marginShare), o.price);
+        o.fillable -= quantity;
+    }
+
+    /// @notice Drop a resting order unfilled, as matching does when it fails a margin check; the
+    /// rest of its margin comes back.
+    function matchCancel(string calldata orderHash) external {
+        Resting storage o = _resting[keccak256(bytes(orderHash))];
+        uint256 refund = o.margin * o.fillable / o.quantity;
+        if (refund != 0) cash.mint(o.sender, _toCash(refund, false));
+        delete _resting[keccak256(bytes(orderHash))];
+    }
 
     function setCash(MockERC20 cash_) external {
         cash = cash_;

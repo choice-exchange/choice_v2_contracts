@@ -6,7 +6,8 @@ pragma solidity ^0.8.26;
 /// @dev Signatures taken from injective-core's abigen bindings
 /// (`injective-chain/modules/evm/precompiles/bindings/cosmos/precompile/exchange`):
 /// `createDerivativeMarketOrder` `0xb84857a1`, `subaccountPositions` `0x9bb15b3c`,
-/// `increasePositionMargin` `0x8ff96af4`. Kept apart from `IExchangeModule`, which the burn leg
+/// `increasePositionMargin` `0x8ff96af4`, `createDerivativeLimitOrder` `0x20c69837`,
+/// `cancelDerivativeOrder` `0x44b9bf3a`, `derivativeOrdersByHashes` `0xd6673c03`. Kept apart from `IExchangeModule`, which the burn leg
 /// uses and which stays exactly the two methods it needs.
 ///
 /// **What a caller must know:**
@@ -25,6 +26,15 @@ pragma solidity ^0.8.26;
 ///   and every credit to it is swept back to bank.
 /// - Only `buy`, `sell`, `buyPostOnly` and `sellPostOnly` order types exist here; atomic orders
 ///   cannot be sent through this precompile.
+/// - A POST-ONLY limit order is checked against the resting book when placed and reverts if it
+///   would cross; otherwise it rests at once, in the placing transaction, and
+///   `derivativeOrdersByHashes` sees it there. Its margin hold (margin plus price times quantity
+///   times the maker fee, if positive) leaves the bank balance at placement and the unfilled part
+///   comes back on cancel. A plain limit order waits in a transient store until the EndBlocker
+///   and is not visible until then. Limit orders never expire.
+/// - A resting order fills mostly in the EndBlocker; a fill lowers only its `fillable`. Matching
+///   can also CANCEL a resting order (failed margin check, open-notional cap), so an order missing
+///   from `derivativeOrdersByHashes` is not necessarily a filled one: read the position.
 interface IExchangeDerivatives {
     struct DerivativeOrder {
         string marketID;
@@ -49,6 +59,28 @@ interface IExchangeDerivatives {
         uint256 deltaExecutionMargin;
         uint256 deltaExecutionPrice;
         bool deltaIsLong;
+    }
+
+    struct CreateDerivativeLimitOrderResponse {
+        string orderHash;
+        string cid;
+    }
+
+    /// @param subaccountID the full 32-byte hex id; the nonce shorthand matches nothing
+    struct DerivativeOrdersRequest {
+        string marketID;
+        string subaccountID;
+        string[] orderHashes;
+    }
+
+    struct TrimmedDerivativeLimitOrder {
+        uint256 price;
+        uint256 quantity;
+        uint256 margin;
+        uint256 fillable;
+        bool isBuy;
+        string orderHash;
+        string cid;
     }
 
     struct DerivativePosition {
@@ -89,4 +121,27 @@ interface IExchangeDerivatives {
         external
         view
         returns (DerivativePosition[] memory positions);
+
+    function createDerivativeLimitOrder(address sender, DerivativeOrder calldata order)
+        external
+        returns (CreateDerivativeLimitOrderResponse memory response);
+
+    /// @param orderMask 1 (`ANY`) matches the order whatever its kind
+    /// @dev Reverts when the order does not exist (filled, cancelled, or cancelled by matching).
+    function cancelDerivativeOrder(
+        address sender,
+        string calldata marketID,
+        string calldata subaccountID,
+        string calldata orderHash,
+        int32 orderMask,
+        string calldata cid
+    ) external returns (bool success);
+
+    /// @dev The binding declares this nonpayable, but the precompile serves every query under
+    /// STATICCALL (it gates only its write methods on read-only), so it is declared `view` here.
+    /// Hashes not found are dropped: match the results by `orderHash`.
+    function derivativeOrdersByHashes(DerivativeOrdersRequest calldata request)
+        external
+        view
+        returns (TrimmedDerivativeLimitOrder[] memory orders);
 }

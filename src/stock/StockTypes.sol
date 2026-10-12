@@ -41,6 +41,7 @@ struct StockConfig {
     uint32 window; // the fill window the window caps apply to
     uint32 publicHedgeDelay; // how long after a hedge anyone, not only the keeper, may hedge
     uint32 restockDeadline;
+    uint32 makerTimeout; // how long a maker hedge may rest before anyone may replace it; zero = off
     bool weekendFills;
     bool overnightLive; // false: the overnight session is treated as closed, priced at the 20:00 close
     // -- caps
@@ -70,6 +71,8 @@ struct StockConfig {
 /// @param cashOwed and `stockOwed`: what the vault holds for fixing-lane requesters (inputs in
 /// escrow, outputs and refunds not yet claimed). Never the vault's: kept out of its value, its free
 /// cash and its stock.
+/// @param makerHash the resting maker hedge order, empty when there is none
+/// @param makerFillable what of it may still fill, 1e18 units, as last read back
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -99,6 +102,10 @@ struct StockState {
     uint256 lastSharePrice;
     uint128 cashOwed;
     uint128 stockOwed;
+    string makerHash;
+    bool makerSell;
+    uint64 makerPlacedAt;
+    uint256 makerFillable;
 }
 
 /// @notice The fixing lane's tunables, set by the owner inside the limits in `StockFixing`. A batch

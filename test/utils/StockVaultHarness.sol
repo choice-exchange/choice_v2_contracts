@@ -170,6 +170,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             window: 3600,
             publicHedgeDelay: 300,
             restockDeadline: 3600,
+            makerTimeout: 0,
             weekendFills: true,
             overnightLive: true,
             maxTrade: 5_000e6,

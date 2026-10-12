@@ -120,6 +120,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     error NotFillable(Refusal reason);
     error NotDepositor(address caller);
     error UnexpectedLock();
+    error NotKeeper();
 
     event PoolRegistered(PoolId indexed poolId, bool stockIsCurrency0);
     event FillRefused(Refusal reason);
@@ -318,6 +319,28 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             ? (f.amountIn.toInt256().toInt128(), -f.amountOut.toInt256().toInt128())
             : (-f.amountOut.toInt256().toInt128(), f.amountIn.toInt256().toInt128());
         return (ICLHooks.beforeSwap.selector, toBeforeSwapDelta(specified, unspecified), 0);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Maker hedging (see `StockLib.placeMaker`)
+    // -------------------------------------------------------------------------------------
+
+    /// @notice Rest a post-only hedge order at `price` for the gap `syncHedge` would cross the book
+    /// for, replacing any resting one. Keeper only.
+    /// @return placed whether an order went out (false inside the band)
+    function placeMaker(uint256 price) external nonReentrant returns (bool placed) {
+        StockLayout storage l = StockStorage.layout();
+        if (msg.sender != l.keeper) revert NotKeeper();
+        bool restockOpen =
+            l.issuer != address(0) && !l.state.restockHalted && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
+        return StockLib.placeMaker(l.config, l.state, _ctx(), restockOpen, price);
+    }
+
+    /// @notice Cancel the resting maker hedge: the keeper any time, anyone once it has rested
+    /// `makerTimeout`.
+    function cancelMaker() external nonReentrant {
+        StockLayout storage l = StockStorage.layout();
+        StockLib.cancelMaker(l.config, l.state, msg.sender == l.keeper);
     }
 
     // -------------------------------------------------------------------------------------
