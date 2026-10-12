@@ -25,6 +25,7 @@ import {MarketCalendar} from "../../src/stock/MarketCalendar.sol";
 import {PriceStore} from "../../src/stock/PriceStore.sol";
 import {StockPublic} from "../../src/stock/StockPublic.sol";
 import {StockAdmin} from "../../src/stock/StockAdmin.sol";
+import {StockRegistry} from "../../src/stock/StockRegistry.sol";
 import {StockVault} from "../../src/stock/StockVault.sol";
 import {Refusal, StockConfig} from "../../src/stock/StockTypes.sol";
 import {LazerBuilder} from "./LazerBuilder.sol";
@@ -60,6 +61,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     CLPoolManagerRouter internal router;
     PriceStore internal store;
     MarketCalendar internal calendar;
+    StockRegistry internal registry;
     StockVault internal sv;
     IStockVaultExtension internal x;
     MockERC20 internal cash;
@@ -86,6 +88,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
 
         store = new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
         calendar = new MarketCalendar(OWNER, GUARDIAN);
+        registry = new StockRegistry(OWNER);
         sv = new StockVault(
             StockVault.Init({
                 cash: IERC20(address(cash)),
@@ -94,6 +97,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
                 store: store,
                 calendar: calendar,
                 modules: address(new StockPublic(address(new StockAdmin()))),
+                registry: address(registry),
                 feedId: FEED,
                 marketId: MARKET,
                 owner: OWNER,
@@ -106,6 +110,8 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
         _price(MANTISSA);
 
         vm.startPrank(OWNER);
+        registry.setIssuerCap(ISSUER, 1_000_000e6);
+        registry.register(address(sv), address(stock), ISSUER, _cfg().maxInventory);
         x.setRoles(KEEPER, GUARDIAN, ISSUER);
         x.setDepositor(DEPOSITOR, true);
         key = PoolKey({
@@ -172,6 +178,8 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             publicHedgeDelay: 300,
             restockDeadline: 3600,
             makerTimeout: 0,
+            queueDeadline: 2 days,
+            exitFeeBps: 20,
             weekendFills: true,
             overnightLive: true,
             maxTrade: 5_000e6,
@@ -186,6 +194,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             cashReserve: 0,
             tvlCap: 1_000_000e6,
             restockDailyCap: 10_000e6,
+            minRedeem: 10e6,
             qtyTick: 1e15,
             priceTick: 1e16
         });

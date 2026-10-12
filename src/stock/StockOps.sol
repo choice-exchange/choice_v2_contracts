@@ -209,6 +209,10 @@ library StockOps {
         }
         if (c.restockDeadline == 0 || c.restockDeadline > StockLib.MAX_RESTOCK_DEADLINE) revert StockLib.BadConfig();
         if (c.makerTimeout > StockLib.MAX_MAKER_TIMEOUT) revert StockLib.BadConfig();
+        if (
+            c.exitFeeBps > StockLib.MAX_EXIT_FEE || c.queueDeadline < StockLib.MIN_QUEUE_DEADLINE
+                || c.queueDeadline > StockLib.MAX_QUEUE_DEADLINE
+        ) revert StockLib.BadConfig();
         if (c.targetInventory > c.maxInventory || c.qtyTick == 0 || c.priceTick == 0) revert StockLib.BadConfig();
     }
 

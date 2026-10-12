@@ -12,7 +12,17 @@ import {StockHedge} from "./StockHedge.sol";
 import {StockLib} from "./StockLib.sol";
 import {StockModule} from "./StockModule.sol";
 import {StockOps} from "./StockOps.sol";
-import {FixingConfig, StockConfig, StockContext, StockLayout, StockState, StockStorage} from "./StockTypes.sol";
+import {StockQuotes} from "./StockQuotes.sol";
+import {StockRegistry} from "./StockRegistry.sol";
+import {
+    FixingConfig,
+    IssuerQuote,
+    StockConfig,
+    StockContext,
+    StockLayout,
+    StockState,
+    StockStorage
+} from "./StockTypes.sol";
 
 /// @title StockAdmin
 /// @notice The last module in a `StockVault`'s chain: what the owner, the keeper and the guardian do.
@@ -29,6 +39,7 @@ contract StockAdmin is StockModule {
     event ConfigUpdated();
     event FixingConfigUpdated();
     event RolesUpdated(address keeper, address guardian, address issuer);
+    event QuoteSignerUpdated(address signer);
     event CalendarUpdated(address calendar);
     event DepositorUpdated(address indexed depositor, bool allowed);
     event AllowlistUpdated(bool on);
@@ -54,6 +65,11 @@ contract StockAdmin is StockModule {
     function placeMaker(uint256 price) external onlyKeeper nonReentrant returns (bool placed) {
         StockLayout storage l = StockStorage.layout();
         return StockHedge.placeMaker(l.config, l.state, l.ctx, _restockOpen(l), price);
+    }
+
+    /// @notice Fill a quote the issuer signed, both legs in this transaction. See `StockQuotes`.
+    function fillQuote(IssuerQuote calldata q, bytes calldata sig) external onlyKeeper nonReentrant {
+        StockQuotes.fill(StockStorage.layout(), q, sig);
     }
 
     /// @notice Add `bps` to every fill's spread for `duration` seconds (earnings, the open, news).
@@ -93,9 +109,13 @@ contract StockAdmin is StockModule {
     // Owner
     // -------------------------------------------------------------------------------------
 
+    /// @notice Set the tunables, inside the hard limits. The inventory cap is this vault's allocation
+    /// under its issuer, and the registry refuses one that would pass the issuer's cap.
     function setConfig(StockConfig calldata config_) external onlyOwner {
         StockOps.checkConfig(config_);
-        StockStorage.layout().config = config_;
+        StockLayout storage l = StockStorage.layout();
+        StockRegistry(l.registry).allocate(config_.maxInventory);
+        l.config = config_;
         emit ConfigUpdated();
     }
 
@@ -111,6 +131,12 @@ contract StockAdmin is StockModule {
         StockLayout storage l = StockStorage.layout();
         (l.keeper, l.guardian, l.issuer) = (keeper_, guardian_, issuer_);
         emit RolesUpdated(keeper_, guardian_, issuer_);
+    }
+
+    /// @notice Who signs issuer quotes. Replacing it voids every quote outstanding.
+    function setQuoteSigner(address signer) external onlyOwner {
+        StockStorage.layout().quoteSigner = signer;
+        emit QuoteSignerUpdated(signer);
     }
 
     function setCalendar(MarketCalendar calendar_) external onlyOwner {
@@ -150,11 +176,13 @@ contract StockAdmin is StockModule {
         emit NavAccepted();
     }
 
-    /// @notice Recover a token sent here by mistake. Never the cash or the stock: the owner cannot
-    /// take what depositors own.
+    /// @notice Recover a token sent here by mistake. Never the cash, the stock or the vault's own
+    /// shares (queued redemptions sit here in escrow): the owner cannot take what depositors own.
     function sweep(address token, address to, uint256 amount) external onlyOwner nonReentrant {
         StockContext storage ctx = StockStorage.layout().ctx;
-        if (token == Currency.unwrap(ctx.cash) || token == Currency.unwrap(ctx.stock)) revert ProtectedToken(token);
+        if (token == Currency.unwrap(ctx.cash) || token == Currency.unwrap(ctx.stock) || token == address(this)) {
+            revert ProtectedToken(token);
+        }
         if (to == address(0)) revert ZeroAddress();
         IERC20(token).safeTransfer(to, amount);
         emit Swept(token, to, amount);

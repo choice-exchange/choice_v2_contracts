@@ -42,6 +42,8 @@ struct StockConfig {
     uint32 publicHedgeDelay; // how long after a hedge anyone, not only the keeper, may hedge
     uint32 restockDeadline;
     uint32 makerTimeout; // how long a maker hedge may rest before anyone may replace it; zero = off
+    uint32 queueDeadline; // how long a redeem epoch may wait before anyone may settle it in kind
+    uint16 exitFeeBps; // charged on a queued exit's cash, kept by those who stay, to cover the unwind
     bool weekendFills;
     bool overnightLive; // false: the overnight session is treated as closed, priced at the 20:00 close
     // -- caps
@@ -57,6 +59,7 @@ struct StockConfig {
     uint96 cashReserve;
     uint96 tvlCap;
     uint96 restockDailyCap;
+    uint96 minRedeem; // smallest queued redemption, cash value
     // -- the perp market's ticks, 1e18 format
     uint64 qtyTick;
     uint64 priceTick;
@@ -71,6 +74,8 @@ struct StockConfig {
 /// @param cashOwed and `stockOwed`: what the vault holds for fixing-lane requesters (inputs in
 /// escrow, outputs and refunds not yet claimed). Never the vault's: kept out of its value, its free
 /// cash and its stock.
+/// @param debtOwed cash an in-kind redeem epoch is owed but not yet paid: out of the vault's value
+/// from the moment it is owed
 /// @param makerHash the resting maker hedge order, empty when there is none
 /// @param makerFillable what of it may still fill, 1e18 units, as last read back
 struct StockState {
@@ -102,6 +107,7 @@ struct StockState {
     uint256 lastSharePrice;
     uint128 cashOwed;
     uint128 stockOwed;
+    uint128 debtOwed;
     string makerHash;
     bool makerSell;
     uint64 makerPlacedAt;
@@ -161,6 +167,41 @@ struct FixingBatch {
     uint128 price;
     uint16 spreadBps;
     bool settled;
+}
+
+/// @notice A quote the issuer signs (EIP-712, domain = the vault) for one atomic restock.
+/// @param vaultBuys the vault pays `cash` for `stock`; otherwise it sells `stock` for `cash`
+struct IssuerQuote {
+    bool vaultBuys;
+    uint256 stock;
+    uint256 cash;
+    uint256 nonce;
+    uint64 expiry;
+}
+
+/// @notice One redeem epoch: every request queued while it was open, settled together.
+/// @param shares escrowed when the epoch closed; `sharesLeft` is what is still to claim
+/// @param cash and `stock`: what is left to claim, paid pro rata on what remains (the last claim
+/// takes the dust); `debt` is cash owed to an in-kind epoch until the short is cut
+/// @param status 0 open, 1 in kind and waiting for its debt, 2 settled
+struct RedeemEpoch {
+    uint128 shares;
+    uint128 sharesLeft;
+    uint128 cash;
+    uint128 stock;
+    uint128 debt;
+    uint64 openedAt;
+    uint8 status;
+}
+
+/// @notice A controller's place in the queue: its latest request, and what earlier settled ones left
+/// it to claim.
+struct RedeemAccount {
+    uint64 epoch;
+    uint128 shares;
+    uint128 claimShares;
+    uint128 claimCash;
+    uint128 claimStock;
 }
 
 struct FixingRequest {
@@ -257,6 +298,14 @@ struct StockLayout {
     uint256 nextRequestId;
     mapping(uint64 boundary => FixingBatch) batches;
     mapping(uint256 id => FixingRequest) requests;
+    address registry;
+    address quoteSigner;
+    mapping(uint256 nonce => bool) quoteUsed;
+    uint64 redeemEpoch;
+    uint64 unwinding;
+    mapping(uint64 epoch => RedeemEpoch) epochs;
+    mapping(address controller => RedeemAccount) redeems;
+    mapping(address controller => mapping(address operator => bool)) operators;
 }
 
 library StockStorage {

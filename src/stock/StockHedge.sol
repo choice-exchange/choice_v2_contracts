@@ -245,7 +245,8 @@ library StockHedge {
     /// @notice Cash, plus the booked stock (never more than is held) at the stored price, plus the
     /// short at margin plus PnL, plus the cash of an open restock order, plus the margin a resting
     /// maker order still holds (not its fee hold, which is small and may be a rebate). What the
-    /// vault holds for fixing-lane requesters is not its own and is left out. ⚠️ Funding reaches the margin only
+    /// vault holds for fixing-lane requesters, and what it owes an in-kind redeem epoch, is not its
+    /// own and is left out. ⚠️ Funding reaches the margin only
     /// when it settles; deposits and withdrawals settle it first.
     function value(StockState storage s, StockContext memory ctx) external view returns (uint256 total) {
         uint256 price = StockLib.markPrice(ctx);
@@ -262,5 +263,7 @@ library StockHedge {
                 total += StockLib.fromApi(ctx, Math.mulDiv(o.margin, o.fillable, o.quantity), Math.Rounding.Floor);
             }
         }
+        // An in-kind redeem epoch's unpaid debt is not the vault's, though the cash for it still is.
+        total = total > s.debtOwed ? total - s.debtOwed : 0;
     }
 }

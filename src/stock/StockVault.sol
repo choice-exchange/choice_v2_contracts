@@ -119,6 +119,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     error NotFillable(Refusal reason);
     error NotDepositor(address caller);
     error UnexpectedLock();
+    error NotSelf();
 
     event PoolRegistered(PoolId indexed poolId, bool stockIsCurrency0);
     event FillRefused(Refusal reason);
@@ -130,6 +131,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         IPriceStore store;
         MarketCalendar calendar;
         address modules;
+        address registry;
         uint32 feedId;
         string marketId;
         address owner;
@@ -146,7 +148,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             address(init.cash) == address(0) || address(init.stock) == address(0)
                 || address(init.poolManager) == address(0) || address(init.store) == address(0)
                 || address(init.calendar) == address(0) || init.modules.code.length == 0
-                || bytes(init.marketId).length == 0
+                || init.registry.code.length == 0 || bytes(init.marketId).length == 0
         ) revert ZeroAddress();
         StockOps.checkConfig(config_);
         POOL_MANAGER = init.poolManager;
@@ -171,6 +173,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             feedId: init.feedId
         });
         l.allowlistOn = true;
+        l.registry = init.registry;
         l.state.marketId = init.marketId;
         l.config = config_;
     }
@@ -336,6 +339,27 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     }
 
     // -------------------------------------------------------------------------------------
+    // Share escrow, for the redeem queue in the modules
+    // -------------------------------------------------------------------------------------
+
+    /// @notice Move `shares` of `owner_` into this contract's escrow for a queued redemption, spending
+    /// `spender`'s allowance unless it is the owner or the owner's operator. Callable only by this
+    /// contract itself, which is to say by its modules (`StockQueue` runs in them).
+    function escrowShares(address owner_, address spender, uint256 shares) external {
+        if (msg.sender != address(this)) revert NotSelf();
+        if (spender != owner_ && !StockStorage.layout().operators[owner_][spender]) {
+            _spendAllowance(owner_, spender, shares);
+        }
+        _transfer(owner_, address(this), shares);
+    }
+
+    /// @notice Burn escrowed shares as their epoch settles. Self only, as above.
+    function burnEscrowed(uint256 shares) external {
+        if (msg.sender != address(this)) revert NotSelf();
+        _burn(address(this), shares);
+    }
+
+    // -------------------------------------------------------------------------------------
     // ERC4626
     // -------------------------------------------------------------------------------------
 
@@ -398,7 +422,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
 
     /// @dev Virtual shares: a first depositor cannot inflate the share price against the next.
     function _decimalsOffset() internal pure override returns (uint8) {
-        return 6;
+        return StockLib.DECIMALS_OFFSET;
     }
 
     // -------------------------------------------------------------------------------------
@@ -413,11 +437,15 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         StockOps.checkSharePrice(l.config, l.state, _convertToAssets(10 ** decimals(), Math.Rounding.Floor));
     }
 
+    /// @dev Own cash above the reserve and above what the redeem queue is waiting for: the open
+    /// epoch's value and an in-kind epoch's unpaid debt. An instant withdrawal never takes cash a
+    /// queued one needs.
     function _freeCash() internal view returns (uint256) {
         StockLayout storage l = StockStorage.layout();
         uint256 cash = StockLib.ownCash(l.state, _ctx());
-        uint256 reserve = l.config.cashReserve;
-        return cash > reserve ? cash - reserve : 0;
+        uint256 held = l.config.cashReserve + l.state.debtOwed
+            + _convertToAssets(l.epochs[l.redeemEpoch].shares, Math.Rounding.Ceil);
+        return cash > held ? cash - held : 0;
     }
 
     /// @dev The fixed facts from immutables (no storage reads on the fill path) plus the calendar.

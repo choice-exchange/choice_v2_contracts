@@ -48,6 +48,11 @@ library StockLib {
     uint32 internal constant MAX_RESTOCK_DEADLINE = 1 days;
     uint32 internal constant RESTOCK_CAP_WINDOW = 1 days;
     uint32 internal constant MAX_MAKER_TIMEOUT = 1 days;
+    uint16 internal constant MAX_EXIT_FEE = 200;
+    /// @dev The vault's ERC-4626 virtual-share offset.
+    uint8 internal constant DECIMALS_OFFSET = 6;
+    uint32 internal constant MIN_QUEUE_DEADLINE = 1 hours;
+    uint32 internal constant MAX_QUEUE_DEADLINE = 14 days;
 
     /// @dev Transient: set only while the vault holds a Choice vault lock it opened itself.
     uint256 internal constant LOCK_OPEN_SLOT = 0x2c7f2a3e1b8d4c6f9e0a5b7c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e;

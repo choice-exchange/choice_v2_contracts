@@ -8,10 +8,14 @@ import {StockHedge} from "./StockHedge.sol";
 import {StockModule} from "./StockModule.sol";
 import {StockOps} from "./StockOps.sol";
 import {StockPricing} from "./StockPricing.sol";
+import {StockQueue} from "./StockQueue.sol";
+import {StockQuotes} from "./StockQuotes.sol";
 import {
     FixingBatch,
     FixingConfig,
     FixingRequest,
+    IssuerQuote,
+    RedeemEpoch,
     StockConfig,
     StockContext,
     StockLayout,
@@ -21,7 +25,7 @@ import {
 
 /// @title StockPublic
 /// @notice The first module in a `StockVault`'s chain: the views, the permissionless triggers (prices,
-/// the anchor, the hedge, restock settlement) and the fixing lane. A selector it does not know falls
+/// the anchor, the hedge, restock settlement), the fixing lane and the redeem queue. A selector it does not know falls
 /// through to `NEXT` (`StockAdmin`), so the vault's whole surface is this module plus the next, fixed at
 /// deployment. One deployment serves every vault.
 contract StockPublic is StockModule {
@@ -88,6 +92,49 @@ contract StockPublic is StockModule {
         return StockStorage.layout().requests[id];
     }
 
+    /// @notice The EIP-712 digest the quote signer signs for `q` on this vault.
+    function quoteDigest(IssuerQuote calldata q) external view delegated returns (bytes32) {
+        return StockQuotes.digest(q);
+    }
+
+    function quoteSigner() external view delegated returns (address) {
+        return StockStorage.layout().quoteSigner;
+    }
+
+    function registry() external view delegated returns (address) {
+        return StockStorage.layout().registry;
+    }
+
+    /// @notice ERC-7540: `controller`'s queued shares not yet settled (`requestId` is always 0).
+    function pendingRedeemRequest(uint256, address controller) external view delegated returns (uint256) {
+        return StockQueue.pending(StockStorage.layout(), controller);
+    }
+
+    /// @notice ERC-7540: `controller`'s settled shares, ready for `claimRedeem`.
+    function claimableRedeemRequest(uint256, address controller) external view delegated returns (uint256 shares) {
+        (shares,,) = StockQueue.claimable(StockStorage.layout(), controller);
+    }
+
+    /// @notice What `claimRedeem` would pay `controller` now.
+    function claimableRedeem(address controller) external view delegated returns (uint256 cashOut, uint256 stockOut) {
+        (, cashOut, stockOut) = StockQueue.claimable(StockStorage.layout(), controller);
+    }
+
+    function isOperator(address controller, address operator) external view delegated returns (bool) {
+        return StockStorage.layout().operators[controller][operator];
+    }
+
+    /// @notice The open epoch, the one in kind waiting for its debt (zero if none), and an epoch's state.
+    function redeemQueue(uint64 epoch)
+        external
+        view
+        delegated
+        returns (uint64 open, uint64 unwinding, RedeemEpoch memory e)
+    {
+        StockLayout storage l = StockStorage.layout();
+        return (l.redeemEpoch, l.unwinding, l.epochs[epoch]);
+    }
+
     // -------------------------------------------------------------------------------------
     // Permissionless
     // -------------------------------------------------------------------------------------
@@ -133,6 +180,53 @@ contract StockPublic is StockModule {
     function syncWindfall() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
         StockOps.syncWindfall(l.state, l.ctx);
+    }
+
+    // -------------------------------------------------------------------------------------
+    // Redeem queue (see `StockQueue`)
+    // -------------------------------------------------------------------------------------
+
+    /// @notice ERC-7540: queue `shares` of `owner` for `controller`. Returns request id 0.
+    function requestRedeem(uint256 shares, address controller, address owner)
+        external
+        delegated
+        nonReentrant
+        returns (uint256)
+    {
+        StockQueue.request(StockStorage.layout(), shares, controller, owner);
+        return 0;
+    }
+
+    /// @notice ERC-7540: let `operator` request and claim for the caller.
+    function setOperator(address operator, bool approved) external delegated returns (bool) {
+        StockQueue.setOperator(StockStorage.layout(), operator, approved);
+        return true;
+    }
+
+    /// @notice Settle the open epoch in cash, once the cash is there. Anyone.
+    function settleRedeems() external delegated nonReentrant {
+        StockQueue.settleCash(StockStorage.layout());
+    }
+
+    /// @notice Settle the open epoch in kind: the keeper any time, anyone once it is overdue.
+    function startInKind() external delegated nonReentrant {
+        StockLayout storage l = StockStorage.layout();
+        StockQueue.startInKind(l, msg.sender == l.keeper);
+    }
+
+    /// @notice Pay the in-kind epoch's debt, once the short is cut and the cash is back. Anyone.
+    function finishInKind() external delegated nonReentrant {
+        StockQueue.finishInKind(StockStorage.layout());
+    }
+
+    /// @notice Pay `controller`'s settled share to `receiver`. The controller or its operator.
+    function claimRedeem(address controller, address receiver)
+        external
+        delegated
+        nonReentrant
+        returns (uint256 cashOut, uint256 stockOut)
+    {
+        return StockQueue.claim(StockStorage.layout(), controller, receiver);
     }
 
     // -------------------------------------------------------------------------------------
