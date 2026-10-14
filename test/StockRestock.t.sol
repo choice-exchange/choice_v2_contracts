@@ -13,9 +13,9 @@ import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 /// LIMIT memo restocking, both directions: the memo the vault builds, the limit bands, what an order
 /// is worth in transit, and every way one closes (delivered, paid, refunded) without a halt.
 contract StockRestockTest is StockVaultHarness {
-    // {"offer":"<0x01>","request":"<0x02>","expiry_days":<0x03>}
+    // {"give":"<0x01>","want":"<0x02>","ttl":<0x03>}: any issuer format, placeholders where the numbers go
     bytes internal constant TEMPLATE =
-        hex"7b226f66666572223a2201222c2272657175657374223a2202222c226578706972795f64617973223a037d";
+        hex"7b2267697665223a2201222c2277616e74223a2202222c2274746c223a037d";
 
     function setUp() public override {
         super.setUp();
@@ -25,11 +25,11 @@ contract StockRestockTest is StockVaultHarness {
 
     function _memo(uint256 offer, uint256 request, uint256 expiry) internal pure returns (bytes memory) {
         return abi.encodePacked(
-            '{"offer":"',
+            '{"give":"',
             vm.toString(offer),
-            '","request":"',
+            '","want":"',
             vm.toString(request),
-            '","expiry_days":',
+            '","ttl":',
             vm.toString(expiry),
             "}"
         );
