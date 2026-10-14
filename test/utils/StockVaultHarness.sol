@@ -89,7 +89,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
         exchange = MockStockExchange(EXCHANGE);
         exchange.setCash(cash);
 
-        store = new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
+        store = _newStore();
         calendar = new MarketCalendar(OWNER, GUARDIAN);
         registry = new StockRegistry(OWNER);
         ratios = new StockRatios(OWNER, UPDATER);
@@ -152,6 +152,11 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
+
+    /// The price store every vault in the suite reads; a suite may swap in another kind.
+    function _newStore() internal virtual returns (PriceStore) {
+        return new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
+    }
 
     function _cfg() internal pure returns (StockConfig memory) {
         return StockConfig({

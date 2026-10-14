@@ -301,3 +301,33 @@ contract MockStockExchange {
         return up ? (api + cashScale - 1) / cashScale : api / cashScale;
     }
 }
+
+/// @notice Injective's oracle precompile at `0x67`, for PythPro prices quoted in USD: a price and the
+/// block time (seconds) it landed at, per feed key; a key never set reverts, as on chain.
+contract MockOraclePrecompile {
+    struct PricePairState {
+        uint256 pairPrice;
+        uint256 basePrice;
+        uint256 quotePrice;
+        uint256 baseCumulativePrice;
+        uint256 quoteCumulativePrice;
+        uint64 baseTimestamp;
+        uint64 quoteTimestamp;
+    }
+
+    mapping(bytes32 key => PricePairState) internal _states;
+
+    function set(string calldata base, uint256 price, uint64 landedAt) external {
+        _states[keccak256(bytes(base))] = PricePairState(price, price, 0, 0, 0, landedAt, landedAt);
+    }
+
+    function oraclePricePairState(uint8 oracleType, string calldata base, string calldata quote)
+        external
+        view
+        returns (PricePairState memory s)
+    {
+        require(oracleType == 14 && keccak256(bytes(quote)) == keccak256("USD"), "no price for oracle was found");
+        s = _states[keccak256(bytes(base))];
+        require(s.pairPrice != 0, "no price for oracle was found");
+    }
+}

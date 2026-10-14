@@ -37,7 +37,7 @@ contract PriceStore is IPriceStore, Ownable2Step {
     }
 
     /// @inheritdoc IPriceStore
-    function latest(uint32 feedId) external view returns (Price memory) {
+    function latest(uint32 feedId) external view virtual returns (Price memory) {
         return _prices[feedId];
     }
 
