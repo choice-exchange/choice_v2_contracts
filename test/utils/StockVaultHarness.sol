@@ -25,6 +25,7 @@ import {MarketCalendar} from "../../src/stock/MarketCalendar.sol";
 import {PriceStore} from "../../src/stock/PriceStore.sol";
 import {StockPublic} from "../../src/stock/StockPublic.sol";
 import {StockAdmin} from "../../src/stock/StockAdmin.sol";
+import {StockRatios} from "../../src/stock/StockRatios.sol";
 import {StockRegistry} from "../../src/stock/StockRegistry.sol";
 import {StockVault} from "../../src/stock/StockVault.sol";
 import {Refusal, StockConfig} from "../../src/stock/StockTypes.sol";
@@ -43,6 +44,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     address internal constant ISSUER = address(0x155E);
     address internal constant TRADER = address(0x7AD3);
     address internal constant DEPOSITOR = address(0xDE90);
+    address internal constant UPDATER = address(0x9A70);
     address internal constant EXCHANGE = 0x0000000000000000000000000000000000000065;
     uint256 internal constant SIGNER_KEY = 0x5161;
     uint32 internal constant FEED = 7;
@@ -62,6 +64,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     PriceStore internal store;
     MarketCalendar internal calendar;
     StockRegistry internal registry;
+    StockRatios internal ratios;
     StockVault internal sv;
     IStockVaultExtension internal x;
     MockERC20 internal cash;
@@ -89,6 +92,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
         store = new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
         calendar = new MarketCalendar(OWNER, GUARDIAN);
         registry = new StockRegistry(OWNER);
+        ratios = new StockRatios(OWNER, UPDATER);
         sv = new StockVault(
             StockVault.Init({
                 cash: IERC20(address(cash)),
@@ -98,6 +102,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
                 calendar: calendar,
                 modules: address(new StockPublic(address(new StockAdmin()))),
                 registry: address(registry),
+                ratios: ratios,
                 feedId: FEED,
                 marketId: MARKET,
                 owner: OWNER,
@@ -177,6 +182,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             window: 3600,
             publicHedgeDelay: 300,
             restockDeadline: 3600,
+            restockExpiryUnit: 1 days,
             makerTimeout: 0,
             queueDeadline: 2 days,
             exitFeeBps: 20,

@@ -43,6 +43,7 @@ contract StockFactoryTest is StockVaultHarness {
                 calendar: calendar,
                 modules: sv.MODULES(),
                 registry: registry,
+                ratios: ratios,
                 vaultOwner: TIMELOCK
             })
         );
@@ -124,6 +125,7 @@ contract StockFactoryTest is StockVaultHarness {
                 calendar: calendar,
                 modules: sv.MODULES(),
                 registry: address(registry),
+                ratios: ratios,
                 feedId: FEED,
                 marketId: MARKET,
                 owner: OWNER,

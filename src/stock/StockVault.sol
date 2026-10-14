@@ -29,6 +29,7 @@ import {
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
+import {IStockRatios} from "../interfaces/IStockRatios.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
 import {StockHedge} from "./StockHedge.sol";
 import {StockLib} from "./StockLib.sol";
@@ -59,8 +60,8 @@ import {
 /// contract, on its storage, which sits at one fixed slot (`StockStorage`). There is no trust boundary
 /// inside a vault, and none of them can be swapped out: their addresses are fixed at deployment.
 ///
-/// **What a depositor owns.** Shares of the cash, the booked stock at the stored price, the short at
-/// margin plus PnL, and the cash of an open restock order (`totalAssets`); never what the vault
+/// **What a depositor owns.** Shares of the cash, the booked stock at the stored price per token, the
+/// short at margin plus PnL, and an open restock order (`totalAssets`); never what the vault
 /// holds for fixing-lane requesters. Deposits and withdrawals
 /// are in cash, priced only while the market is open and the price fresh, after settling the
 /// short's funding into its margin. Withdrawals are paid from cash on hand above the reserve.
@@ -85,6 +86,10 @@ import {
 /// never touches the perp. Orders fill in the block's EndBlocker, so a short is confirmed from the
 /// position a block later and counts as unhedged until then.
 ///
+/// **Corporate actions.** Prices are per token: the feed's per-share price divided by the vault's
+/// tokens-per-share ratio. A split changes the ratio (announced in `RATIOS`) and the feed together; until
+/// the owner accepts the new ratio (`acceptAction`), every price is refused. See `StockPricing.acceptAction`.
+///
 /// **Roles.** The owner (a Safe behind a timelock) sets the tunables inside hard limits in
 /// `StockLib`, the roles and the issuer; it cannot sweep the cash or the stock, and the token, feed,
 /// market and pool are fixed. The keeper widens the spread, restocks within a daily cap and hedges
@@ -105,6 +110,8 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     /// @notice The first module of the chain every selector this contract does not know reaches.
     address public immutable MODULES;
     uint32 public immutable FEED_ID;
+    /// @notice Where tokens-per-share ratio changes are announced; zero when the owner alone sets them.
+    IStockRatios public immutable RATIOS;
     Currency internal immutable CASH;
     Currency internal immutable STOCK;
     uint8 internal immutable CASH_DECIMALS;
@@ -132,6 +139,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         MarketCalendar calendar;
         address modules;
         address registry;
+        IStockRatios ratios;
         uint32 feedId;
         string marketId;
         address owner;
@@ -156,6 +164,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         PRICE_STORE = init.store;
         MODULES = init.modules;
         FEED_ID = init.feedId;
+        RATIOS = init.ratios;
         CASH = Currency.wrap(address(init.cash));
         STOCK = Currency.wrap(address(init.stock));
         CASH_DECIMALS = IERC20Metadata(address(init.cash)).decimals();
@@ -170,7 +179,10 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             stockDecimals: STOCK_DECIMALS,
             store: init.store,
             calendar: init.calendar,
-            feedId: init.feedId
+            feedId: init.feedId,
+            tokenPerShare: uint56(StockLib.RATIO_ONE),
+            actionHalt: false,
+            ratios: init.ratios
         });
         l.allowlistOn = true;
         l.registry = init.registry;
@@ -237,9 +249,8 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         (MarketCalendar.Session session,) = ctx.calendar.sessionAt(block.timestamp);
         bool closed = session == MarketCalendar.Session.Closed
             || (session == MarketCalendar.Session.Overnight && !l.config.overnightLive);
-        bool restockOpen =
-            !closed && l.issuer != address(0) && !l.state.restockHalted && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
-        return StockLib.hedgeGap(l.config, l.state, ctx, StockLib.markPrice(ctx), restockOpen);
+        bool restockOpen = !closed && l.issuer != address(0) && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
+        return StockHedge.gapNow(l.config, l.state, ctx, restockOpen);
     }
 
     // -------------------------------------------------------------------------------------
@@ -448,8 +459,10 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return cash > held ? cash - held : 0;
     }
 
-    /// @dev The fixed facts from immutables (no storage reads on the fill path) plus the calendar.
+    /// @dev The fixed facts from immutables plus the calendar, the ratio and the action halt, which
+    /// share one storage slot: one read on the fill path.
     function _ctx() internal view returns (StockContext memory) {
+        StockContext storage stored = StockStorage.layout().ctx;
         return StockContext({
             vault: VAULT,
             cash: CASH,
@@ -457,8 +470,11 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             cashDecimals: CASH_DECIMALS,
             stockDecimals: STOCK_DECIMALS,
             store: PRICE_STORE,
-            calendar: StockStorage.layout().ctx.calendar,
-            feedId: FEED_ID
+            calendar: stored.calendar,
+            feedId: FEED_ID,
+            tokenPerShare: stored.tokenPerShare,
+            actionHalt: stored.actionHalt,
+            ratios: RATIOS
         });
     }
 }

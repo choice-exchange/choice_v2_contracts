@@ -30,6 +30,8 @@ interface IStockVaultExtension {
     function quoteDigest(IssuerQuote calldata q) external view returns (bytes32);
     function quoteSigner() external view returns (address);
     function registry() external view returns (address);
+    function restockMemo() external view returns (bytes memory);
+    function actionPending() external view returns (bool);
     function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256);
     function claimableRedeemRequest(uint256 requestId, address controller) external view returns (uint256);
     function claimableRedeem(address controller) external view returns (uint256 cashOut, uint256 stockOut);
@@ -45,6 +47,7 @@ interface IStockVaultExtension {
     function topUpMargin() external;
     function settleRestock() external;
     function syncWindfall() external;
+    function syncRatio() external;
 
     // redeem queue
     function requestRedeem(uint256 shares, address controller, address owner) external returns (uint256);
@@ -62,13 +65,14 @@ interface IStockVaultExtension {
     function claimFixing(uint256 id) external returns (uint256 out, uint256 refund);
 
     // keeper (and pausers)
-    function restock(uint256 cash, uint256 minStockOut, bytes calldata memo) external;
+    function restock(bool sell, uint256 amountIn, uint256 limitOut, uint16 expiryUnits) external;
     function placeMaker(uint256 price) external returns (bool placed);
     function fillQuote(IssuerQuote calldata q, bytes calldata sig) external;
     function widen(uint16 bps, uint32 duration) external;
     function toClaims(bool isCash, uint256 amount) external;
     function fromClaims(bool isCash, uint256 amount) external;
     function pause(uint8 flags) external;
+    function haltAction() external;
 
     // owner
     function setConfig(StockConfig calldata config_) external;
@@ -80,7 +84,9 @@ interface IStockVaultExtension {
     function setDepositor(address depositor, bool allowed) external;
     function setCurveOpen(bool open) external;
     function unpause(uint8 flags) external;
-    function clearRestockHalt() external;
+    function acceptAction(uint56 ratio, uint16 maxMoveBps) external;
+    function migrateMarket(string calldata marketId_) external;
+    function setRestockMemo(bytes calldata memo) external;
     function acceptNav() external;
     function sweep(address token, address to, uint256 amount) external;
 }

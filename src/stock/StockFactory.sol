@@ -14,6 +14,7 @@ import {PoolKey} from "infinity-core/src/types/PoolKey.sol";
 
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
+import {IStockRatios} from "../interfaces/IStockRatios.sol";
 import {StockRegistry} from "./StockRegistry.sol";
 import {StockVault} from "./StockVault.sol";
 import {StockConfig} from "./StockTypes.sol";
@@ -25,7 +26,8 @@ import {StockConfig} from "./StockTypes.sol";
 /// **The same code.** The vault's creation code (about 28 KB) cannot sit inside a contract's runtime,
 /// so the owner passes it with each deployment and the factory refuses any whose hash is not
 /// `VAULT_CODE_HASH`. The libraries are linked into that code, so the hash pins them too; the modules,
-/// the price store, the calendar, the registry, the pool manager and the cash token are pinned here.
+/// the price store, the calendar, the registry, the ratio registry, the pool manager and the cash token
+/// are pinned here.
 /// What varies per vault is the stock token, its issuer, its feed and perp market, its names, its
 /// config and its pool's fee, spacing and starting price.
 ///
@@ -47,6 +49,7 @@ contract StockFactory is Ownable2Step {
         MarketCalendar calendar;
         address modules;
         StockRegistry registry;
+        IStockRatios ratios;
         address vaultOwner;
     }
 
@@ -69,6 +72,7 @@ contract StockFactory is Ownable2Step {
     MarketCalendar public immutable CALENDAR;
     address public immutable MODULES;
     StockRegistry public immutable REGISTRY;
+    IStockRatios public immutable RATIOS;
     address public immutable VAULT_OWNER;
 
     error WrongCode();
@@ -90,6 +94,7 @@ contract StockFactory is Ownable2Step {
         CALENDAR = p.calendar;
         MODULES = p.modules;
         REGISTRY = p.registry;
+        RATIOS = p.ratios;
         VAULT_OWNER = p.vaultOwner;
     }
 
@@ -109,6 +114,7 @@ contract StockFactory is Ownable2Step {
             calendar: CALENDAR,
             modules: MODULES,
             registry: address(REGISTRY),
+            ratios: RATIOS,
             feedId: x.feedId,
             marketId: x.marketId,
             owner: address(this),

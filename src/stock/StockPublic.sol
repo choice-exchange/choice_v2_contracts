@@ -6,10 +6,11 @@ import {Currency} from "infinity-core/src/types/Currency.sol";
 import {StockFixing} from "./StockFixing.sol";
 import {StockHedge} from "./StockHedge.sol";
 import {StockModule} from "./StockModule.sol";
-import {StockOps} from "./StockOps.sol";
+import {StockLib} from "./StockLib.sol";
 import {StockPricing} from "./StockPricing.sol";
 import {StockQueue} from "./StockQueue.sol";
 import {StockQuotes} from "./StockQuotes.sol";
+import {StockRestock} from "./StockRestock.sol";
 import {
     FixingBatch,
     FixingConfig,
@@ -105,6 +106,15 @@ contract StockPublic is StockModule {
         return StockStorage.layout().registry;
     }
 
+    function restockMemo() external view delegated returns (bytes memory) {
+        return StockStorage.layout().restockMemo;
+    }
+
+    /// @notice Whether a corporate action is pending: halted, or a ratio announced but not accepted.
+    function actionPending() external view delegated returns (bool) {
+        return StockLib.actionPending(StockStorage.layout().ctx);
+    }
+
     /// @notice ERC-7540: `controller`'s queued shares not yet settled (`requestId` is always 0).
     function pendingRedeemRequest(uint256, address controller) external view delegated returns (uint256) {
         return StockQueue.pending(StockStorage.layout(), controller);
@@ -170,16 +180,27 @@ contract StockPublic is StockModule {
         StockHedge.topUpMargin(l.config, l.state, l.ctx);
     }
 
-    /// @notice Book the open restock order's delivery, or expire it past its deadline.
+    /// @notice Close the open restock order on what has arrived; the keeper any time, anyone past its
+    /// deadline. See `StockRestock.settle`.
     function settleRestock() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockOps.settleRestock(l.state, l.ctx);
+        StockRestock.settle(l.state, l.ctx, msg.sender == l.keeper);
     }
 
     /// @notice Book stock that arrived with no order open.
     function syncWindfall() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockOps.syncWindfall(l.state, l.ctx);
+        StockRestock.syncWindfall(l.state, l.ctx);
+    }
+
+    /// @notice Make a ratio the registry announces a standing halt, so the vault stays halted until
+    /// the owner accepts it even if the announcement is withdrawn. Anyone.
+    function syncRatio() external delegated {
+        StockContext storage ctx = StockStorage.layout().ctx;
+        if (!ctx.actionHalt && StockLib.actionPending(ctx)) {
+            ctx.actionHalt = true;
+            emit ActionHalted(msg.sender);
+        }
     }
 
     // -------------------------------------------------------------------------------------

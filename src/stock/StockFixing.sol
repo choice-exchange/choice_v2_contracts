@@ -169,7 +169,7 @@ library StockFixing {
 
         IPriceStore.Price memory p = ctx.store.verify(update, ctx.feedId);
         if (p.timestampUs != uint256(b.tickMs) * 1000) revert WrongTick(p.timestampUs, uint256(b.tickMs) * 1000);
-        uint256 price = StockLib.toWad(p.price, p.exponent);
+        uint256 price = StockLib.perToken(ctx, StockLib.toWad(p.price, p.exponent));
         Refusal why = _check(c, s, ctx, p, price, b.tickMs / 1000);
         if (why != Refusal.None) revert FixingRefused(why);
 
@@ -213,6 +213,7 @@ library StockFixing {
         if (price == 0 || uint256(p.feedTimestampUs) + uint256(c.maxAgeMs) * 1000 < p.timestampUs) {
             return Refusal.Stale;
         }
+        if (StockLib.actionPending(ctx)) return Refusal.Action;
         if (!_open(c, ctx, tick)) return Refusal.Closed;
         if (p.flags & PythLazerLib.HAS_SESSION != 0 && p.marketSession == PythLazerLib.SESSION_CLOSED) {
             return Refusal.Halted;

@@ -45,7 +45,11 @@ library StockLib {
     uint32 internal constant MAX_CLOSE_TOLERANCE = 1 hours;
     uint32 internal constant MIN_WINDOW = 1 minutes;
     uint32 internal constant MIN_REANCHOR_DELAY = 1 minutes;
-    uint32 internal constant MAX_RESTOCK_DEADLINE = 1 days;
+    uint32 internal constant MAX_RESTOCK_DEADLINE = 2 days;
+    /// @dev The longest a restock order may ask the issuer to keep it open.
+    uint32 internal constant MAX_ORDER_LIFE = 7 days;
+    uint32 internal constant MIN_EXPIRY_UNIT = 1 minutes;
+    uint32 internal constant MAX_EXPIRY_UNIT = 1 days;
     uint32 internal constant RESTOCK_CAP_WINDOW = 1 days;
     uint32 internal constant MAX_MAKER_TIMEOUT = 1 days;
     uint16 internal constant MAX_EXIT_FEE = 200;
@@ -59,10 +63,20 @@ library StockLib {
     uint8 internal constant OP_TO_CLAIMS = 1;
     uint8 internal constant OP_FROM_CLAIMS = 2;
 
+    /// @dev `tokenPerShare` for one token per share, and the range a vault accepts (as `StockRatios`).
+    uint256 internal constant RATIO_ONE = 1e12;
+    uint256 internal constant MIN_RATIO = 1e6;
+    uint256 internal constant MAX_RATIO = 1e16;
+    /// @dev The most the price per token may move across an accepted corporate action. A correct
+    /// acceptance leaves it where it was; a ratio accepted before the feed moved (or after the wrong
+    /// one) moves it by the split factor: 33% for a 3:2, 50% for a 2:1.
+    uint16 internal constant MAX_ACTION_MOVE = 3000;
+
     error BadConfig();
     error PriceNotUsable(Refusal reason);
     error OracleMissing();
     error CashShort(uint256 needed, uint256 own);
+    error RestockCapExceeded(uint256 wanted, uint256 remaining);
 
     // -------------------------------------------------------------------------------------
     // The reference price
@@ -73,7 +87,9 @@ library StockLib {
         return referencePrice(c, ctx, ctx.store.latest(ctx.feedId));
     }
 
-    /// @notice The reference price, the session, and whether a call may act on them.
+    /// @notice The reference price per token, the session, and whether a call may act on them. A
+    /// pending corporate action refuses every reference (`Refusal.Action`), so nothing that prices off
+    /// one runs until the owner accepts it.
     function referencePrice(StockConfig storage c, StockContext memory ctx, IPriceStore.Price memory p)
         internal
         view
@@ -82,9 +98,14 @@ library StockLib {
         (r.session, r.sessionStart) = ctx.calendar.sessionAt(block.timestamp);
         r.closed = r.session == MarketCalendar.Session.Closed
             || (r.session == MarketCalendar.Session.Overnight && !c.overnightLive);
-        r.price = toWad(p.price, p.exponent);
+        r.sharePrice = toWad(p.price, p.exponent);
+        r.price = perToken(ctx, r.sharePrice);
         if (r.price == 0) {
             r.reason = Refusal.Stale;
+            return r;
+        }
+        if (actionPending(ctx)) {
+            r.reason = Refusal.Action;
             return r;
         }
         // 🔴 Judge the FEED's own time: a shut market's feed rides every fresh batch.
@@ -120,6 +141,21 @@ library StockLib {
         if (r.closed) revert PriceNotUsable(Refusal.Closed);
     }
 
+    /// @notice Revert if `price` is a jump from the anchor: a restock never trades on one.
+    function requireAnchored(StockConfig storage c, StockState storage s, uint256 price) internal view {
+        if (s.anchorPrice != 0 && deviationBps(price, s.anchorPrice) > c.maxJumpBps) {
+            revert PriceNotUsable(Refusal.Jump);
+        }
+    }
+
+    /// @notice A corporate action is pending: halted by hand, or the registry announces a ratio other
+    /// than the one the vault accepted.
+    function actionPending(StockContext memory ctx) internal view returns (bool) {
+        return ctx.actionHalt
+            || (address(ctx.ratios) != address(0)
+                && ctx.ratios.tokenPerShare(Currency.unwrap(ctx.stock)) != ctx.tokenPerShare);
+    }
+
     // -------------------------------------------------------------------------------------
     // The hedge gap
     // -------------------------------------------------------------------------------------
@@ -133,10 +169,11 @@ library StockLib {
         uint256 price,
         bool restockOpen
     ) internal view returns (int256) {
+        // A restock order counts as held both ways: a buy's stock is on its way, a sell's is still ours.
         uint256 units = toUnits(s.stockBooked, ctx.stockDecimals);
-        if (s.orderOpen) units += toUnits(s.orderMinOut, ctx.stockDecimals);
+        if (s.orderOpen) units += toUnits(s.orderStock, ctx.stockDecimals);
         if (restockOpen) {
-            uint256 held = stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor) + (s.orderOpen ? s.orderCash : 0);
+            uint256 held = stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor) + orderValue(s, ctx, price);
             if (c.targetInventory > held) {
                 uint256 used = block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW ? 0 : s.restockUsed;
                 uint256 room = c.restockDailyCap > used ? c.restockDailyCap - used : 0;
@@ -146,7 +183,7 @@ library StockLib {
                 units += cashToUnits(ctx, gapCash, price);
             }
         }
-        return units.toInt256() - s.shortConfirmed;
+        return toShares(ctx, units).toInt256() - s.shortConfirmed;
     }
 
     // -------------------------------------------------------------------------------------
@@ -157,11 +194,49 @@ library StockLib {
         return block.timestamp >= uint256(s.windowStart) + c.window ? 0 : s.windowUsed;
     }
 
-    /// @dev The stored price for valuation: any age, but it must exist.
-    function markPrice(StockContext memory ctx) internal view returns (uint256 price) {
+    /// @dev The stored price per token for valuation: any age, but it must exist.
+    function markPrice(StockContext memory ctx) internal view returns (uint256) {
+        return perToken(ctx, markSharePrice(ctx));
+    }
+
+    /// @dev The stored price per share, as the perp marks it: any age, but it must exist.
+    function markSharePrice(StockContext memory ctx) internal view returns (uint256 price) {
         IPriceStore.Price memory p = ctx.store.latest(ctx.feedId);
         price = toWad(p.price, p.exponent);
         if (price == 0) revert OracleMissing();
+    }
+
+    /// @dev A per-share price as a per-token price.
+    function perToken(StockContext memory ctx, uint256 sharePrice) internal pure returns (uint256) {
+        return Math.mulDiv(sharePrice, RATIO_ONE, ctx.tokenPerShare);
+    }
+
+    /// @dev 1e18 token units as 1e18 share units, the perp's.
+    function toShares(StockContext memory ctx, uint256 tokenUnits) internal pure returns (uint256) {
+        return Math.mulDiv(tokenUnits, RATIO_ONE, ctx.tokenPerShare);
+    }
+
+    /// @dev What the open restock order is worth: a buy's cash, or a sell's stock at `price`.
+    function orderValue(StockState storage s, StockContext memory ctx, uint256 price) internal view returns (uint256) {
+        if (!s.orderOpen) return 0;
+        return s.orderSell ? stockToCash(ctx, s.orderStock, price, Math.Rounding.Floor) : s.orderCash;
+    }
+
+    /// @dev Count `cash` against the daily restock cap, shared by memo orders and quotes.
+    function countRestock(StockConfig storage c, StockState storage s, uint256 cash) internal {
+        if (block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW) {
+            s.restockWindowStart = uint64(block.timestamp);
+            s.restockUsed = 0;
+        }
+        uint256 remaining = c.restockDailyCap > s.restockUsed ? c.restockDailyCap - s.restockUsed : 0;
+        if (cash > remaining) revert RestockCapExceeded(cash, remaining);
+        s.restockUsed += cash.toUint96();
+    }
+
+    /// @dev Stock held beyond the booked stock and what is held for fixing-lane requesters.
+    function unbooked(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        uint256 held = ownStock(s, ctx);
+        return held > s.stockBooked ? held - s.stockBooked : 0;
     }
 
     /// @dev A Lazer mantissa and exponent as 1e18 per unit; zero for a missing or negative price.

@@ -12,7 +12,9 @@ import {StockHedge} from "./StockHedge.sol";
 import {StockLib} from "./StockLib.sol";
 import {StockModule} from "./StockModule.sol";
 import {StockOps} from "./StockOps.sol";
+import {StockPricing} from "./StockPricing.sol";
 import {StockQuotes} from "./StockQuotes.sol";
+import {StockRestock} from "./StockRestock.sol";
 import {StockRegistry} from "./StockRegistry.sol";
 import {
     FixingConfig,
@@ -44,7 +46,9 @@ contract StockAdmin is StockModule {
     event DepositorUpdated(address indexed depositor, bool allowed);
     event AllowlistUpdated(bool on);
     event CurveOpenUpdated(bool open);
-    event RestockHaltCleared();
+    event ActionAccepted(uint256 tokenPerShare);
+    event MarketMigrated(string marketId);
+    event RestockMemoSet(bytes memo);
     event NavAccepted();
     event Swept(address indexed token, address indexed to, uint256 amount);
 
@@ -52,11 +56,16 @@ contract StockAdmin is StockModule {
     // Keeper
     // -------------------------------------------------------------------------------------
 
-    /// @notice Order `cash` of stock from the issuer, `memo` appended to the transfer (the issuer's
-    /// order format), expecting at least `minStockOut` by the deadline. See `StockOps.restock`.
-    function restock(uint256 cash, uint256 minStockOut, bytes calldata memo) external onlyKeeper nonReentrant {
+    /// @notice Send the issuer a LIMIT order: `amountIn` of cash for at least `limitOut` stock, or
+    /// (`sell`) `amountIn` of stock for at least `limitOut` cash, open `expiryUnits` of the issuer's
+    /// expiry unit. See `StockRestock.order`.
+    function restock(bool sell, uint256 amountIn, uint256 limitOut, uint16 expiryUnits)
+        external
+        onlyKeeper
+        nonReentrant
+    {
         StockLayout storage l = StockStorage.layout();
-        StockOps.restock(l.config, l.state, l.ctx, l.issuer, _restockOpen(l), cash, minStockOut, memo);
+        StockRestock.order(l, _restockOpen(l), sell, amountIn, limitOut, expiryUnits);
     }
 
     /// @notice Rest a post-only hedge order at `price` for the gap `syncHedge` would cross the book
@@ -99,10 +108,17 @@ contract StockAdmin is StockModule {
     /// @notice Pause `flags` (fills 1, deposits 2, withdrawals 4, restock 8, fixing 16). Guardian,
     /// keeper or owner. A fixing batch that cannot settle while paused lapses and is refunded.
     function pause(uint8 flags) external delegated {
-        StockLayout storage l = StockStorage.layout();
-        if (msg.sender != l.guardian && msg.sender != l.keeper && msg.sender != _owner()) revert NotPauser();
-        l.state.paused |= flags;
+        _pauser();
+        StockStorage.layout().state.paused |= flags;
         emit Paused(flags, msg.sender);
+    }
+
+    /// @notice Halt the vault for a corporate action (a split, a merger, a delisting): every price is
+    /// refused until the owner accepts it. Guardian, keeper or owner.
+    function haltAction() external delegated {
+        _pauser();
+        StockStorage.layout().ctx.actionHalt = true;
+        emit ActionHalted(msg.sender);
     }
 
     // -------------------------------------------------------------------------------------
@@ -165,9 +181,29 @@ contract StockAdmin is StockModule {
         emit Unpaused(flags);
     }
 
-    function clearRestockHalt() external onlyOwner {
-        StockStorage.layout().state.restockHalted = false;
-        emit RestockHaltCleared();
+    /// @notice End a corporate-action halt at `ratio` tokens per share (1e12 = one), the anchor moved to
+    /// the stored price at it in the same call. With a registry, `ratio` must be the one it announces;
+    /// the price per token may have moved at most `maxMoveBps` from the anchor (see `StockPricing`).
+    function acceptAction(uint56 ratio, uint16 maxMoveBps) external onlyOwner nonReentrant {
+        StockLayout storage l = StockStorage.layout();
+        StockPricing.acceptAction(l.config, l.state, l.ctx, ratio, maxMoveBps);
+        emit ActionAccepted(ratio);
+    }
+
+    /// @notice Move the short to a new perp market, as when the old one is settled ahead of a split.
+    /// Only while halted, and with no position, pending hedge or maker order on the old one.
+    function migrateMarket(string calldata marketId_) external onlyOwner nonReentrant {
+        StockLayout storage l = StockStorage.layout();
+        StockHedge.migrateMarket(l.state, l.ctx, marketId_);
+        emit MarketMigrated(marketId_);
+    }
+
+    /// @notice The issuer's order memo, with placeholder bytes 0x01 (amount offered), 0x02 (amount
+    /// asked for) and 0x03 (expiry in units), each exactly once. Empty stops memo restocking.
+    function setRestockMemo(bytes calldata memo) external onlyOwner {
+        if (memo.length != 0) StockRestock.checkMemo(memo);
+        StockStorage.layout().restockMemo = memo;
+        emit RestockMemoSet(memo);
     }
 
     /// @notice Accept the current share price after a person has looked at a NAV jump.

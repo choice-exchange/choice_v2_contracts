@@ -178,7 +178,7 @@ contract StockQuotesTest is StockVaultHarness {
         IssuerQuote memory big = _quote(true, 34 ether, 10_200e6);
         bytes memory sig = _sign(QUOTE_KEY, big);
         vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockQuotes.RestockCapExceeded.selector, 10_200e6, 10_000e6));
+        vm.expectRevert(abi.encodeWithSelector(StockLib.RestockCapExceeded.selector, 10_200e6, 10_000e6));
         x.fillQuote(big, sig);
 
         StockConfig memory c = _cfg();

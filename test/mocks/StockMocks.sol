@@ -283,6 +283,16 @@ contract MockStockExchange {
     }
 
     /// @notice Cut a position, as a liquidation would.
+    /// @notice As a governance forced settlement: close the position at `price`, margin plus PnL paid
+    /// to `holder`'s bank balance.
+    function forceSettle(string calldata subaccountID, string calldata market, uint256 price, address holder) external {
+        Position storage p = _positions[keccak256(bytes(subaccountID))][keccak256(bytes(market))];
+        int256 move = p.isLong ? int256(price) - int256(p.entryPrice) : int256(p.entryPrice) - int256(price);
+        int256 payout = int256(p.margin) + p.unsettledFunding + move * int256(p.quantity) / 1e18;
+        (p.quantity, p.margin, p.unsettledFunding) = (0, 0, 0);
+        if (payout > 0) cash.mint(holder, _toCash(uint256(payout), false));
+    }
+
     function setQuantity(string calldata subaccountID, string calldata market, uint256 quantity) external {
         _positions[keccak256(bytes(subaccountID))][keccak256(bytes(market))].quantity = quantity;
     }

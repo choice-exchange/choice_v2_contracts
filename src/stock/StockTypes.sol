@@ -6,6 +6,7 @@ import {Currency} from "infinity-core/src/types/Currency.sol";
 import {PoolId} from "infinity-core/src/types/PoolId.sol";
 
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
+import {IStockRatios} from "../interfaces/IStockRatios.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
 
 /// @notice A stock vault's tunables. The owner sets them inside hard limits that `StockLib`
@@ -40,7 +41,8 @@ struct StockConfig {
     uint32 reanchorWide;
     uint32 window; // the fill window the window caps apply to
     uint32 publicHedgeDelay; // how long after a hedge anyone, not only the keeper, may hedge
-    uint32 restockDeadline;
+    uint32 restockDeadline; // after a restock order's expiry, how long before anyone may close it
+    uint32 restockExpiryUnit; // seconds per unit of a restock order's expiry, as the issuer counts it
     uint32 makerTimeout; // how long a maker hedge may rest before anyone may replace it; zero = off
     uint32 queueDeadline; // how long a redeem epoch may wait before anyone may settle it in kind
     uint16 exitFeeBps; // charged on a queued exit's cash, kept by those who stay, to cover the unwind
@@ -76,6 +78,10 @@ struct StockConfig {
 /// cash and its stock.
 /// @param debtOwed cash an in-kind redeem epoch is owed but not yet paid: out of the vault's value
 /// from the moment it is owed
+/// @param orderSell the open restock order sells stock; otherwise it buys
+/// @param orderCash a buy's cash sent, or a sell's cash asked for (its limit)
+/// @param orderStock a buy's stock asked for (its limit), or a sell's stock sent
+/// @param orderDeadline when anyone may close the open order: its expiry plus `restockDeadline`
 /// @param makerHash the resting maker hedge order, empty when there is none
 /// @param makerFillable what of it may still fill, 1e18 units, as last read back
 struct StockState {
@@ -84,7 +90,6 @@ struct StockState {
     bool poolRegistered;
     bool stockIsCurrency0;
     bool curveOpen;
-    bool restockHalted;
     uint8 paused;
     uint128 anchorPrice;
     uint64 jumpSince;
@@ -99,9 +104,10 @@ struct StockState {
     uint64 hedgeBlock;
     uint64 lastHedgeTime;
     bool orderOpen;
+    bool orderSell;
     uint64 orderDeadline;
     uint96 orderCash;
-    uint128 orderMinOut;
+    uint128 orderStock;
     uint64 restockWindowStart;
     uint96 restockUsed;
     uint256 lastSharePrice;
@@ -212,6 +218,10 @@ struct FixingRequest {
 }
 
 /// @notice What `StockLib` needs of the vault it runs inside.
+/// @param tokenPerShare how many stock tokens make one share of the feed and the perp, `StockLib.RATIO_ONE`
+/// = one; it changes only when the owner accepts a corporate action
+/// @param actionHalt a corporate action is pending: every reference is refused until the owner accepts it
+/// @param ratios where ratio changes are announced; zero when the owner alone sets them
 struct StockContext {
     IVault vault;
     Currency cash;
@@ -221,14 +231,19 @@ struct StockContext {
     IPriceStore store;
     MarketCalendar calendar;
     uint32 feedId;
+    uint56 tokenPerShare;
+    bool actionHalt;
+    IStockRatios ratios;
 }
 
 /// @notice The price a call may act on, and whether it may.
-/// @param price 1e18 cash per whole stock unit
+/// @param price 1e18 cash per whole stock token
+/// @param sharePrice 1e18 cash per share, as the feed and the perp quote it
 /// @param closed the market is closed for this vault (weekend mode)
 /// @param sessionStart when the current session began; for a closed market, the close
 struct Reference {
     uint256 price;
+    uint256 sharePrice;
     uint256 ageMs;
     uint256 quoteBps;
     uint256 confidenceBps;
@@ -277,14 +292,17 @@ enum Refusal {
     Reserve,
     Unhedged,
     Deficit,
-    PriceLimit
+    PriceLimit,
+    Action
 }
 
 /// @notice Everything a stock vault stores besides its share token and owner, at one fixed slot,
 /// so the vault and its modules (`StockPublic`, `StockAdmin`, reached through the vault's fallback by
 /// DELEGATECALL) read the same storage without sharing an inheritance chain.
 /// @param ctx the vault's fixed facts, copied from its immutables at construction for the
-/// modules' use; only `ctx.calendar` ever changes (`setCalendar`)
+/// modules' use; only the calendar, the ratio and the action halt ever change
+/// @param restockMemo the issuer's order memo with three placeholder bytes, 0x01 the amount offered,
+/// 0x02 the amount asked for and 0x03 the expiry in units, filled in by the vault on each order
 struct StockLayout {
     StockContext ctx;
     address keeper;
@@ -306,6 +324,7 @@ struct StockLayout {
     mapping(uint64 epoch => RedeemEpoch) epochs;
     mapping(address controller => RedeemAccount) redeems;
     mapping(address controller => mapping(address operator => bool)) operators;
+    bytes restockMemo;
 }
 
 library StockStorage {

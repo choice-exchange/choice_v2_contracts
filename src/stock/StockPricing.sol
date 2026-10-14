@@ -5,6 +5,7 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {TickMath} from "infinity-core/src/pool-cl/libraries/TickMath.sol";
+import {Currency} from "infinity-core/src/types/Currency.sol";
 
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
@@ -22,6 +23,10 @@ library StockPricing {
     event Anchored(uint256 price);
     event JumpSeen(uint256 price, uint256 anchor);
     event Reanchored(uint256 price, uint256 wideUntil);
+
+    error NoActionPending();
+    error BadRatio(uint256 ratio, uint256 announced);
+    error ActionMove(uint256 price, uint256 anchor);
 
     // -------------------------------------------------------------------------------------
     // Fills
@@ -172,15 +177,17 @@ library StockPricing {
         uint256 bookedAfter,
         uint256 price
     ) internal view returns (bool) {
-        int256 inTransit = s.orderOpen ? StockLib.toUnits(s.orderMinOut, ctx.stockDecimals).toInt256() : int256(0);
-        int256 before = StockLib.toUnits(s.stockBooked, ctx.stockDecimals).toInt256() + inTransit;
-        int256 next = StockLib.toUnits(bookedAfter, ctx.stockDecimals).toInt256() + inTransit;
+        // In share units, the perp's: the short is in shares, the stock in tokens.
+        uint256 inTransit = s.orderOpen ? s.orderStock : 0;
+        int256 before = _shares(ctx, s.stockBooked + inTransit);
+        int256 next = _shares(ctx, bookedAfter + inTransit);
         int256 resting = s.makerSell ? s.makerFillable.toInt256() : -s.makerFillable.toInt256();
+        uint256 sharePrice = Math.mulDiv(price, ctx.tokenPerShare, StockLib.RATIO_ONE);
         for (uint256 k; k < 2; ++k) {
             int256 short_ = k == 0 ? s.shortConfirmed : s.shortConfirmed + s.pendingQty + resting;
             uint256 b = StockLib.abs(before - short_);
             uint256 a = StockLib.abs(next - short_);
-            if (a > b && StockLib.unitsToCash(ctx, a, price) > c.maxUnhedged) return true;
+            if (a > b && StockLib.unitsToCash(ctx, a, sharePrice) > c.maxUnhedged) return true;
         }
         return false;
     }
@@ -241,6 +248,41 @@ library StockPricing {
             s.wideUntil = uint64(block.timestamp + c.reanchorWide);
             emit Reanchored(r.price, s.wideUntil);
         }
+    }
+
+    /// @notice Apply an accepted corporate action: the new ratio (in range, and the registry's if there
+    /// is one), and the anchor moved to the stored price at it in the same call, with the re-anchor
+    /// widen. The halt is the owner's review; the stored price may be of any age (a split usually
+    /// lands over a weekend). The price per token at the new ratio must be within `maxMoveBps` (at most
+    /// `MAX_ACTION_MOVE`) of the anchor: across a split it should not have moved at all, so a ratio
+    /// accepted before the feed reflects it is refused.
+    function acceptAction(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext storage ctx,
+        uint56 ratio,
+        uint16 maxMoveBps
+    ) external {
+        if (!StockLib.actionPending(ctx)) revert NoActionPending();
+        uint256 announced =
+            address(ctx.ratios) == address(0) ? ratio : ctx.ratios.tokenPerShare(Currency.unwrap(ctx.stock));
+        if (ratio < StockLib.MIN_RATIO || ratio > StockLib.MAX_RATIO || ratio != announced) {
+            revert BadRatio(ratio, announced);
+        }
+        ctx.tokenPerShare = ratio;
+        ctx.actionHalt = false;
+        uint256 price = StockLib.markPrice(ctx);
+        uint256 anchor = s.anchorPrice;
+        if (anchor != 0 && (maxMoveBps > StockLib.MAX_ACTION_MOVE || StockLib.deviationBps(price, anchor) > maxMoveBps))
+        revert ActionMove(price, anchor);
+        s.anchorPrice = price.toUint128();
+        s.jumpSince = 0;
+        s.wideUntil = uint64(block.timestamp + c.reanchorWide);
+        emit Reanchored(price, s.wideUntil);
+    }
+
+    function _shares(StockContext memory ctx, uint256 amount) private pure returns (int256) {
+        return StockLib.toShares(ctx, StockLib.toUnits(amount, ctx.stockDecimals)).toInt256();
     }
 
     function _refuse(Fill memory f, Refusal reason) private pure returns (Fill memory) {
