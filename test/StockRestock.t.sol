@@ -13,9 +13,9 @@ import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 /// LIMIT memo restocking, both directions: the memo the vault builds, the limit bands, what an order
 /// is worth in transit, and every way one closes (delivered, paid, refunded) without a halt.
 contract StockRestockTest is StockVaultHarness {
-    // {"give":"<0x01>","want":"<0x02>","ttl":<0x03>}: any issuer format, placeholders where the numbers go
-    bytes internal constant TEMPLATE =
-        hex"7b2267697665223a2201222c2277616e74223a2202222c2274746c223a037d";
+    // Any issuer format, placeholders where the numbers go; the vault writes the payee (0x04) and the
+    // expiry key and value (0x03) itself.
+    bytes internal constant TEMPLATE = '{"did_id":"\x04","give":"\x01","want":"\x02",\x03}';
 
     function setUp() public override {
         super.setUp();
@@ -23,13 +23,15 @@ contract StockRestockTest is StockVaultHarness {
         x.setRestockMemo(TEMPLATE);
     }
 
-    function _memo(uint256 offer, uint256 request, uint256 expiry) internal pure returns (bytes memory) {
+    function _memo(uint256 offer, uint256 request, uint256 expiry) internal view returns (bytes memory) {
         return abi.encodePacked(
-            '{"give":"',
+            '{"did_id":"',
+            vm.toLowercase(vm.toString(address(sv))),
+            '","give":"',
             vm.toString(offer),
             '","want":"',
             vm.toString(request),
-            '","ttl":',
+            '","expiry_days":',
             vm.toString(expiry),
             "}"
         );
@@ -173,9 +175,10 @@ contract StockRestockTest is StockVaultHarness {
     function test_aBuyIsCountedOnceThroughDelivery() public {
         uint256 nav = sv.totalAssets();
         _order(false, 3_000e6, 9.8 ether);
-        assertEq(sv.totalAssets(), nav, "in transit at the cash sent");
+        // In transit as the stock it buys, at the mark (it is hedged as that): 2,940 for 3,000 sent.
+        assertEq(sv.totalAssets(), nav - 60e6, "in transit at its stock");
         stock.mint(address(sv), 10 ether); // filled better than the limit
-        assertEq(sv.totalAssets(), nav, "a delivery is not counted twice before it is booked");
+        assertEq(sv.totalAssets(), nav - 60e6, "a delivery is not counted twice before it is booked");
         x.settleRestock();
         StockState memory s = x.state();
         assertFalse(s.orderOpen);
@@ -203,7 +206,7 @@ contract StockRestockTest is StockVaultHarness {
         uint256 nav = sv.totalAssets();
         _order(false, 3_000e6, 9.8 ether);
         cash.mint(address(sv), 3_000e6); // the issuer refunds
-        assertEq(sv.totalAssets(), nav + 3_000e6, "the known window: counted twice until closed");
+        assertEq(sv.totalAssets(), nav - 60e6 + 3_000e6, "the known window: counted twice until closed");
         vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 9.8 ether));
         x.settleRestock(); // not anyone, before the deadline
         vm.expectEmit(address(sv));
@@ -287,7 +290,7 @@ contract StockRestockTest is StockVaultHarness {
             amountIn = bound(amount, 0.01 ether, 30 ether);
             out = _value(amountIn) * (10_000 - edgeBps) / 10_000;
         } else {
-            amountIn = bound(amount, 10e6, 9_000e6);
+            amountIn = bound(amount, 10e6, 7_000e6); // the rest is the margin its stock's short needs
             out = Math.mulDiv(amountIn, 1e30, PRICE) * (10_000 - edgeBps) / 10_000;
         }
         _order(sell, amountIn, out);

@@ -19,6 +19,7 @@ library StockHedge {
     error HedgePending();
     error HedgeTooSoon(uint256 allowedAt);
     error MarginHealthy();
+    error ExchangeRefused();
     error MakerOff();
     error NoMaker();
     error MakerResting(uint256 replaceableAt);
@@ -80,13 +81,15 @@ library StockHedge {
             revert HedgeTooSoon(uint256(s.lastHedgeTime) + c.publicHedgeDelay);
         }
 
+        // Anyone's hedge may cross at most the narrowest spread the vault charges, so moving the book
+        // against it costs more than it can take; the keeper's may use the full slippage.
+        uint256 slip = isKeeper ? c.hedgeSlippageBps : Math.min(c.hedgeSlippageBps, c.minSpread);
         uint256 worst = sell
-            ? r.sharePrice * (StockLib.BPS - c.hedgeSlippageBps) / StockLib.BPS / c.priceTick * c.priceTick
+            ? r.sharePrice * (StockLib.BPS - slip) / StockLib.BPS / c.priceTick * c.priceTick
             : Math.ceilDiv(
-                    Math.mulDiv(r.sharePrice, StockLib.BPS + c.hedgeSlippageBps, StockLib.BPS, Math.Rounding.Ceil),
-                    c.priceTick
+                    Math.mulDiv(r.sharePrice, StockLib.BPS + slip, StockLib.BPS, Math.Rounding.Ceil), c.priceTick
                 ) * c.priceTick;
-        uint256 margin = _holdMargin(c, s, ctx, sell, qty, worst);
+        uint256 margin = _holdMargin(c, s, ctx, sell, qty, worst, r.sharePrice);
 
         string memory sub = StockLib.subaccount();
         string memory orderHash =
@@ -137,7 +140,7 @@ library StockHedge {
         uint256 low = r.sharePrice * (StockLib.BPS - c.hedgeSlippageBps) / StockLib.BPS;
         uint256 high = Math.mulDiv(r.sharePrice, StockLib.BPS + c.hedgeSlippageBps, StockLib.BPS, Math.Rounding.Ceil);
         if (price < low || price > high || price % c.priceTick != 0) revert MakerPriceOutOfBand(price, low, high);
-        uint256 margin = _holdMargin(c, s, ctx, sell, qty, price);
+        uint256 margin = _holdMargin(c, s, ctx, sell, qty, price, r.sharePrice);
 
         string memory orderHash =
             StockLib.EXCHANGE
@@ -192,18 +195,22 @@ library StockHedge {
         if (qty == 0 || StockLib.unitsToCash(ctx, qty, r.sharePrice) < c.minHedge) qty = 0;
     }
 
-    /// @dev An opening order's margin at `price`, made available out of the vault's own cash; a
-    /// reducing order carries none (reduce-only).
+    /// @dev An opening order's margin, made available out of the vault's own cash; a reducing order
+    /// carries none (reduce-only). The exchange wants the initial margin at the order price AND at the
+    /// mark, the latter less the PnL the order opens at; so it is sized at the higher of the two prices,
+    /// plus, for a sell placed below the mark, the loss it opens at, `qty * (mark - price)`.
     function _holdMargin(
         StockConfig storage c,
         StockState storage s,
         StockContext memory ctx,
         bool sell,
         uint256 qty,
-        uint256 price
+        uint256 price,
+        uint256 mark
     ) private returns (uint256 margin) {
         if (!sell) return 0;
-        margin = Math.mulDiv(qty, price, 1e18) * 10 / c.leverageX10;
+        margin = Math.mulDiv(qty, Math.max(price, mark), 1e18) * 10 / c.leverageX10;
+        if (mark > price) margin += Math.mulDiv(qty, mark - price, 1e18, Math.Rounding.Ceil);
         // The margin hold also covers the fee; 1% over is far above any fee tier.
         StockLib.spendOwnCash(s, ctx, StockLib.fromApi(ctx, margin, Math.Rounding.Ceil) * 101 / 100 + 1);
     }
@@ -215,7 +222,10 @@ library StockHedge {
 
     /// @dev Cancel the resting order, which `confirmHedge` has just seen live in this transaction.
     function _cancelMaker(StockState storage s) private {
-        StockLib.EXCHANGE.cancelDerivativeOrder(address(this), s.marketId, StockLib.subaccount(), s.makerHash, 1, "");
+        if (!StockLib.EXCHANGE
+            .cancelDerivativeOrder(address(this), s.marketId, StockLib.subaccount(), s.makerHash, 1, "")) {
+            revert ExchangeRefused();
+        }
         emit MakerCancelled(s.makerHash, s.makerFillable);
         _clearMaker(s);
     }
@@ -246,17 +256,26 @@ library StockHedge {
         s.marketId = marketId;
     }
 
-    /// @notice Bring the short back to its target leverage once its margin is below 70% of what
-    /// that leverage needs. Permissionless: it only adds the vault's own cash to its own position.
-    function topUpMargin(StockConfig storage c, StockState storage s, StockContext memory ctx) external {
+    /// @notice Bring the short back to its target leverage: its equity (margin plus unrealised PnL,
+    /// which the exchange liquidates on) back up to what that leverage needs at the mark. The keeper
+    /// may top up whenever equity is short of the target; anyone once it is below 70% of it. It only
+    /// adds the vault's own cash to its own position.
+    function topUpMargin(StockConfig storage c, StockState storage s, StockContext memory ctx, bool isKeeper) external {
         (bool found, IExchangeDerivatives.DerivativePosition memory p) = StockLib.position(s);
         if (!found) revert MarginHealthy();
-        uint256 target = Math.mulDiv(p.quantity, StockLib.markSharePrice(ctx), 1e18) * 10 / c.leverageX10;
-        if (p.margin * 10 >= target * 7) revert MarginHealthy();
-        uint256 amount = target - p.margin;
+        uint256 mark = StockLib.markSharePrice(ctx);
+        uint256 target = Math.mulDiv(p.quantity, mark, 1e18) * 10 / c.leverageX10;
+        int256 move = p.isLong ? mark.toInt256() - p.entryPrice.toInt256() : p.entryPrice.toInt256() - mark.toInt256();
+        int256 eq = p.margin.toInt256() + move * p.quantity.toInt256() / 1e18;
+        // forge-lint: disable-next-line(unsafe-typecast) - positive by the test.
+        uint256 equity = eq <= 0 ? 0 : uint256(eq);
+        if (isKeeper ? equity >= target : equity * 10 >= target * 7) revert MarginHealthy();
+        uint256 amount = target - equity;
         StockLib.spendOwnCash(s, ctx, StockLib.fromApi(ctx, amount, Math.Rounding.Ceil) + 1);
         string memory sub = StockLib.subaccount();
-        StockLib.EXCHANGE.increasePositionMargin(address(this), sub, sub, s.marketId, amount);
+        if (!StockLib.EXCHANGE.increasePositionMargin(address(this), sub, sub, s.marketId, amount)) {
+            revert ExchangeRefused();
+        }
         emit MarginAdded(amount);
     }
 

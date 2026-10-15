@@ -340,7 +340,7 @@ contract StockInvariantTest is StockVaultHarness {
         super.setUp();
         vm.startPrank(OWNER);
         x.setQuoteSigner(vm.addr(QUOTE_KEY));
-        x.setRestockMemo(hex"7b0102037d");
+        x.setRestockMemo('{"did_id":"\x04"\x01\x02\x03}');
         x.setFixingConfig(
             FixingConfig({
                 interval: 60,

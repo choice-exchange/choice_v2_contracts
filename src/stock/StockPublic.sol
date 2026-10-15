@@ -177,7 +177,7 @@ contract StockPublic is StockModule {
 
     function topUpMargin() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockHedge.topUpMargin(l.config, l.state, l.ctx);
+        StockHedge.topUpMargin(l.config, l.state, l.ctx, msg.sender == l.keeper);
     }
 
     /// @notice Close the open restock order on what has arrived; the keeper any time, anyone past its

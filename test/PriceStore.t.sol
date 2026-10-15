@@ -35,7 +35,7 @@ contract PriceStoreTest is Test {
         assertEq(p.exponent, -8);
         assertEq(p.confidence, 223_986);
         assertEq(p.feedTimestampUs, LazerFixtures.UPDATE_13_TIMESTAMP_US);
-        assertEq(p.flags, PythLazerLib.HAS_CONFIDENCE | PythLazerLib.HAS_FEED_TIMESTAMP);
+        assertEq(p.flags, PythLazerLib.HAS_CONFIDENCE | PythLazerLib.HAS_FEED_TIMESTAMP | PythLazerLib.HAS_EXPONENT);
     }
 
     /// A feed whose market is shut rides the fresh batch with its last close as its own time.
@@ -119,14 +119,37 @@ contract PriceStoreTest is Test {
         assertEq(
             p.flags,
             PythLazerLib.HAS_QUOTE | PythLazerLib.HAS_CONFIDENCE | PythLazerLib.HAS_SESSION
-                | PythLazerLib.HAS_FEED_TIMESTAMP
+                | PythLazerLib.HAS_FEED_TIMESTAMP | PythLazerLib.HAS_EXPONENT
         );
     }
 
-    function test_missingFeedTimestampMeansTheUpdatesOwn() public view {
-        IPriceStore.Price memory p = store.verify(LazerBuilder.one(KEY, T0, LazerBuilder.plain(7, 100, -2, 0)), 7);
-        assertEq(p.feedTimestampUs, T0);
-        assertEq(p.flags & PythLazerLib.HAS_FEED_TIMESTAMP, 0);
+    /// Without its own time a feed would read as fresh whatever its age: refused, and never stored.
+    function test_anUpdateWithoutAFeedTimestampIsRefused() public {
+        bytes memory u = LazerBuilder.one(KEY, T0, LazerBuilder.plain(7, 100, -2, 0));
+        vm.expectRevert(PythLazerLib.MalformedUpdate.selector);
+        store.verify(u, 7);
+        assertEq(store.update(u), 0);
+    }
+
+    /// Without its exponent a feed would read at exponent 0 (here x100): refused, and never stored.
+    function test_anUpdateWithoutAnExponentIsRefused() public {
+        bytes memory p = abi.encodePacked(PythLazerLib.PAYLOAD_MAGIC, T0, uint8(3), uint8(1));
+        p = abi.encodePacked(p, uint32(7), uint8(2), uint8(0), int64(500), uint8(12), uint8(1), T0);
+        bytes memory u = LazerBuilder.sign(KEY, p);
+        vm.expectRevert(PythLazerLib.MalformedUpdate.selector);
+        store.verify(u, 7);
+        assertEq(store.update(u), 0);
+    }
+
+    /// Only the fixed-rate 200 ms channel: a faster one would let a filler choose among more prices.
+    function test_anotherChannelIsRefused() public {
+        bytes memory p = abi.encodePacked(PythLazerLib.PAYLOAD_MAGIC, T0, uint8(1), uint8(1));
+        p = abi.encodePacked(p, uint32(7), uint8(3), uint8(0), int64(500), uint8(4), int16(-2), uint8(12), uint8(1), T0);
+        bytes memory u = LazerBuilder.sign(KEY, p);
+        vm.expectRevert(PythLazerLib.MalformedUpdate.selector);
+        store.verify(u, 7);
+        vm.expectRevert(PythLazerLib.MalformedUpdate.selector);
+        store.update(u);
     }
 
     function test_aFeedTimestampAfterTheUpdateIsClamped() public view {
@@ -136,7 +159,7 @@ contract PriceStoreTest is Test {
     }
 
     function test_crossedQuoteIsDropped() public view {
-        LazerBuilder.Feed memory f = LazerBuilder.Feed(7, 100, -2, 1, 0, 101, 99, -1);
+        LazerBuilder.Feed memory f = LazerBuilder.Feed(7, 100, -2, 1, T0, 101, 99, -1);
         IPriceStore.Price memory p = store.verify(LazerBuilder.one(KEY, T0, f), 7);
         assertEq(p.bestBid, 0);
         assertEq(p.bestAsk, 0);
@@ -146,9 +169,10 @@ contract PriceStoreTest is Test {
     function test_skipsFundingAndEmaProperties() public view {
         // feed 7: price, a set funding rate, an unset funding timestamp, EMA price; then feed 8.
         bytes memory p = abi.encodePacked(PythLazerLib.PAYLOAD_MAGIC, T0, uint8(3), uint8(2));
-        p = abi.encodePacked(p, uint32(7), uint8(5), uint8(0), int64(500), uint8(6), uint8(1), int64(-3));
+        p = abi.encodePacked(p, uint32(7), uint8(6), uint8(0), int64(500), uint8(6), uint8(1), int64(-3));
         p = abi.encodePacked(p, uint8(7), uint8(0), uint8(10), int64(499), uint8(4), int16(-2));
-        p = abi.encodePacked(p, uint32(8), uint8(2), uint8(0), int64(42), uint8(4), int16(0));
+        p = abi.encodePacked(p, uint8(12), uint8(1), T0);
+        p = abi.encodePacked(p, uint32(8), uint8(3), uint8(0), int64(42), uint8(4), int16(0), uint8(12), uint8(1), T0);
         bytes memory u = LazerBuilder.sign(KEY, p);
         assertEq(store.verify(u, 7).price, 500);
         assertEq(store.verify(u, 8).price, 42);
@@ -189,10 +213,10 @@ contract PriceStoreTest is Test {
     // -------------------------------------------------------------------------------------
 
     function test_storeKeepsTheNewestPerFeed() public {
-        store.update(LazerBuilder.one(KEY, T0, LazerBuilder.plain(7, 100, -2, 0)));
-        assertEq(store.update(LazerBuilder.one(KEY, T0 - 200_000, LazerBuilder.plain(7, 99, -2, 0))), 0);
+        store.update(LazerBuilder.one(KEY, T0, LazerBuilder.plain(7, 100, -2, T0)));
+        assertEq(store.update(LazerBuilder.one(KEY, T0 - 200_000, LazerBuilder.plain(7, 99, -2, T0 - 200_000))), 0);
         assertEq(store.latest(7).price, 100);
-        assertEq(store.update(LazerBuilder.one(KEY, T0 + 200_000, LazerBuilder.plain(7, 101, -2, 0))), 1);
+        assertEq(store.update(LazerBuilder.one(KEY, T0 + 200_000, LazerBuilder.plain(7, 101, -2, T0 + 200_000))), 1);
         assertEq(store.latest(7).price, 101);
         assertEq(store.latest(8).timestampUs, 0, "a feed never stored reads as zero");
     }
@@ -207,8 +231,8 @@ contract PriceStoreTest is Test {
         store.setSigner(vm.addr(next), uint64(block.timestamp + 1 days));
         store.setSigner(vm.addr(KEY), 0);
         vm.stopPrank();
-        store.verify(LazerBuilder.one(next, T0, LazerBuilder.plain(7, 1, 0, 0)), 7);
-        bytes memory old = LazerBuilder.one(KEY, T0, LazerBuilder.plain(7, 1, 0, 0));
+        store.verify(LazerBuilder.one(next, T0, LazerBuilder.plain(7, 1, 0, T0)), 7);
+        bytes memory old = LazerBuilder.one(KEY, T0, LazerBuilder.plain(7, 1, 0, T0));
         vm.expectRevert(abi.encodeWithSelector(PriceStore.UntrustedSigner.selector, vm.addr(KEY)));
         store.verify(old, 7);
     }

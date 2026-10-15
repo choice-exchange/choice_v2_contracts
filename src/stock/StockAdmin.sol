@@ -34,6 +34,7 @@ contract StockAdmin is StockModule {
 
     error SpreadWidenTooLarge();
     error ProtectedToken(address token);
+    error NotRegistryIssuer(address issuer);
 
     event Widened(uint16 bps, uint64 until);
     event Paused(uint8 flags, address indexed by);
@@ -143,8 +144,13 @@ contract StockAdmin is StockModule {
         emit FixingConfigUpdated();
     }
 
+    /// @notice The keeper, the guardian and the issuer. The issuer is the one the registry fixed for this
+    /// vault (or none, which stops memo restocking): restock orders send it the vault's cash and stock.
     function setRoles(address keeper_, address guardian_, address issuer_) external onlyOwner {
         StockLayout storage l = StockStorage.layout();
+        if (issuer_ != address(0) && issuer_ != StockRegistry(l.registry).issuerOf(address(this))) {
+            revert NotRegistryIssuer(issuer_);
+        }
         (l.keeper, l.guardian, l.issuer) = (keeper_, guardian_, issuer_);
         emit RolesUpdated(keeper_, guardian_, issuer_);
     }
@@ -185,8 +191,19 @@ contract StockAdmin is StockModule {
     /// the stored price at it in the same call. With a registry, `ratio` must be the one it announces;
     /// the price per token may have moved at most `maxMoveBps` from the anchor (see `StockPricing`).
     function acceptAction(uint56 ratio, uint16 maxMoveBps) external onlyOwner nonReentrant {
+        _accept(ratio, maxMoveBps, 0);
+    }
+
+    /// @notice `acceptAction` checked against the per-token price the owner expects (1e18) instead of
+    /// the pre-halt anchor: for a halt the market has moved more than `MAX_ACTION_MOVE` across.
+    function acceptActionAt(uint56 ratio, uint16 maxMoveBps, uint256 expectedPrice) external onlyOwner nonReentrant {
+        if (expectedPrice == 0) revert StockLib.BadConfig();
+        _accept(ratio, maxMoveBps, expectedPrice);
+    }
+
+    function _accept(uint56 ratio, uint16 maxMoveBps, uint256 expectedPrice) private {
         StockLayout storage l = StockStorage.layout();
-        StockPricing.acceptAction(l.config, l.state, l.ctx, ratio, maxMoveBps);
+        StockPricing.acceptAction(l.config, l.state, l.ctx, ratio, maxMoveBps, expectedPrice);
         emit ActionAccepted(ratio);
     }
 

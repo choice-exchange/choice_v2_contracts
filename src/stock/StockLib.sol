@@ -46,10 +46,10 @@ library StockLib {
     uint32 internal constant MIN_WINDOW = 1 minutes;
     uint32 internal constant MIN_REANCHOR_DELAY = 1 minutes;
     uint32 internal constant MAX_RESTOCK_DEADLINE = 2 days;
+    /// @dev The issuer refunded a 1 h order 62 s after expiry (10-15) but has been hours late before.
+    uint32 internal constant MIN_RESTOCK_DEADLINE = 1 hours;
     /// @dev The longest a restock order may ask the issuer to keep it open.
     uint32 internal constant MAX_ORDER_LIFE = 7 days;
-    uint32 internal constant MIN_EXPIRY_UNIT = 1 minutes;
-    uint32 internal constant MAX_EXPIRY_UNIT = 1 days;
     uint32 internal constant RESTOCK_CAP_WINDOW = 1 days;
     uint32 internal constant MAX_MAKER_TIMEOUT = 1 days;
     uint16 internal constant MAX_EXIT_FEE = 200;
@@ -170,9 +170,10 @@ library StockLib {
         bool restockOpen
     ) internal view returns (int256) {
         // A restock order counts as held both ways: a buy's stock is on its way, a sell's is still ours.
-        uint256 units = toUnits(s.stockBooked, ctx.stockDecimals);
+        uint256 units = toUnits(Math.min(s.stockBooked, ownStock(s, ctx)), ctx.stockDecimals);
         if (s.orderOpen) units += toUnits(s.orderStock, ctx.stockDecimals);
-        if (restockOpen) {
+        // No pre-hedge while an in-kind epoch unwinds: its debt is paid from cash the short would hold.
+        if (restockOpen && s.debtOwed == 0) {
             uint256 held = stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor) + orderValue(s, ctx, price);
             if (c.targetInventory > held) {
                 uint256 used = block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW ? 0 : s.restockUsed;
@@ -216,10 +217,12 @@ library StockLib {
         return Math.mulDiv(tokenUnits, RATIO_ONE, ctx.tokenPerShare);
     }
 
-    /// @dev What the open restock order is worth: a buy's cash, or a sell's stock at `price`.
+    /// @dev What the open restock order is worth: its stock at `price`, either way. A buy's stock is
+    /// hedged from the moment it is ordered, so it is valued as stock too: valued as its cash, a move
+    /// before delivery would show the short's loss or gain with nothing against it.
     function orderValue(StockState storage s, StockContext memory ctx, uint256 price) internal view returns (uint256) {
         if (!s.orderOpen) return 0;
-        return s.orderSell ? stockToCash(ctx, s.orderStock, price, Math.Rounding.Floor) : s.orderCash;
+        return stockToCash(ctx, s.orderStock, price, Math.Rounding.Floor);
     }
 
     /// @dev Count `cash` against the daily restock cap, shared by memo orders and quotes.
@@ -266,6 +269,16 @@ library StockLib {
     function ownStock(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
         uint256 h = holding(ctx, ctx.stock);
         return h > s.stockOwed ? h - s.stockOwed : 0;
+    }
+
+    /// @dev Booked stock plus an open restock buy's, which the inventory cap counts as held.
+    function stockInventory(StockState storage s) internal view returns (uint256) {
+        return s.stockBooked + (s.orderOpen && !s.orderSell ? s.orderStock : 0);
+    }
+
+    /// @dev Cash no trade may spend: the reserve, and what an unwinding in-kind epoch is owed.
+    function cashKept(StockConfig storage c, StockState storage s) internal view returns (uint256) {
+        return uint256(c.cashReserve) + s.debtOwed;
     }
 
     /// @dev Make `amount` of cash available as the token for the vault to spend, refusing to dip

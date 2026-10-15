@@ -287,9 +287,10 @@ library StockFixing {
             // hedging that value needs value * 10 / leverageX10 of margin; both must fit above the
             // reserve.
             uint256 own = StockLib.ownCash(s, ctx);
-            uint256 room = own > c.cashReserve ? own - c.cashReserve : 0;
+            uint256 kept = StockLib.cashKept(c, s);
+            uint256 room = own > kept ? own - kept : 0;
             uint256 capValue = Math.min(fc.maxNet, room * c.leverageX10 / (uint256(c.leverageX10) + 10));
-            uint256 heldValue = StockLib.stockToCash(ctx, s.stockBooked, price, Math.Rounding.Ceil);
+            uint256 heldValue = StockLib.stockToCash(ctx, StockLib.stockInventory(s), price, Math.Rounding.Ceil);
             capValue = Math.min(capValue, c.maxInventory > heldValue ? c.maxInventory - heldValue : 0);
             uint256 cap = Math.mulDiv(capValue, scale, price);
             if (sellIn - stockOut > cap) sellFilled = stockOut + cap;

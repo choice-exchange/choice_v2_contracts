@@ -79,9 +79,10 @@ library StockOps {
         (bool found,) = StockLib.position(s);
         if (found) {
             // A one-unit margin decrease applies accrued funding in the same transaction and moves
-            // nothing that matters.
+            // nothing that matters. If the exchange refuses it (a short under its initial margin
+            // ratio), the value is read with funding unsettled rather than freezing every exit.
             string memory sub = StockLib.subaccount();
-            StockLib.EXCHANGE.decreasePositionMargin(address(this), sub, sub, s.marketId, 1);
+            try StockLib.EXCHANGE.decreasePositionMargin(address(this), sub, sub, s.marketId, 1) {} catch {}
         }
     }
 
@@ -120,13 +121,19 @@ library StockOps {
         ) {
             revert StockLib.BadConfig();
         }
-        if (c.window < StockLib.MIN_WINDOW || c.reanchorDelay < StockLib.MIN_REANCHOR_DELAY) {
+        if (
+            c.window < StockLib.MIN_WINDOW || c.reanchorDelay < StockLib.MIN_REANCHOR_DELAY
+                || c.publicHedgeDelay < StockLib.MIN_REANCHOR_DELAY
+        ) {
             revert StockLib.BadConfig();
         }
-        if (c.restockDeadline == 0 || c.restockDeadline > StockLib.MAX_RESTOCK_DEADLINE) revert StockLib.BadConfig();
-        if (c.restockExpiryUnit < StockLib.MIN_EXPIRY_UNIT || c.restockExpiryUnit > StockLib.MAX_EXPIRY_UNIT) {
+        if (c.restockDeadline < StockLib.MIN_RESTOCK_DEADLINE || c.restockDeadline > StockLib.MAX_RESTOCK_DEADLINE) {
             revert StockLib.BadConfig();
         }
+        // The issuer's two units: the memo's expiry key follows this.
+        if (c.restockExpiryUnit != 1 hours && c.restockExpiryUnit != 1 days) revert StockLib.BadConfig();
+        // A day of restocking can never move more than the inventory cap.
+        if (c.restockDailyCap > c.maxInventory) revert StockLib.BadConfig();
         if (c.makerTimeout > StockLib.MAX_MAKER_TIMEOUT) revert StockLib.BadConfig();
         if (
             c.exitFeeBps > StockLib.MAX_EXIT_FEE || c.queueDeadline < StockLib.MIN_QUEUE_DEADLINE
