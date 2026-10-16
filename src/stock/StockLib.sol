@@ -46,10 +46,10 @@ library StockLib {
     uint32 internal constant MIN_WINDOW = 1 minutes;
     uint32 internal constant MIN_REANCHOR_DELAY = 1 minutes;
     uint32 internal constant MAX_RESTOCK_DEADLINE = 2 days;
+    /// @dev The issuer refunded a 1 h order 62 s after expiry (10-15) but has been hours late before.
+    uint32 internal constant MIN_RESTOCK_DEADLINE = 1 hours;
     /// @dev The longest a restock order may ask the issuer to keep it open.
     uint32 internal constant MAX_ORDER_LIFE = 7 days;
-    uint32 internal constant MIN_EXPIRY_UNIT = 1 minutes;
-    uint32 internal constant MAX_EXPIRY_UNIT = 1 days;
     uint32 internal constant RESTOCK_CAP_WINDOW = 1 days;
     uint32 internal constant MAX_MAKER_TIMEOUT = 1 days;
     uint16 internal constant MAX_EXIT_FEE = 200;
@@ -57,6 +57,13 @@ library StockLib {
     uint8 internal constant DECIMALS_OFFSET = 6;
     uint32 internal constant MIN_QUEUE_DEADLINE = 1 hours;
     uint32 internal constant MAX_QUEUE_DEADLINE = 14 days;
+
+    /// @dev The exchange subaccount the short trades from. Not the default one, which trades off the
+    /// bank balance: here its margin, PnL, fees and funding move a deposit of its own, so the bank
+    /// balance the cash ledger reads moves only on the vault's own calls and on arrivals. One arrival
+    /// is the vault's own: an order's relayer fee share (40% of its fee, `feeRecipient` empty = the
+    /// sender) accrues on the DEFAULT subaccount and reaches the bank in whole units (measured 10-16).
+    uint96 internal constant HEDGE_NONCE = 1;
 
     /// @dev Transient: set only while the vault holds a Choice vault lock it opened itself.
     uint256 internal constant LOCK_OPEN_SLOT = 0x2c7f2a3e1b8d4c6f9e0a5b7c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e;
@@ -115,7 +122,17 @@ library StockLib {
         if (r.closed) {
             // Weekend mode needs the close itself: a price from before the close is an outage
             // that started in session, not a frozen market.
-            if (p.feedTimestampUs / 1e6 + c.closeTolerance < r.sessionStart) r.reason = Refusal.Stale;
+            uint256 feedS = p.feedTimestampUs / 1e6;
+            if (feedS + c.closeTolerance < r.sessionStart) {
+                r.reason = Refusal.Stale;
+            } else if (
+                r.session == MarketCalendar.Session.Overnight && feedS > r.sessionStart + c.closeTolerance
+                    && r.ageMs > c.maxAgeMs
+            ) {
+                // An overnight priced as closed, on a price from after the close: the overnight
+                // market is trading, so its price must be as fresh as one in session.
+                r.reason = Refusal.Stale;
+            }
         } else if (r.ageMs > c.maxAgeMs) {
             r.reason = Refusal.Stale;
         } else if (p.flags & PythLazerLib.HAS_SESSION != 0 && p.marketSession == PythLazerLib.SESSION_CLOSED) {
@@ -170,9 +187,10 @@ library StockLib {
         bool restockOpen
     ) internal view returns (int256) {
         // A restock order counts as held both ways: a buy's stock is on its way, a sell's is still ours.
-        uint256 units = toUnits(s.stockBooked, ctx.stockDecimals);
+        uint256 units = toUnits(Math.min(s.stockBooked, ownStock(s, ctx)), ctx.stockDecimals);
         if (s.orderOpen) units += toUnits(s.orderStock, ctx.stockDecimals);
-        if (restockOpen) {
+        // No pre-hedge while an in-kind epoch unwinds: its debt is paid from cash the short would hold.
+        if (restockOpen && s.debtOwed == 0) {
             uint256 held = stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor) + orderValue(s, ctx, price);
             if (c.targetInventory > held) {
                 uint256 used = block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW ? 0 : s.restockUsed;
@@ -216,10 +234,12 @@ library StockLib {
         return Math.mulDiv(tokenUnits, RATIO_ONE, ctx.tokenPerShare);
     }
 
-    /// @dev What the open restock order is worth: a buy's cash, or a sell's stock at `price`.
+    /// @dev What the open restock order is worth: its stock at `price`, either way. A buy's stock is
+    /// hedged from the moment it is ordered, so it is valued as stock too: valued as its cash, a move
+    /// before delivery would show the short's loss or gain with nothing against it.
     function orderValue(StockState storage s, StockContext memory ctx, uint256 price) internal view returns (uint256) {
         if (!s.orderOpen) return 0;
-        return s.orderSell ? stockToCash(ctx, s.orderStock, price, Math.Rounding.Floor) : s.orderCash;
+        return stockToCash(ctx, s.orderStock, price, Math.Rounding.Floor);
     }
 
     /// @dev Count `cash` against the daily restock cap, shared by memo orders and quotes.
@@ -231,6 +251,14 @@ library StockLib {
         uint256 remaining = c.restockDailyCap > s.restockUsed ? c.restockDailyCap - s.restockUsed : 0;
         if (cash > remaining) revert RestockCapExceeded(cash, remaining);
         s.restockUsed += cash.toUint96();
+    }
+
+    /// @dev Give back `cash` counted in `window`, if that window is still the current one (a later
+    /// window started from zero and owes nothing).
+    function uncountRestock(StockState storage s, uint64 window, uint256 cash) internal returns (uint256 back) {
+        if (window != s.restockWindowStart || block.timestamp >= uint256(window) + RESTOCK_CAP_WINDOW) return 0;
+        back = Math.min(cash, s.restockUsed);
+        s.restockUsed -= uint96(back);
     }
 
     /// @dev Stock held beyond the booked stock and what is held for fixing-lane requesters.
@@ -256,10 +284,28 @@ library StockLib {
         return IERC20(Currency.unwrap(currency)).balanceOf(address(this)) + ctx.vault.balanceOf(address(this), currency);
     }
 
-    /// @notice The cash held less what is held for fixing-lane requesters.
+    /// @notice The booked cash, never more than is held less what is held for fixing-lane requesters
+    /// and redeemers. Cash that arrived unbooked (an issuer's payment or refund, a donation) is not
+    /// the vault's to spend or value until it is booked.
     function ownCash(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        return Math.min(_freeCash(s, ctx), s.cashBooked);
+    }
+
+    /// @dev Cash held beyond the booked cash and what is held for requesters and redeemers.
+    function unbookedCash(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        uint256 free = _freeCash(s, ctx);
+        return free > s.cashBooked ? free - s.cashBooked : 0;
+    }
+
+    function _freeCash(StockState storage s, StockContext memory ctx) private view returns (uint256) {
         uint256 h = holding(ctx, ctx.cash);
         return h > s.cashOwed ? h - s.cashOwed : 0;
+    }
+
+    /// @dev The hedge subaccount's cash, in cash units: what is free, and the total (which includes a
+    /// resting order's margin hold).
+    function subaccountCash(StockState storage s) internal view returns (uint256 available, uint256 total) {
+        return EXCHANGE.subaccountDeposit(subaccount(), s.cashDenom);
     }
 
     /// @notice The stock held less what is held for fixing-lane requesters.
@@ -268,8 +314,18 @@ library StockLib {
         return h > s.stockOwed ? h - s.stockOwed : 0;
     }
 
+    /// @dev Booked stock plus an open restock buy's, which the inventory cap counts as held.
+    function stockInventory(StockState storage s) internal view returns (uint256) {
+        return s.stockBooked + (s.orderOpen && !s.orderSell ? s.orderStock : 0);
+    }
+
+    /// @dev Cash no trade may spend: the reserve, and what an unwinding in-kind epoch is owed.
+    function cashKept(StockConfig storage c, StockState storage s) internal view returns (uint256) {
+        return uint256(c.cashReserve) + s.debtOwed;
+    }
+
     /// @dev Make `amount` of cash available as the token for the vault to spend, refusing to dip
-    /// into what it holds for fixing-lane requesters.
+    /// into what it holds for fixing-lane requesters. The caller books what it spends.
     function spendOwnCash(StockState storage s, StockContext memory ctx, uint256 amount) internal {
         uint256 own = ownCash(s, ctx);
         if (own < amount) revert CashShort(amount, own);
@@ -321,9 +377,9 @@ library StockLib {
         return v <= 0 ? 0 : fromApi(ctx, uint256(v), Math.Rounding.Floor);
     }
 
-    /// @notice The vault's default exchange subaccount, which trades off its bank balance.
+    /// @notice The vault's hedge subaccount (`HEDGE_NONCE`).
     function subaccount() internal view returns (string memory) {
-        return SubaccountLib.defaultSubaccount(address(this));
+        return SubaccountLib.subaccount(address(this), HEDGE_NONCE);
     }
 
     function stockToCash(StockContext memory ctx, uint256 amount, uint256 price, Math.Rounding r)

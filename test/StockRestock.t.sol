@@ -11,11 +11,12 @@ import {LazerBuilder} from "./utils/LazerBuilder.sol";
 import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 
 /// LIMIT memo restocking, both directions: the memo the vault builds, the limit bands, what an order
-/// is worth in transit, and every way one closes (delivered, paid, refunded) without a halt.
+/// is worth in transit, and every way one closes (delivered, paid, refunded, lapsed), by anyone, off
+/// what the two ledgers see arrive.
 contract StockRestockTest is StockVaultHarness {
-    // {"give":"<0x01>","want":"<0x02>","ttl":<0x03>}: any issuer format, placeholders where the numbers go
-    bytes internal constant TEMPLATE =
-        hex"7b2267697665223a2201222c2277616e74223a2202222c2274746c223a037d";
+    // Any issuer format, placeholders where the numbers go; the vault writes the payee (0x04) and the
+    // expiry key and value (0x03) itself.
+    bytes internal constant TEMPLATE = '{"did_id":"\x04","give":"\x01","want":"\x02",\x03}';
 
     function setUp() public override {
         super.setUp();
@@ -23,13 +24,15 @@ contract StockRestockTest is StockVaultHarness {
         x.setRestockMemo(TEMPLATE);
     }
 
-    function _memo(uint256 offer, uint256 request, uint256 expiry) internal pure returns (bytes memory) {
+    function _memo(uint256 offer, uint256 request, uint256 expiry) internal view returns (bytes memory) {
         return abi.encodePacked(
-            '{"give":"',
+            '{"did_id":"',
+            vm.toLowercase(vm.toString(address(sv))),
+            '","give":"',
             vm.toString(offer),
             '","want":"',
             vm.toString(request),
-            '","ttl":',
+            '","expiry_days":',
             vm.toString(expiry),
             "}"
         );
@@ -121,11 +124,39 @@ contract StockRestockTest is StockVaultHarness {
         x.restock(false, 10_001e6, 34 ether, 1);
 
         _order(true, 25 ether, 7_400e6); // 7,500 of stock
-        stock.mint(address(sv), 25 ether);
-        x.settleRestock(); // refunded
+        cash.mint(address(sv), 7_400e6);
+        x.settleRestock(); // paid
         vm.prank(KEEPER);
         vm.expectRevert(abi.encodeWithSelector(StockLib.RestockCapExceeded.selector, 3_000e6, 2_500e6));
         x.restock(false, 3_000e6, 9.8 ether, 1);
+    }
+
+    function test_aSaleRefundedInStockGivesItsCapBack() public {
+        _order(true, 25 ether, 7_400e6);
+        assertEq(x.state().restockUsed, 7_500e6);
+        stock.mint(address(sv), 25 ether); // the issuer sends the stock back
+        x.settleRestock();
+        assertEq(x.state().restockUsed, 0, "seen to come back, so it no longer counts");
+        _order(false, 6_000e6, 19.9 ether);
+    }
+
+    function test_aBuyRefundedInCashGivesItsCapBack() public {
+        _order(false, 3_000e6, 9.8 ether);
+        assertEq(x.state().restockUsed, 3_000e6);
+        cash.mint(address(sv), 3_000e6); // the issuer refunds
+        x.settleRestock();
+        assertEq(x.state().restockUsed, 0, "seen to come back on the cash ledger, so it no longer counts");
+    }
+
+    function test_aRefundAfterItsWindowGivesNothingBack() public {
+        _order(true, 25 ether, 7_400e6);
+        vm.warp(block.timestamp + 1 days);
+        _price(MANTISSA);
+        stock.mint(address(sv), 25 ether);
+        x.settleRestock();
+        assertEq(x.state().restockUsed, 7_500e6, "a stale window is left as it was");
+        _order(false, 6_000e6, 19.9 ether); // the new window starts from zero
+        assertEq(x.state().restockUsed, 6_000e6);
     }
 
     function test_oneOrderAtATime() public {
@@ -173,9 +204,10 @@ contract StockRestockTest is StockVaultHarness {
     function test_aBuyIsCountedOnceThroughDelivery() public {
         uint256 nav = sv.totalAssets();
         _order(false, 3_000e6, 9.8 ether);
-        assertEq(sv.totalAssets(), nav, "in transit at the cash sent");
+        // In transit as the stock it buys, at the mark (it is hedged as that): 2,940 for 3,000 sent.
+        assertEq(sv.totalAssets(), nav - 60e6, "in transit at its stock");
         stock.mint(address(sv), 10 ether); // filled better than the limit
-        assertEq(sv.totalAssets(), nav, "a delivery is not counted twice before it is booked");
+        assertEq(sv.totalAssets(), nav - 60e6, "a delivery is not counted twice before it is booked");
         x.settleRestock();
         StockState memory s = x.state();
         assertFalse(s.orderOpen);
@@ -191,7 +223,7 @@ contract StockRestockTest is StockVaultHarness {
         vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 5 ether, 9.8 ether));
         x.settleRestock();
         vm.warp(block.timestamp + 1 days + 3601);
-        x.settleRestock(); // anyone, past the deadline: taken as refunded, no halt
+        x.settleRestock(); // anyone, past the deadline: lapsed, no halt
         x.syncWindfall();
         assertEq(x.state().stockBooked, 35 ether);
         _price(MANTISSA);
@@ -199,32 +231,54 @@ contract StockRestockTest is StockVaultHarness {
         _order(false, 1_000e6, 3.3 ether); // and restocking goes on
     }
 
-    function test_aRefundedBuyClosesOnTheKeepersWord() public {
+    function test_aRefundedBuyIsCountedOnceAndClosesForAnyone() public {
         uint256 nav = sv.totalAssets();
         _order(false, 3_000e6, 9.8 ether);
         cash.mint(address(sv), 3_000e6); // the issuer refunds
-        assertEq(sv.totalAssets(), nav + 3_000e6, "the known window: counted twice until closed");
-        vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 9.8 ether));
-        x.settleRestock(); // not anyone, before the deadline
+        assertEq(sv.totalAssets(), nav - 60e6, "an unbooked refund is not counted twice");
         vm.expectEmit(address(sv));
         emit StockRestock.RestockRefunded(false, 3_000e6);
-        vm.prank(KEEPER);
         x.settleRestock();
         assertEq(sv.totalAssets(), nav);
+        assertEq(x.state().cashBooked, 10_000e6);
         _order(false, 1_000e6, 3.3 ether);
     }
 
-    function test_aRefundedBuyClosesForAnyonePastTheDeadline() public {
+    function test_anOrderWithNothingBackLapsesAndItsLateLegIsAWindfall() public {
         uint256 nav = sv.totalAssets();
         _order(false, 3_000e6, 9.8 ether);
-        cash.mint(address(sv), 3_000e6);
         vm.warp(block.timestamp + 1 days + 3600);
         vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 9.8 ether));
         x.settleRestock();
         vm.warp(block.timestamp + 1);
+        vm.expectEmit(address(sv));
+        emit StockRestock.RestockLapsed(false, 3_000e6);
         x.settleRestock();
-        _price(MANTISSA);
+        assertEq(sv.totalAssets(), nav - 3_000e6, "lapsed: out of the value");
+        cash.mint(address(sv), 3_000e6); // refunded late
+        assertEq(sv.totalAssets(), nav - 3_000e6, "not counted until booked");
+        x.syncWindfall();
         assertEq(sv.totalAssets(), nav);
+    }
+
+    function test_aGiftShortOfTheLegCannotCloseAnOrder() public {
+        uint256 nav = sv.totalAssets();
+        _order(true, 10 ether, 2_950e6);
+        cash.mint(address(sv), 2_949e6);
+        vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 10 ether));
+        x.settleRestock();
+        assertEq(sv.totalAssets(), nav, "and is out of the value meanwhile");
+    }
+
+    function test_cashHereBeforeAnOrderIsBookedFirstAndCannotSettleIt() public {
+        uint256 nav = sv.totalAssets();
+        cash.mint(address(sv), 500e6); // a donation, or a late leg of an earlier order
+        assertEq(sv.totalAssets(), nav);
+        vm.expectEmit(address(sv));
+        emit StockRestock.CashWindfall(500e6);
+        _order(false, 400e6, 1.3 ether);
+        vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 1.3 ether));
+        x.settleRestock();
     }
 
     function test_aSaleInTransitStaysInTheValueAndTheHedge() public {
@@ -239,9 +293,9 @@ contract StockRestockTest is StockVaultHarness {
         uint256 nav = sv.totalAssets();
         _order(true, 10 ether, 2_950e6);
         cash.mint(address(sv), 2_950e6); // the issuer pays at the limit
+        assertEq(sv.totalAssets(), nav, "still the stock in transit; the payment waits to be booked");
         vm.expectEmit(address(sv));
         emit StockRestock.Restocked(true, 10 ether, 2_950e6);
-        vm.prank(KEEPER);
         x.settleRestock();
         assertEq(sv.totalAssets(), nav - 3_000e6 + 2_950e6);
         assertEq(x.state().stockBooked, 20 ether);
@@ -259,11 +313,11 @@ contract StockRestockTest is StockVaultHarness {
         assertEq(sv.totalAssets(), nav);
     }
 
-    function test_aMistakenCloseIsRecoveredWhenTheStockComes() public {
+    function test_aLapsedSaleIsRecoveredWhenTheStockComes() public {
         uint256 nav = sv.totalAssets();
         _order(true, 10 ether, 2_950e6);
-        vm.prank(KEEPER);
-        x.settleRestock(); // closed as paid, but nothing came
+        vm.warp(block.timestamp + 1 days + 3601);
+        x.settleRestock(); // lapsed: nothing came
         assertEq(sv.totalAssets(), nav - 3_000e6);
         stock.mint(address(sv), 10 ether); // it was refunded after all
         x.syncWindfall();
@@ -287,7 +341,7 @@ contract StockRestockTest is StockVaultHarness {
             amountIn = bound(amount, 0.01 ether, 30 ether);
             out = _value(amountIn) * (10_000 - edgeBps) / 10_000;
         } else {
-            amountIn = bound(amount, 10e6, 9_000e6);
+            amountIn = bound(amount, 10e6, 7_000e6); // the rest is the margin its stock's short needs
             out = Math.mulDiv(amountIn, 1e30, PRICE) * (10_000 - edgeBps) / 10_000;
         }
         _order(sell, amountIn, out);
@@ -298,7 +352,6 @@ contract StockRestockTest is StockVaultHarness {
             if (sell) stock.mint(address(sv), amountIn);
             else cash.mint(address(sv), amountIn);
         }
-        vm.prank(KEEPER);
         x.settleRestock();
         assertFalse(x.state().orderOpen);
         uint256 expected = !filled ? nav : sell ? nav - _value(amountIn) + out : nav - amountIn + _value(out);

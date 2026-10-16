@@ -44,11 +44,13 @@ contract PriceStore is IPriceStore, Ownable2Step {
     /// @inheritdoc IPriceStore
     function verify(bytes calldata update_, uint32 feedId) external view returns (Price memory p) {
         bytes calldata payload = _trusted(update_);
-        (uint64 ts,, uint8 feeds, uint256 pos) = PythLazerLib.header(payload);
+        (uint64 ts, uint8 channel, uint8 feeds, uint256 pos) = PythLazerLib.header(payload);
+        if (channel != PythLazerLib.CHANNEL) revert PythLazerLib.MalformedUpdate();
         for (uint256 k; k < feeds; ++k) {
             (uint32 id, uint256 next) = PythLazerLib.skipFeed(payload, pos);
             if (id == feedId) {
                 (, p,) = PythLazerLib.readFeed(payload, pos, ts);
+                if (p.flags & PythLazerLib.REQUIRED != PythLazerLib.REQUIRED) revert PythLazerLib.MalformedUpdate();
                 return p;
             }
             pos = next;
@@ -59,12 +61,15 @@ contract PriceStore is IPriceStore, Ownable2Step {
     /// @inheritdoc IPriceStore
     function update(bytes calldata update_) external returns (uint256 stored) {
         bytes calldata payload = _trusted(update_);
-        (uint64 ts,, uint8 feeds, uint256 pos) = PythLazerLib.header(payload);
+        (uint64 ts, uint8 channel, uint8 feeds, uint256 pos) = PythLazerLib.header(payload);
+        if (channel != PythLazerLib.CHANNEL) revert PythLazerLib.MalformedUpdate();
         for (uint256 k; k < feeds; ++k) {
             uint32 id;
             Price memory p;
             (id, p, pos) = PythLazerLib.readFeed(payload, pos, ts);
-            if (p.price > 0 && ts > _prices[id].timestampUs) {
+            // A feed without the required properties is skipped, not stored.
+            if (p.price > 0 && p.flags & PythLazerLib.REQUIRED == PythLazerLib.REQUIRED && ts > _prices[id].timestampUs)
+            {
                 _prices[id] = p;
                 ++stored;
             }

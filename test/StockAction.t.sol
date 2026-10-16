@@ -17,6 +17,11 @@ contract StockActionTest is StockVaultHarness {
     uint56 internal constant QUARTER = 0.25e12; // after a 4:1 split, one token is four shares
     string internal constant NEW_MARKET = "0x00000000000000000000000000000000000000000000000000000000000000bb";
 
+    function setUp() public override {
+        super.setUp();
+        x.poke(); // an anchor to check accepted moves against, as any vault that has traded has
+    }
+
     function _announce(uint256 ratio) internal {
         vm.prank(UPDATER);
         ratios.setRatio(address(stock), ratio);
@@ -31,7 +36,7 @@ contract StockActionTest is StockVaultHarness {
 
     function test_anAnnouncedRatioRefusesEveryPrice() public {
         vm.prank(OWNER);
-        x.setRestockMemo(hex"010203");
+        x.setRestockMemo('"did_id":"\x04"\x01\x02\x03');
         _announce(QUARTER);
         assertTrue(x.actionPending());
 

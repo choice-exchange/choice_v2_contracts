@@ -85,6 +85,7 @@ interface IStockVaultExtension {
     function setCurveOpen(bool open) external;
     function unpause(uint8 flags) external;
     function acceptAction(uint56 ratio, uint16 maxMoveBps) external;
+    function acceptActionAt(uint56 ratio, uint16 maxMoveBps, uint256 expectedPrice) external;
     function migrateMarket(string calldata marketId_) external;
     function setRestockMemo(bytes calldata memo) external;
     function acceptNav() external;

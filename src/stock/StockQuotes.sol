@@ -84,16 +84,21 @@ library StockQuotes {
         IERC20 cashToken = IERC20(Currency.unwrap(ctx.cash));
         if (q.vaultBuys) {
             StockLib.countRestock(c, s, q.cash);
-            uint256 value = StockLib.stockToCash(ctx, s.stockBooked + q.stock, r.price, Math.Rounding.Ceil);
+            uint256 value = StockLib.stockToCash(ctx, StockLib.stockInventory(s) + q.stock, r.price, Math.Rounding.Ceil);
             if (value > c.maxInventory) revert InventoryCapExceeded(value, c.maxInventory);
+            // The reserve, an unwinding epoch's debt and the margin to hedge what comes in stay.
+            uint256 keepCash = StockLib.cashKept(c, s) + fair * 10 / c.leverageX10;
+            uint256 own = StockLib.ownCash(s, ctx);
+            if (own < q.cash + keepCash) revert StockLib.CashShort(q.cash + keepCash, own);
             StockLib.spendOwnCash(s, ctx, q.cash);
             uint256 got = _pull(stockToken, issuer, q.stock);
             cashToken.safeTransfer(issuer, q.cash);
             s.stockBooked += got;
+            s.cashBooked -= q.cash;
         } else {
             if (q.stock > s.stockBooked) revert NotEnoughStock(q.stock, s.stockBooked);
             StockLib.ensureToken(ctx, ctx.stock, q.stock);
-            _pull(cashToken, issuer, q.cash);
+            s.cashBooked += _pull(cashToken, issuer, q.cash);
             stockToken.safeTransfer(issuer, q.stock);
             s.stockBooked -= q.stock;
         }

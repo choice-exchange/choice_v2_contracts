@@ -172,22 +172,22 @@ contract StockPublic is StockModule {
     /// `makerTimeout`.
     function cancelMaker() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockHedge.cancelMaker(l.config, l.state, msg.sender == l.keeper);
+        StockHedge.cancelMaker(l.config, l.state, l.ctx, msg.sender == l.keeper);
     }
 
     function topUpMargin() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockHedge.topUpMargin(l.config, l.state, l.ctx);
+        StockHedge.topUpMargin(l.config, l.state, l.ctx, msg.sender == l.keeper);
     }
 
-    /// @notice Close the open restock order on what has arrived; the keeper any time, anyone past its
-    /// deadline. See `StockRestock.settle`.
+    /// @notice Close the open restock order on what has arrived, or as lapsed past its deadline.
+    /// Anyone. See `StockRestock.settle`.
     function settleRestock() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockRestock.settle(l.state, l.ctx, msg.sender == l.keeper);
+        StockRestock.settle(l.state, l.ctx);
     }
 
-    /// @notice Book stock that arrived with no order open.
+    /// @notice Book stock and cash that arrived with no order open.
     function syncWindfall() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
         StockRestock.syncWindfall(l.state, l.ctx);
