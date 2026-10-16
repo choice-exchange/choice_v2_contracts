@@ -144,4 +144,23 @@ interface IExchangeDerivatives {
         external
         view
         returns (TrimmedDerivativeLimitOrder[] memory orders);
+
+    /// @dev `deposit` `0xe441dec9` and `withdraw` `0xeb28c205` move `amount` of bank `denom` (the
+    /// token's own units, not the API format) into and out of one of the sender's non-default
+    /// subaccounts. Both proven from a contract on mainnet (10-12, subaccount 1, USDC).
+    function deposit(address sender, string calldata subaccountID, string calldata denom, uint256 amount)
+        external
+        returns (bool success);
+
+    function withdraw(address sender, string calldata subaccountID, string calldata denom, uint256 amount)
+        external
+        returns (bool success);
+
+    /// @dev `subaccountDeposit` `0x9e96621f`: a non-default subaccount's balance of `denom` in the
+    /// token's own units, rounded down; a resting order's margin hold is in the total, not the
+    /// available. A default subaccount reads zero (its funds are the bank balance).
+    function subaccountDeposit(string calldata subaccountID, string calldata denom)
+        external
+        view
+        returns (uint256 availableBalance, uint256 totalBalance);
 }

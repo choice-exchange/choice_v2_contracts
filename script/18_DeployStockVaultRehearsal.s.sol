@@ -70,6 +70,7 @@ contract DeployStockVaultRehearsal is BaseScript {
                 vaultCodeHash: keccak256(code),
                 poolManager: manager,
                 cash: IERC20(usdc),
+                cashDenom: string.concat("erc20:", vm.toString(usdc)),
                 store: IPriceStore(address(store)),
                 calendar: calendar,
                 modules: modules,

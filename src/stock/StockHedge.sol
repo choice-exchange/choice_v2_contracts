@@ -12,6 +12,12 @@ import {Reference, Refusal, StockConfig, StockContext, StockState} from "./Stock
 /// @notice A `StockVault`'s short and its value: reading the position back, market and maker hedges
 /// toward the target, margin top-ups, and what the vault is worth. Its external functions run by
 /// DELEGATECALL, as the vault: the perp position they trade is the vault's.
+///
+/// The short trades from the vault's hedge subaccount (`StockLib.HEDGE_NONCE`), which holds a deposit of
+/// its own: each order or top-up first leaves exactly what it needs available there, depositing the
+/// shortfall from the vault's booked cash or bringing the rest back to the bank, and a confirmation
+/// brings back whatever is free. Cash crosses between the bank and the subaccount only here, booked
+/// both ways.
 library StockHedge {
     using SafeCast for uint256;
     using SafeCast for int256;
@@ -38,9 +44,20 @@ library StockHedge {
     // Hedge
     // -------------------------------------------------------------------------------------
 
-    /// @notice Read the short back from the position: the truth a pending order is judged against.
-    /// A resting maker order is read back too: what may still fill, or cleared once it is gone.
-    function confirmHedge(StockState storage s) public {
+    /// @notice Read the short back from the position, then bring the subaccount's free cash back to the
+    /// bank (best effort: if the exchange refuses, it stays there, still in the value).
+    function confirmHedge(StockState storage s) external {
+        _confirm(s);
+        (uint256 available,) = StockLib.subaccountCash(s);
+        if (available == 0) return;
+        try StockLib.EXCHANGE.withdraw(address(this), StockLib.subaccount(), s.cashDenom, available) returns (bool ok) {
+            if (ok) s.cashBooked += available;
+        } catch {}
+    }
+
+    /// @dev Read the short back from the position: the truth a pending order is judged against. A
+    /// resting maker order is read back too: what may still fill, or cleared once it is gone.
+    function _confirm(StockState storage s) private {
         if (s.hedgeBlock == block.number) revert HedgePending();
         (bool found, IExchangeDerivatives.DerivativePosition memory p) = StockLib.position(s);
         s.shortConfirmed = !found ? int256(0) : (p.isLong ? -p.quantity.toInt256() : p.quantity.toInt256());
@@ -67,7 +84,7 @@ library StockHedge {
         bool restockOpen,
         bool isKeeper
     ) external returns (bool ordered) {
-        confirmHedge(s);
+        _confirm(s);
         if (bytes(s.makerHash).length != 0) {
             _requireMakerReplaceable(c, s, isKeeper);
             _cancelMaker(s);
@@ -76,7 +93,10 @@ library StockHedge {
         if (r.reason != Refusal.None) revert StockLib.PriceNotUsable(r.reason);
 
         (bool sell, uint256 qty) = _hedgeOrder(c, s, ctx, r, restockOpen);
-        if (qty == 0) return false;
+        if (qty == 0) {
+            _fund(s, ctx, 0);
+            return false;
+        }
         if (!isKeeper && block.timestamp < uint256(s.lastHedgeTime) + c.publicHedgeDelay) {
             revert HedgeTooSoon(uint256(s.lastHedgeTime) + c.publicHedgeDelay);
         }
@@ -130,13 +150,16 @@ library StockHedge {
         uint256 price
     ) external returns (bool placed) {
         if (c.makerTimeout == 0) revert MakerOff();
-        confirmHedge(s);
+        _confirm(s);
         if (bytes(s.makerHash).length != 0) _cancelMaker(s);
         Reference memory r = StockLib.storedReference(c, ctx);
         if (r.reason != Refusal.None) revert StockLib.PriceNotUsable(r.reason);
 
         (bool sell, uint256 qty) = _hedgeOrder(c, s, ctx, r, restockOpen);
-        if (qty == 0) return false;
+        if (qty == 0) {
+            _fund(s, ctx, 0);
+            return false;
+        }
         uint256 low = r.sharePrice * (StockLib.BPS - c.hedgeSlippageBps) / StockLib.BPS;
         uint256 high = Math.mulDiv(r.sharePrice, StockLib.BPS + c.hedgeSlippageBps, StockLib.BPS, Math.Rounding.Ceil);
         if (price < low || price > high || price % c.priceTick != 0) revert MakerPriceOutOfBand(price, low, high);
@@ -169,11 +192,14 @@ library StockHedge {
 
     /// @notice Cancel the resting maker order: the keeper any time, anyone once it has rested
     /// `makerTimeout` (so a stalled keeper cannot leave one resting at a stale price).
-    function cancelMaker(StockConfig storage c, StockState storage s, bool isKeeper) external {
+    function cancelMaker(StockConfig storage c, StockState storage s, StockContext memory ctx, bool isKeeper)
+        external
+    {
         if (bytes(s.makerHash).length == 0) revert NoMaker();
         _requireMakerReplaceable(c, s, isKeeper);
-        confirmHedge(s);
+        _confirm(s);
         if (bytes(s.makerHash).length != 0) _cancelMaker(s);
+        _fund(s, ctx, 0);
     }
 
     /// @dev The order that would bring the short to target: which way, and how much in shares, rounded
@@ -195,7 +221,7 @@ library StockHedge {
         if (qty == 0 || StockLib.unitsToCash(ctx, qty, r.sharePrice) < c.minHedge) qty = 0;
     }
 
-    /// @dev An opening order's margin, made available out of the vault's own cash; a reducing order
+    /// @dev An opening order's margin, made available in the hedge subaccount; a reducing order
     /// carries none (reduce-only). The exchange wants the initial margin at the order price AND at the
     /// mark, the latter less the PnL the order opens at; so it is sized at the higher of the two prices,
     /// plus, for a sell placed below the mark, the loss it opens at, `qty * (mark - price)`.
@@ -208,11 +234,30 @@ library StockHedge {
         uint256 price,
         uint256 mark
     ) private returns (uint256 margin) {
-        if (!sell) return 0;
-        margin = Math.mulDiv(qty, Math.max(price, mark), 1e18) * 10 / c.leverageX10;
-        if (mark > price) margin += Math.mulDiv(qty, mark - price, 1e18, Math.Rounding.Ceil);
+        if (sell) {
+            margin = Math.mulDiv(qty, Math.max(price, mark), 1e18) * 10 / c.leverageX10;
+            if (mark > price) margin += Math.mulDiv(qty, mark - price, 1e18, Math.Rounding.Ceil);
+        }
         // The margin hold also covers the fee; 1% over is far above any fee tier.
-        StockLib.spendOwnCash(s, ctx, StockLib.fromApi(ctx, margin, Math.Rounding.Ceil) * 101 / 100 + 1);
+        _fund(s, ctx, margin == 0 ? 0 : StockLib.fromApi(ctx, margin, Math.Rounding.Ceil) * 101 / 100 + 1);
+    }
+
+    /// @dev Leave exactly `need` (cash units) available in the hedge subaccount: deposit the shortfall
+    /// out of the vault's own cash, or bring the rest back to the bank. Booked either way.
+    function _fund(StockState storage s, StockContext memory ctx, uint256 need) private {
+        (uint256 available,) = StockLib.subaccountCash(s);
+        if (available == need) return;
+        string memory sub = StockLib.subaccount();
+        if (available < need) {
+            uint256 amount = need - available;
+            StockLib.spendOwnCash(s, ctx, amount);
+            s.cashBooked -= amount;
+            if (!StockLib.EXCHANGE.deposit(address(this), sub, s.cashDenom, amount)) revert ExchangeRefused();
+        } else {
+            uint256 amount = available - need;
+            if (!StockLib.EXCHANGE.withdraw(address(this), sub, s.cashDenom, amount)) revert ExchangeRefused();
+            s.cashBooked += amount;
+        }
     }
 
     function _requireMakerReplaceable(StockConfig storage c, StockState storage s, bool isKeeper) private view {
@@ -271,7 +316,7 @@ library StockHedge {
         uint256 equity = eq <= 0 ? 0 : uint256(eq);
         if (isKeeper ? equity >= target : equity * 10 >= target * 7) revert MarginHealthy();
         uint256 amount = target - equity;
-        StockLib.spendOwnCash(s, ctx, StockLib.fromApi(ctx, amount, Math.Rounding.Ceil) + 1);
+        _fund(s, ctx, StockLib.fromApi(ctx, amount, Math.Rounding.Ceil) + 1);
         string memory sub = StockLib.subaccount();
         if (!StockLib.EXCHANGE.increasePositionMargin(address(this), sub, sub, s.marketId, amount)) {
             revert ExchangeRefused();
@@ -283,27 +328,22 @@ library StockHedge {
     // Value
     // -------------------------------------------------------------------------------------
 
-    /// @notice Cash, plus the booked stock (never more than is held) at the stored price, plus the
-    /// short at margin plus PnL, plus an open restock order (a buy's cash, a sell's stock), plus the margin a resting
-    /// maker order still holds (not its fee hold, which is small and may be a rebate). What the
-    /// vault holds for fixing-lane requesters, and what it owes an in-kind redeem epoch, is not its
-    /// own and is left out. ⚠️ Funding reaches the margin only
-    /// when it settles; deposits and withdrawals settle it first.
+    /// @notice The booked cash, plus the booked stock (never more than is held) at the stored price,
+    /// plus an open restock order's stock, plus the hedge subaccount's cash (a resting maker order's
+    /// margin hold included), plus the short at margin plus PnL. Cash that arrived unbooked, what the
+    /// vault holds for fixing-lane requesters and redeemers, and what it owes an in-kind redeem epoch,
+    /// are left out. ⚠️ Funding reaches the margin only when it settles; deposits and withdrawals settle
+    /// it first.
     function value(StockState storage s, StockContext memory ctx) external view returns (uint256 total) {
         uint256 price = StockLib.markPrice(ctx);
         total = StockLib.ownCash(s, ctx) + StockLib.orderValue(s, ctx, price);
         total += StockLib.stockToCash(
             ctx, Math.min(s.stockBooked, StockLib.ownStock(s, ctx)), price, Math.Rounding.Floor
         );
+        (, uint256 held) = StockLib.subaccountCash(s);
+        total += held;
         (bool found, IExchangeDerivatives.DerivativePosition memory p) = StockLib.position(s);
         if (found) total += StockLib.positionValue(ctx, p, StockLib.markSharePrice(ctx));
-        if (bytes(s.makerHash).length != 0) {
-            // The margin still held by what may fill; a filled part's margin is in the position.
-            (bool live, IExchangeDerivatives.TrimmedDerivativeLimitOrder memory o) = StockLib.makerOrder(s);
-            if (live && o.quantity != 0) {
-                total += StockLib.fromApi(ctx, Math.mulDiv(o.margin, o.fillable, o.quantity), Math.Rounding.Floor);
-            }
-        }
         // An in-kind redeem epoch's unpaid debt is not the vault's, though the cash for it still is.
         total = total > s.debtOwed ? total - s.debtOwed : 0;
     }

@@ -58,6 +58,11 @@ library StockLib {
     uint32 internal constant MIN_QUEUE_DEADLINE = 1 hours;
     uint32 internal constant MAX_QUEUE_DEADLINE = 14 days;
 
+    /// @dev The exchange subaccount the short trades from. Not the default one, which trades off the
+    /// bank balance: here its margin, PnL, fees and funding move a deposit of its own, so the bank
+    /// balance the cash ledger reads moves only on the vault's own calls (and on arrivals).
+    uint96 internal constant HEDGE_NONCE = 1;
+
     /// @dev Transient: set only while the vault holds a Choice vault lock it opened itself.
     uint256 internal constant LOCK_OPEN_SLOT = 0x2c7f2a3e1b8d4c6f9e0a5b7c3d2e1f0a9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e;
     uint8 internal constant OP_TO_CLAIMS = 1;
@@ -277,10 +282,28 @@ library StockLib {
         return IERC20(Currency.unwrap(currency)).balanceOf(address(this)) + ctx.vault.balanceOf(address(this), currency);
     }
 
-    /// @notice The cash held less what is held for fixing-lane requesters.
+    /// @notice The booked cash, never more than is held less what is held for fixing-lane requesters
+    /// and redeemers. Cash that arrived unbooked (an issuer's payment or refund, a donation) is not
+    /// the vault's to spend or value until it is booked.
     function ownCash(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        return Math.min(_freeCash(s, ctx), s.cashBooked);
+    }
+
+    /// @dev Cash held beyond the booked cash and what is held for requesters and redeemers.
+    function unbookedCash(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
+        uint256 free = _freeCash(s, ctx);
+        return free > s.cashBooked ? free - s.cashBooked : 0;
+    }
+
+    function _freeCash(StockState storage s, StockContext memory ctx) private view returns (uint256) {
         uint256 h = holding(ctx, ctx.cash);
         return h > s.cashOwed ? h - s.cashOwed : 0;
+    }
+
+    /// @dev The hedge subaccount's cash, in cash units: what is free, and the total (which includes a
+    /// resting order's margin hold).
+    function subaccountCash(StockState storage s) internal view returns (uint256 available, uint256 total) {
+        return EXCHANGE.subaccountDeposit(subaccount(), s.cashDenom);
     }
 
     /// @notice The stock held less what is held for fixing-lane requesters.
@@ -300,7 +323,7 @@ library StockLib {
     }
 
     /// @dev Make `amount` of cash available as the token for the vault to spend, refusing to dip
-    /// into what it holds for fixing-lane requesters.
+    /// into what it holds for fixing-lane requesters. The caller books what it spends.
     function spendOwnCash(StockState storage s, StockContext memory ctx, uint256 amount) internal {
         uint256 own = ownCash(s, ctx);
         if (own < amount) revert CashShort(amount, own);
@@ -352,9 +375,9 @@ library StockLib {
         return v <= 0 ? 0 : fromApi(ctx, uint256(v), Math.Rounding.Floor);
     }
 
-    /// @notice The vault's default exchange subaccount, which trades off its bank balance.
+    /// @notice The vault's hedge subaccount (`HEDGE_NONCE`).
     function subaccount() internal view returns (string memory) {
-        return SubaccountLib.defaultSubaccount(address(this));
+        return SubaccountLib.subaccount(address(this), HEDGE_NONCE);
     }
 
     function stockToCash(StockContext memory ctx, uint256 amount, uint256 price, Math.Rounding r)

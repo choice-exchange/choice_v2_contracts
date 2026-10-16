@@ -89,6 +89,5 @@ interface IStockVaultExtension {
     function migrateMarket(string calldata marketId_) external;
     function setRestockMemo(bytes calldata memo) external;
     function acceptNav() external;
-    function creditRestock(uint256 cash) external;
     function sweep(address token, address to, uint256 amount) external;
 }

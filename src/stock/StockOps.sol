@@ -37,7 +37,7 @@ library StockOps {
     // -------------------------------------------------------------------------------------
 
     /// @notice Settle a priced fill in claims and book it: the input minted to the vault, the output
-    /// burned from its claims, the stock ledger, the outflow window, and the anchor (a fill on a
+    /// burned from its claims, both ledgers, the outflow window, and the anchor (a fill on a
     /// live price is a fresh anchor; a frozen weekend price is not).
     function applyFill(
         StockConfig storage c,
@@ -51,7 +51,9 @@ library StockOps {
         ctx.vault.mint(address(this), cIn, f.amountIn);
         ctx.vault.burn(address(this), cOut, f.amountOut);
 
-        s.stockBooked = w.cashIn ? s.stockBooked - f.amountOut : s.stockBooked + f.amountIn;
+        (s.stockBooked, s.cashBooked) = w.cashIn
+            ? (s.stockBooked - f.amountOut, s.cashBooked + f.amountIn)
+            : (s.stockBooked + f.amountIn, s.cashBooked - f.amountOut);
         uint256 outValue = w.cashIn ? StockLib.stockToCash(ctx, f.amountOut, f.price, Math.Rounding.Ceil) : f.amountOut;
         if (block.timestamp >= uint256(s.windowStart) + c.window) {
             s.windowStart = uint64(block.timestamp);

@@ -186,6 +186,7 @@ library StockFixing {
         s.cashOwed = s.cashOwed - buyFilled.toUint128() + cashOut.toUint128();
         s.stockOwed = s.stockOwed - sellFilled.toUint128() + stockOut.toUint128();
         s.stockBooked = s.stockBooked + sellFilled - stockOut;
+        s.cashBooked = s.cashBooked + buyFilled - cashOut;
         (b.buy.filled, b.buy.out) = (buyFilled.toUint128(), stockOut.toUint128());
         (b.sell.filled, b.sell.out) = (sellFilled.toUint128(), cashOut.toUint128());
         b.price = price.toUint128();
