@@ -10,8 +10,13 @@ import {IExchangeDerivatives} from "../../src/interfaces/IExchangeDerivatives.so
 /// semantics a stock vault depends on: an order holds margin when placed and fills (or is dropped)
 /// at `endBlock`, against the price the test names; positions are per subaccount; funding accrues
 /// off the books (`accrueFunding`) and reaches the margin only when `decreasePositionMargin` runs,
-/// as on chain. Margin moves by minting and burning the cash mock, which is how the real precompile
-/// debits a bank balance without an approval.
+/// as on chain.
+///
+/// Funds, as on chain: the default subaccount (nonce 0) trades off the bank balance, moved by minting
+/// and burning the cash mock (how the real precompile debits a bank balance without an approval). Any
+/// other subaccount holds a deposit (`deposit`/`withdraw` against the bank, in the token's units):
+/// an order's margin hold lowers its available balance, a fill moves the hold into the position, and
+/// what a position pays back is credited to the deposit, never the bank.
 ///
 /// Post-only limit orders rest at once, as on chain: checked against the book's best bid and ask
 /// (`setBook`) and reverted if they would cross, visible to `derivativeOrdersByHashes` in the same
@@ -25,6 +30,7 @@ contract MockStockExchange {
         uint256 worstPrice;
         uint256 quantity;
         uint256 margin;
+        uint256 hold; // cash units held from the subaccount
     }
 
     struct Position {
@@ -36,7 +42,10 @@ contract MockStockExchange {
     }
 
     MockERC20 public cash;
+    string public cashDenom;
     uint256 public cashScale; // 10 ** (18 - cash decimals)
+    mapping(bytes32 subaccount => uint256) public depositTotal;
+    mapping(bytes32 subaccount => uint256) public depositHeld;
     Order[] internal _pending;
     mapping(bytes32 subaccount => mapping(bytes32 market => Position)) internal _positions;
     mapping(bytes32 subaccount => string[]) internal _markets;
@@ -53,6 +62,7 @@ contract MockStockExchange {
         uint256 quantity;
         uint256 margin;
         uint256 fillable;
+        uint256 holdLeft; // cash units still held for what may fill
     }
 
     mapping(bytes32 hash => Resting) internal _resting;
@@ -73,10 +83,11 @@ contract MockStockExchange {
         bool isBuy = keccak256(bytes(o.orderType)) == keccak256("buyPostOnly");
         require(isBuy || keccak256(bytes(o.orderType)) == keccak256("sellPostOnly"), "order type");
         require(isBuy ? (bestAsk == 0 || o.price < bestAsk) : o.price > bestBid, "exceeds top of book");
-        if (o.margin != 0) cash.burn(sender, _toCash(o.margin, true));
+        uint256 hold = _toCash(o.margin, true);
+        _hold(sender, o.subaccountID, hold);
         r.orderHash = Strings.toHexString(uint256(keccak256(abi.encode(address(this), ++limitOrdersPlaced))), 32);
         _resting[keccak256(bytes(r.orderHash))] =
-            Resting(sender, o.subaccountID, o.marketID, isBuy, o.price, o.quantity, o.margin, o.quantity);
+            Resting(sender, o.subaccountID, o.marketID, isBuy, o.price, o.quantity, o.margin, o.quantity, hold);
     }
 
     function cancelDerivativeOrder(
@@ -90,8 +101,7 @@ contract MockStockExchange {
         require(msg.sender == sender, "authz");
         Resting storage o = _resting[keccak256(bytes(orderHash))];
         require(o.fillable != 0, "order doesnt exist");
-        uint256 refund = o.margin * o.fillable / o.quantity;
-        if (refund != 0) cash.mint(o.sender, _toCash(refund, false));
+        _release(o.sender, o.subaccountID, o.holdLeft);
         delete _resting[keccak256(bytes(orderHash))];
         cancels++;
         return true;
@@ -129,7 +139,10 @@ contract MockStockExchange {
         Resting storage o = _resting[keccak256(bytes(orderHash))];
         require(quantity <= o.fillable, "overfill");
         uint256 marginShare = o.margin * quantity / o.quantity;
-        _apply(Order(o.sender, o.subaccountID, o.marketID, o.isBuy, o.price, quantity, marginShare), o.price);
+        uint256 holdShare = o.holdLeft * quantity / o.fillable;
+        o.holdLeft -= holdShare;
+        _consume(o.subaccountID, holdShare);
+        _apply(Order(o.sender, o.subaccountID, o.marketID, o.isBuy, o.price, quantity, marginShare, holdShare), o.price);
         o.fillable -= quantity;
     }
 
@@ -137,14 +150,49 @@ contract MockStockExchange {
     /// rest of its margin comes back.
     function matchCancel(string calldata orderHash) external {
         Resting storage o = _resting[keccak256(bytes(orderHash))];
-        uint256 refund = o.margin * o.fillable / o.quantity;
-        if (refund != 0) cash.mint(o.sender, _toCash(refund, false));
+        _release(o.sender, o.subaccountID, o.holdLeft);
         delete _resting[keccak256(bytes(orderHash))];
     }
 
-    function setCash(MockERC20 cash_) external {
+    function setCash(MockERC20 cash_, string calldata denom) external {
         cash = cash_;
+        cashDenom = denom;
         cashScale = 10 ** (18 - cash_.decimals());
+    }
+
+    // ── subaccount funds ──────────────────────────────────────────────────
+
+    function deposit(address sender, string calldata subaccountID, string calldata denom, uint256 amount)
+        external
+        returns (bool)
+    {
+        require(msg.sender == sender, "authz");
+        require(_isCash(denom) && !_isDefault(subaccountID), "deposit");
+        cash.burn(sender, amount);
+        depositTotal[keccak256(bytes(subaccountID))] += amount;
+        return true;
+    }
+
+    function withdraw(address sender, string calldata subaccountID, string calldata denom, uint256 amount)
+        external
+        returns (bool)
+    {
+        require(msg.sender == sender, "authz");
+        require(_isCash(denom) && !_isDefault(subaccountID), "withdraw");
+        _debit(sender, subaccountID, amount);
+        cash.mint(sender, amount);
+        return true;
+    }
+
+    function subaccountDeposit(string calldata subaccountID, string calldata denom)
+        external
+        view
+        returns (uint256 available, uint256 total)
+    {
+        if (!_isCash(denom) || _isDefault(subaccountID)) return (0, 0);
+        bytes32 sub = keccak256(bytes(subaccountID));
+        total = depositTotal[sub];
+        available = total - depositHeld[sub];
     }
 
     function setFailDecrease(bool fail) external {
@@ -166,8 +214,9 @@ contract MockStockExchange {
         require(msg.sender == sender, "authz");
         bool isBuy = keccak256(bytes(o.orderType)) == keccak256("buy");
         require(isBuy || keccak256(bytes(o.orderType)) == keccak256("sell"), "order type");
-        if (o.margin != 0) cash.burn(sender, _toCash(o.margin, true));
-        _pending.push(Order(sender, o.subaccountID, o.marketID, isBuy, o.price, o.quantity, o.margin));
+        uint256 hold = _toCash(o.margin, true);
+        _hold(sender, o.subaccountID, hold);
+        _pending.push(Order(sender, o.subaccountID, o.marketID, isBuy, o.price, o.quantity, o.margin, hold));
         ordersPlaced++;
         r.orderHash = "0xmock";
     }
@@ -179,9 +228,10 @@ contract MockStockExchange {
             Order memory o = _pending[k];
             bool fills = o.isBuy ? fillPrice <= o.worstPrice : fillPrice >= o.worstPrice;
             if (!fills) {
-                if (o.margin != 0) cash.mint(o.sender, _toCash(o.margin, false));
+                _release(o.sender, o.subaccountID, o.hold);
                 continue;
             }
+            _consume(o.subaccountID, o.hold);
             _apply(o, fillPrice);
         }
         delete _pending;
@@ -206,18 +256,18 @@ contract MockStockExchange {
         int256 payout = int256(marginShare) + move * int256(o.quantity) / 1e18;
         p.quantity -= o.quantity;
         p.margin -= marginShare;
-        if (payout > 0) cash.mint(o.sender, _toCash(uint256(payout), false));
+        if (payout > 0) _credit(o.sender, o.subaccountID, _toCash(uint256(payout), false));
     }
 
     function increasePositionMargin(
         address sender,
-        string calldata,
+        string calldata src,
         string calldata dst,
         string calldata market,
         uint256 amount
     ) external returns (bool) {
         require(msg.sender == sender, "authz");
-        cash.burn(sender, _toCash(amount, true));
+        _debit(sender, src, _toCash(amount, true));
         _positions[keccak256(bytes(dst))][keccak256(bytes(market))].margin += amount;
         return true;
     }
@@ -226,7 +276,7 @@ contract MockStockExchange {
     function decreasePositionMargin(
         address sender,
         string calldata src,
-        string calldata,
+        string calldata dst,
         string calldata market,
         uint256 amount
     ) external returns (bool) {
@@ -238,8 +288,7 @@ contract MockStockExchange {
         require(m >= int256(amount), "margin");
         p.unsettledFunding = 0;
         p.margin = uint256(m) - amount;
-        uint256 out = _toCash(amount, false);
-        if (out != 0) cash.mint(sender, out);
+        _credit(sender, dst, _toCash(amount, false));
         decreases++;
         return true;
     }
@@ -284,13 +333,13 @@ contract MockStockExchange {
 
     /// @notice Cut a position, as a liquidation would.
     /// @notice As a governance forced settlement: close the position at `price`, margin plus PnL paid
-    /// to `holder`'s bank balance.
+    /// to the subaccount (`holder`'s bank balance for a default one).
     function forceSettle(string calldata subaccountID, string calldata market, uint256 price, address holder) external {
         Position storage p = _positions[keccak256(bytes(subaccountID))][keccak256(bytes(market))];
         int256 move = p.isLong ? int256(price) - int256(p.entryPrice) : int256(p.entryPrice) - int256(price);
         int256 payout = int256(p.margin) + p.unsettledFunding + move * int256(p.quantity) / 1e18;
         (p.quantity, p.margin, p.unsettledFunding) = (0, 0, 0);
-        if (payout > 0) cash.mint(holder, _toCash(uint256(payout), false));
+        if (payout > 0) _credit(holder, subaccountID, _toCash(uint256(payout), false));
     }
 
     function setQuantity(string calldata subaccountID, string calldata market, uint256 quantity) external {
@@ -299,5 +348,98 @@ contract MockStockExchange {
 
     function _toCash(uint256 api, bool up) internal view returns (uint256) {
         return up ? (api + cashScale - 1) / cashScale : api / cashScale;
+    }
+
+    function _isCash(string calldata denom) internal view returns (bool) {
+        return keccak256(bytes(denom)) == keccak256(bytes(cashDenom));
+    }
+
+    /// @dev A default subaccount id ends in a zero nonce.
+    function _isDefault(string memory subaccountID) internal pure returns (bool) {
+        bytes memory b = bytes(subaccountID);
+        for (uint256 k = 42; k < b.length; ++k) {
+            if (b[k] != "0") return false;
+        }
+        return true;
+    }
+
+    /// @dev Margin held for an order: the bank pays it at once for a default subaccount.
+    function _hold(address sender, string memory subaccountID, uint256 amount) internal {
+        if (amount == 0) return;
+        if (_isDefault(subaccountID)) {
+            cash.burn(sender, amount);
+            return;
+        }
+        bytes32 sub = keccak256(bytes(subaccountID));
+        require(depositTotal[sub] - depositHeld[sub] >= amount, "insufficient funds");
+        depositHeld[sub] += amount;
+    }
+
+    /// @dev A hold given back unfilled.
+    function _release(address sender, string memory subaccountID, uint256 amount) internal {
+        if (amount == 0) return;
+        if (_isDefault(subaccountID)) {
+            cash.mint(sender, amount);
+            return;
+        }
+        depositHeld[keccak256(bytes(subaccountID))] -= amount;
+    }
+
+    /// @dev A hold filled: it moves into the position.
+    function _consume(string memory subaccountID, uint256 amount) internal {
+        if (amount == 0 || _isDefault(subaccountID)) return;
+        bytes32 sub = keccak256(bytes(subaccountID));
+        depositHeld[sub] -= amount;
+        depositTotal[sub] -= amount;
+    }
+
+    function _credit(address owner, string memory subaccountID, uint256 amount) internal {
+        if (amount == 0) return;
+        if (_isDefault(subaccountID)) {
+            cash.mint(owner, amount);
+            return;
+        }
+        depositTotal[keccak256(bytes(subaccountID))] += amount;
+    }
+
+    function _debit(address sender, string memory subaccountID, uint256 amount) internal {
+        if (amount == 0) return;
+        if (_isDefault(subaccountID)) {
+            cash.burn(sender, amount);
+            return;
+        }
+        bytes32 sub = keccak256(bytes(subaccountID));
+        require(depositTotal[sub] - depositHeld[sub] >= amount, "insufficient funds");
+        depositTotal[sub] -= amount;
+    }
+}
+
+/// @notice Injective's oracle precompile at `0x67`, for PythPro prices quoted in USD: a price and the
+/// block time (seconds) it landed at, per feed key; a key never set reverts, as on chain.
+contract MockOraclePrecompile {
+    struct PricePairState {
+        uint256 pairPrice;
+        uint256 basePrice;
+        uint256 quotePrice;
+        uint256 baseCumulativePrice;
+        uint256 quoteCumulativePrice;
+        uint64 baseTimestamp;
+        uint64 quoteTimestamp;
+    }
+
+    mapping(bytes32 key => PricePairState) internal _states;
+
+    function set(string calldata base, uint256 price, uint64 landedAt) external {
+        _states[keccak256(bytes(base))] = PricePairState(price, price, 0, 0, 0, landedAt, landedAt);
+    }
+
+    function oraclePricePairState(uint8 oracleType, string calldata base, string calldata quote)
+        external
+        view
+        returns (PricePairState memory s)
+    {
+        require(oracleType == 14 && keccak256(bytes(quote)) == keccak256("USD"), "no price for oracle was found");
+        s = _states[keccak256(bytes(base))];
+        require(s.pairPrice != 0, "no price for oracle was found");
     }
 }

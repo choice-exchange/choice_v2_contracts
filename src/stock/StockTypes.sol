@@ -47,7 +47,7 @@ struct StockConfig {
     uint32 queueDeadline; // how long a redeem epoch may wait before anyone may settle it in kind
     uint16 exitFeeBps; // charged on a queued exit's cash, kept by those who stay, to cover the unwind
     bool weekendFills;
-    bool overnightLive; // false: the overnight session is treated as closed, priced at the 20:00 close
+    bool overnightLive; // false: the overnight session is priced as closed (a price moved since the 20:00 close must still be fresh)
     // -- caps
     uint96 maxTrade;
     uint96 maxTradeClosed;
@@ -68,7 +68,7 @@ struct StockConfig {
 }
 
 /// @notice What a stock vault keeps between calls.
-/// @param stockBooked the stock the vault accounts for (token plus claims). A balance above it is
+/// @param stockBooked the stock the vault accounts for (token plus claims, less `stockOwed`). A balance above it is
 /// a delivery or a windfall not yet booked; one below it means stock left without the vault
 /// sending it, and fills stop.
 /// @param shortConfirmed the short read back from the position, 1e18 units (positive = short)
@@ -84,6 +84,13 @@ struct StockConfig {
 /// @param orderDeadline when anyone may close the open order: its expiry plus `restockDeadline`
 /// @param makerHash the resting maker hedge order, empty when there is none
 /// @param makerFillable what of it may still fill, 1e18 units, as last read back
+/// @param orderWindow the restock-cap window the open order was counted in
+/// @param orderCounted the cash it counted against that window's cap
+/// @param cashBooked the cash the vault accounts for (token plus claims, less `cashOwed`). The short
+/// trades from its own exchange subaccount, so only the vault's own calls move this balance, besides
+/// arrivals: one above it is an issuer's payment or refund, a windfall, or the relayer share of the
+/// short's own fees (dust, whole units only), not yet booked
+/// @param cashDenom the cash's bank denom, which the exchange names it by; fixed at construction
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -118,6 +125,10 @@ struct StockState {
     bool makerSell;
     uint64 makerPlacedAt;
     uint256 makerFillable;
+    uint64 orderWindow;
+    uint96 orderCounted;
+    uint256 cashBooked;
+    string cashDenom;
 }
 
 /// @notice The fixing lane's tunables, set by the owner inside the limits in `StockFixing`. A batch
@@ -190,6 +201,8 @@ struct IssuerQuote {
 /// @param cash and `stock`: what is left to claim, paid pro rata on what remains (the last claim
 /// takes the dust); `debt` is cash owed to an in-kind epoch until the short is cut
 /// @param status 0 open, 1 in kind and waiting for its debt, 2 settled
+/// @param feeBps the exit fee when the epoch opened: a queued request cannot be cancelled, so a later
+/// raise never applies to it
 struct RedeemEpoch {
     uint128 shares;
     uint128 sharesLeft;
@@ -198,6 +211,7 @@ struct RedeemEpoch {
     uint128 debt;
     uint64 openedAt;
     uint8 status;
+    uint16 feeBps;
 }
 
 /// @notice A controller's place in the queue: its latest request, and what earlier settled ones left

@@ -359,6 +359,7 @@ contract StockVaultTest is StockVaultHarness {
     function test_inventoryCap() public {
         StockConfig memory c = _cfg();
         c.maxInventory = 9_500e6;
+        c.restockDailyCap = 9_500e6; // never above the inventory cap
         _setCfg(c);
         _expectRefusal(Refusal.InventoryCap);
         _swap(false, true, 2 ether);
@@ -606,7 +607,8 @@ contract StockVaultTest is StockVaultHarness {
         assertFalse(o.isBuy);
         assertEq(o.quantity, 30 ether);
         assertEq(o.worstPrice, 298.2e18); // 300 less 60 bp, on the 0.01 tick
-        assertEq(o.margin, Math.mulDiv(30 ether, 298.2e18, 1e18) * 10 / 30);
+        // Initial margin at the mark (the higher price), plus the 1.80 a share the order opens under it.
+        assertEq(o.margin, Math.mulDiv(30 ether, PRICE, 1e18) * 10 / 30 + Math.mulDiv(30 ether, 1.8e18, 1e18));
     }
 
     function test_aDroppedHedgeIsReadBackAsNothing() public {
@@ -694,12 +696,16 @@ contract StockVaultTest is StockVaultHarness {
         assertLt(shares, previewBefore, "the funding is in the price the deposit paid");
     }
 
-    function test_aFailedFundingSettlementStopsDeposits() public {
+    /// A refused funding settlement (a short under its initial margin ratio refuses any decrease) must not
+    /// freeze deposits and exits: the value is read with funding unsettled.
+    function test_aFailedFundingSettlementDoesNotStopDeposits() public {
         _hedge(PRICE);
         exchange.setFailDecrease(true);
+        cash.mint(OWNER, 1e6);
         vm.prank(OWNER);
-        vm.expectRevert(bytes("decrease failed"));
         sv.deposit(1e6, OWNER);
+        vm.prank(OWNER);
+        sv.withdraw(1e6, OWNER, OWNER);
     }
 
     function test_aNavJumpStopsDepositsUntilAccepted() public {

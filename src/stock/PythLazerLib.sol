@@ -26,6 +26,15 @@ library PythLazerLib {
     uint8 internal constant HAS_CONFIDENCE = 2;
     uint8 internal constant HAS_SESSION = 4;
     uint8 internal constant HAS_FEED_TIMESTAMP = 8;
+    uint8 internal constant HAS_EXPONENT = 16;
+    /// @dev What a stored price must carry: a subscriber picks its properties and every update is
+    /// signed alike, so a missing exponent (read as 0, i.e. x1e5 here) or feed time (read as fresh)
+    /// would otherwise pass as a valid price.
+    uint8 internal constant REQUIRED = HAS_EXPONENT | HAS_FEED_TIMESTAMP;
+    /// @dev The only channel accepted: fixed rate 200 ms, what the relayed updates on Injective carry
+    /// (measured 10-15) and the grid the fixing lane settles on. A faster channel would let a filler
+    /// pick among more prices.
+    uint8 internal constant CHANNEL = 3;
 
     uint8 internal constant SESSION_CLOSED = 4;
 
@@ -92,6 +101,7 @@ library PythLazerLib {
                 pos += 2; // publisher count
             } else if (prop == 4) {
                 p.exponent = int16(uint16(bytes2(payload[pos:pos + 2])));
+                p.flags |= HAS_EXPONENT;
                 pos += 2;
             } else if (prop == 5) {
                 p.confidence = uint64(bytes8(payload[pos:pos + 8]));
@@ -121,7 +131,7 @@ library PythLazerLib {
                 revert UnknownProperty(prop);
             }
         }
-        if (p.feedTimestampUs == 0 || p.feedTimestampUs > timestampUs) p.feedTimestampUs = timestampUs;
+        if (p.feedTimestampUs > timestampUs) p.feedTimestampUs = timestampUs;
         if (p.bestBid > 0 && p.bestAsk > 0 && p.bestAsk >= p.bestBid) {
             p.flags |= HAS_QUOTE;
         } else {

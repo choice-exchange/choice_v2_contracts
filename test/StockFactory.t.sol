@@ -39,6 +39,7 @@ contract StockFactoryTest is StockVaultHarness {
                 vaultCodeHash: keccak256(type(StockVault).creationCode),
                 poolManager: manager,
                 cash: IERC20(address(cash)),
+                cashDenom: CASH_DENOM,
                 store: store,
                 calendar: calendar,
                 modules: sv.MODULES(),
@@ -128,6 +129,7 @@ contract StockFactoryTest is StockVaultHarness {
                 ratios: ratios,
                 feedId: FEED,
                 marketId: MARKET,
+                cashDenom: CASH_DENOM,
                 owner: OWNER,
                 name: "Stock vault 2",
                 symbol: "SV2"

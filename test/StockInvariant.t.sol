@@ -274,8 +274,7 @@ contract StockHandler is Test {
             if (fill) STOCK.mint(address(SV), s.orderStock);
             else CASH.mint(address(SV), s.orderCash);
         }
-        vm.prank(KEEPER);
-        X.settleRestock();
+        X.settleRestock(); // anyone: the ledgers show what came
         done["answer"]++;
         _after();
     }
@@ -340,7 +339,7 @@ contract StockInvariantTest is StockVaultHarness {
         super.setUp();
         vm.startPrank(OWNER);
         x.setQuoteSigner(vm.addr(QUOTE_KEY));
-        x.setRestockMemo(hex"7b0102037d");
+        x.setRestockMemo('{"did_id":"\x04"\x01\x02\x03}');
         x.setFixingConfig(
             FixingConfig({
                 interval: 60,
@@ -436,7 +435,7 @@ contract StockInvariantTest is StockVaultHarness {
     /// forge-config: ci.invariant.depth = 60
     function invariant_whatIsHeldCoversWhatIsOwed() public view {
         StockState memory s = x.state();
-        assertGe(_held(cash), s.cashOwed, "cash covers what requesters are owed");
+        assertEq(_held(cash), s.cashBooked + s.cashOwed, "every unit of cash is booked or owed");
         assertEq(_held(stock), s.stockBooked + s.stockOwed, "every unit of stock is booked or owed");
     }
 

@@ -49,6 +49,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     uint256 internal constant SIGNER_KEY = 0x5161;
     uint32 internal constant FEED = 7;
     string internal constant MARKET = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+    string internal constant CASH_DENOM = "erc20:cash";
     int64 internal constant MANTISSA = 30_000_000; // 300.00000, exponent -5
     uint256 internal constant PRICE = 300e18;
 
@@ -87,9 +88,9 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
 
         vm.etch(EXCHANGE, address(new MockStockExchange()).code);
         exchange = MockStockExchange(EXCHANGE);
-        exchange.setCash(cash);
+        exchange.setCash(cash, CASH_DENOM);
 
-        store = new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
+        store = _newStore();
         calendar = new MarketCalendar(OWNER, GUARDIAN);
         registry = new StockRegistry(OWNER);
         ratios = new StockRatios(OWNER, UPDATER);
@@ -105,6 +106,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
                 ratios: ratios,
                 feedId: FEED,
                 marketId: MARKET,
+                cashDenom: CASH_DENOM,
                 owner: OWNER,
                 name: "Stock vault",
                 symbol: "SV"
@@ -152,6 +154,11 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
+
+    /// The price store every vault in the suite reads; a suite may swap in another kind.
+    function _newStore() internal virtual returns (PriceStore) {
+        return new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
+    }
 
     function _cfg() internal pure returns (StockConfig memory) {
         return StockConfig({
@@ -273,7 +280,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     }
 
     function _sub() internal view returns (string memory) {
-        return SubaccountLib.defaultSubaccount(address(sv));
+        return SubaccountLib.subaccount(address(sv), 1);
     }
 
     function _claims(MockERC20 t) internal view returns (uint256) {
