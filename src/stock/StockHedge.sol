@@ -192,9 +192,7 @@ library StockHedge {
 
     /// @notice Cancel the resting maker order: the keeper any time, anyone once it has rested
     /// `makerTimeout` (so a stalled keeper cannot leave one resting at a stale price).
-    function cancelMaker(StockConfig storage c, StockState storage s, StockContext memory ctx, bool isKeeper)
-        external
-    {
+    function cancelMaker(StockConfig storage c, StockState storage s, StockContext memory ctx, bool isKeeper) external {
         if (bytes(s.makerHash).length == 0) revert NoMaker();
         _requireMakerReplaceable(c, s, isKeeper);
         _confirm(s);

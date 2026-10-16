@@ -471,7 +471,8 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         if (r.reason != Refusal.None || r.closed) return false;
         uint256 last = s.lastSharePrice;
         return last == 0
-            || StockLib.deviationBps(_convertToAssets(10 ** decimals(), Math.Rounding.Floor), last) <= l.config.navJumpBps;
+            || StockLib.deviationBps(_convertToAssets(10 ** decimals(), Math.Rounding.Floor), last)
+                <= l.config.navJumpBps;
     }
 
     /// @dev Own cash above the reserve and above what the redeem queue is waiting for: the open
