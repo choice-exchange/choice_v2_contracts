@@ -76,8 +76,10 @@ jobs:
       # up below as "Name (path)" at the wrong settings, or go missing from the report.
       - name: Contract sizes
         run: |
+          # Deployable contracts only: an abstract contract has no bytecode, so forge leaves it out
+          # of the size report and there is nothing for EIP-170 to measure.
           ours="$(find src -name '*.sol' \
-                  -exec sed -n 's/^ *\(abstract \)\?contract \([A-Za-z0-9_]*\).*/\2/p' {} + \
+                  -exec sed -n 's/^ *contract \([A-Za-z0-9_]*\).*/\1/p' {} + \
                   | sort -u | jq -R . | jq -sc .)"
           # forge exits 1 - and prints "some contracts exceed the runtime size limit" - when
           # ANY artifact is over, upstream's included, so neither its exit code nor its stderr
