@@ -223,8 +223,8 @@ contract StockRestockTest is StockVaultHarness {
         vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 5 ether, 9.8 ether));
         x.settleRestock();
         vm.warp(block.timestamp + 1 days + 3601);
-        x.settleRestock(); // anyone, past the deadline: lapsed, no halt
-        x.syncWindfall();
+        vm.prank(OWNER);
+        x.writeOffRestock(); // past the deadline: written off, and what came is booked
         assertEq(x.state().stockBooked, 35 ether);
         _price(MANTISSA);
         assertEq(sv.totalAssets(), nav - 3_000e6 + 1_500e6, "the cash left, the stock that came is booked");
@@ -244,17 +244,24 @@ contract StockRestockTest is StockVaultHarness {
         _order(false, 1_000e6, 3.3 ether);
     }
 
-    function test_anOrderWithNothingBackLapsesAndItsLateLegIsAWindfall() public {
+    function test_anOrderWithNothingBackIsWrittenOffAndItsLateLegIsAWindfall() public {
         uint256 nav = sv.totalAssets();
         _order(false, 3_000e6, 9.8 ether);
         vm.warp(block.timestamp + 1 days + 3600);
+        vm.prank(OWNER);
         vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 9.8 ether));
-        x.settleRestock();
+        x.writeOffRestock(); // not before the deadline
         vm.warp(block.timestamp + 1);
+        vm.expectRevert(abi.encodeWithSelector(StockRestock.NotDelivered.selector, 0, 9.8 ether));
+        x.settleRestock(); // nor by anyone: the deadline alone closes nothing
+        assertEq(sv.totalAssets(), nav - 60e6, "still open, still in the value");
+        vm.expectRevert(StockModule.NotOwner.selector);
+        x.writeOffRestock();
+        vm.prank(OWNER);
         vm.expectEmit(address(sv));
         emit StockRestock.RestockLapsed(false, 3_000e6);
-        x.settleRestock();
-        assertEq(sv.totalAssets(), nav - 3_000e6, "lapsed: out of the value");
+        x.writeOffRestock();
+        assertEq(sv.totalAssets(), nav - 3_000e6, "written off: out of the value");
         cash.mint(address(sv), 3_000e6); // refunded late
         assertEq(sv.totalAssets(), nav - 3_000e6, "not counted until booked");
         x.syncWindfall();
@@ -313,15 +320,34 @@ contract StockRestockTest is StockVaultHarness {
         assertEq(sv.totalAssets(), nav);
     }
 
-    function test_aLapsedSaleIsRecoveredWhenTheStockComes() public {
+    function test_aWrittenOffSaleIsRecoveredWhenTheStockComes() public {
         uint256 nav = sv.totalAssets();
         _order(true, 10 ether, 2_950e6);
         vm.warp(block.timestamp + 1 days + 3601);
-        x.settleRestock(); // lapsed: nothing came
+        vm.prank(OWNER);
+        x.writeOffRestock(); // nothing came
         assertEq(sv.totalAssets(), nav - 3_000e6);
         stock.mint(address(sv), 10 ether); // it was refunded after all
         x.syncWindfall();
         assertEq(sv.totalAssets(), nav);
+    }
+
+    /// 10-15: the issuer refunded an order 11 h past its expiry. Had the order lapsed by itself and a new
+    /// one gone out, that refund would have settled the NEW order as refunded, while the issuer still held
+    /// it. Past its deadline an order stays open, so its own late leg closes it, and the next waits.
+    function test_anOverdueOrderStaysOpenSoItsLateLegClosesItNotTheNext() public {
+        _order(false, 3_000e6, 9.8 ether);
+        vm.warp(block.timestamp + 1 days + 12 hours);
+        _price(MANTISSA);
+        vm.prank(KEEPER);
+        vm.expectRevert(StockRestock.RestockUnavailable.selector);
+        x.restock(false, 1_000e6, 3.3 ether, 1);
+        cash.mint(address(sv), 3_000e6); // the late refund
+        vm.expectEmit(address(sv));
+        emit StockRestock.RestockRefunded(false, 3_000e6);
+        x.settleRestock();
+        _order(false, 1_000e6, 3.3 ether);
+        assertTrue(x.state().orderOpen, "the next order is open, untouched by the old refund");
     }
 
     function test_windfallWaitsForAnOpenOrder() public {

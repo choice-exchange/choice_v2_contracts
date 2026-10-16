@@ -46,6 +46,8 @@ contract DeployStockVaultRehearsal is BaseScript {
     address internal constant ISSUER = 0x74a548ecdCa848654314402D9f8Fb19214A5008c;
     address internal constant AAPLS = 0xeBaf9Cd753F76C79aa47a910254D476B04d4a35A;
     uint32 internal constant FEED = 922;
+    /// @dev USDC/USD, the cash's own feed: the perp is marked at FEED over it.
+    uint32 internal constant USDC_FEED = 7;
     string internal constant MARKET = "0xa3d0ef8d845ada306a53baabd04edab9c5525ba9e011648a09aa064db5ca3442";
 
     uint256 internal constant START_PRICE_USD = 345;
@@ -71,6 +73,7 @@ contract DeployStockVaultRehearsal is BaseScript {
                 poolManager: manager,
                 cash: IERC20(usdc),
                 cashDenom: string.concat("erc20:", vm.toString(usdc)),
+                cashFeedId: USDC_FEED,
                 store: IPriceStore(address(store)),
                 calendar: calendar,
                 modules: modules,
@@ -172,13 +175,25 @@ contract DeployStockVaultRehearsal is BaseScript {
 
     /// @dev NYSE closures and half days through the rehearsal's horizon (days since 1970).
     function _holidays(MarketCalendar calendar) internal {
-        uint32[] memory closed = new uint32[](2);
+        uint32[] memory closed = new uint32[](12);
         closed[0] = _day(2026, 11, 26); // Thanksgiving
         closed[1] = _day(2026, 12, 25); // Christmas
+        // NYSE 2027 (a Saturday holiday is observed the Friday before, a Sunday one the Monday after).
+        closed[2] = _day(2027, 1, 1); // New Year's Day
+        closed[3] = _day(2027, 1, 18); // Martin Luther King Jr. Day
+        closed[4] = _day(2027, 2, 15); // Washington's Birthday
+        closed[5] = _day(2027, 3, 26); // Good Friday
+        closed[6] = _day(2027, 5, 31); // Memorial Day
+        closed[7] = _day(2027, 6, 18); // Juneteenth (Saturday)
+        closed[8] = _day(2027, 7, 5); // Independence Day (Sunday)
+        closed[9] = _day(2027, 9, 6); // Labor Day
+        closed[10] = _day(2027, 11, 25); // Thanksgiving
+        closed[11] = _day(2027, 12, 24); // Christmas (Saturday)
         calendar.setDays(closed, MarketCalendar.DayType.Closed);
-        uint32[] memory half = new uint32[](2);
+        uint32[] memory half = new uint32[](3);
         half[0] = _day(2026, 11, 27);
         half[1] = _day(2026, 12, 24);
+        half[2] = _day(2027, 11, 26);
         calendar.setDays(half, MarketCalendar.DayType.Half);
     }
 

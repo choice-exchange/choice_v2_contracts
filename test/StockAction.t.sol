@@ -175,9 +175,13 @@ contract StockActionTest is StockVaultHarness {
         exchange.forceSettle(_sub(), MARKET, PRICE, address(sv));
         x.confirmHedge();
         assertEq(x.state().shortConfirmed, 0);
+        assertTrue(x.state().positionLost, "gone with no cover of the vault's");
         assertApproxEqAbs(sv.totalAssets(), nav, 1, "the settlement paid the margin back");
 
         vm.startPrank(OWNER);
+        vm.expectRevert(StockHedge.HedgeOpen.selector);
+        x.migrateMarket(NEW_MARKET, 1e15, 1e16); // not before the owner has looked
+        x.acceptNav(); // settled, paid back: not merely paused
         x.migrateMarket(NEW_MARKET, 1e15, 1e16);
         _price(MANTISSA / 4);
         x.acceptAction(QUARTER, 100);

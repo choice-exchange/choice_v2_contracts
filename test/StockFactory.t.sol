@@ -40,6 +40,7 @@ contract StockFactoryTest is StockVaultHarness {
                 poolManager: manager,
                 cash: IERC20(address(cash)),
                 cashDenom: CASH_DENOM,
+                cashFeedId: 0,
                 store: store,
                 calendar: calendar,
                 modules: sv.MODULES(),
@@ -130,6 +131,7 @@ contract StockFactoryTest is StockVaultHarness {
                 feedId: FEED,
                 marketId: MARKET,
                 cashDenom: CASH_DENOM,
+                cashFeedId: 0,
                 owner: OWNER,
                 name: "Stock vault 2",
                 symbol: "SV2"

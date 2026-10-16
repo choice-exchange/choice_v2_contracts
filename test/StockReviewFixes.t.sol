@@ -286,13 +286,14 @@ contract StockReviewFixesTest is StockVaultHarness {
         vm.prank(GUARDIAN);
         x.haltAction();
         vm.startPrank(OWNER);
+        string memory next = "0x00000000000000000000000000000000000000000000000000000000000000cc";
         vm.expectRevert(StockLib.BadConfig.selector);
-        x.migrateMarket("new", 0, 1e16);
-        x.migrateMarket("new", 1e16, 1e17);
+        x.migrateMarket(next, 0, 1e16);
+        x.migrateMarket(next, 1e16, 1e17);
         vm.stopPrank();
         assertEq(x.config().qtyTick, 1e16);
         assertEq(x.config().priceTick, 1e17);
-        assertEq(x.state().marketId, "new");
+        assertEq(x.state().marketId, next);
     }
 
     /// A restock buy leaves the cash the open redeem epoch is waiting for.
@@ -343,7 +344,7 @@ contract StockReviewFixesTest is StockVaultHarness {
         assertTrue(x.syncHedge()); // cover 10, reduce-only
         vm.roll(n + 3);
         exchange.endBlock(PRICE); // its margin comes back to the subaccount
-        exchange.setRoundUp(true); // with a fraction of a unit over half, as on chain
+        exchange.addDust(_sub(), exchange.cashScale() * 6 / 10); // a fraction over half, which reads rounded up
         bytes32 sub = keccak256(bytes(_sub()));
         uint256 back = exchange.depositTotal(sub);
         assertGt(back, 0);

@@ -19,9 +19,19 @@ pragma solidity ^0.8.26;
 /// - A market order is NOT executed in the transaction that places it. It is queued and matched
 ///   in the block's EndBlocker; the response carries only `orderHash` and `cid`, every quantity
 ///   in it is zero. Read the resulting position in a later block.
-/// - `price` on a market order is the WORST price accepted. An order that cannot fill within it
-///   is dropped at the end of the block, and its margin hold is released.
-/// - `margin` zero makes an order reduce-only.
+/// - `price` on a market order is the WORST price accepted, and the order REVERTS at placement unless
+///   it crosses the best opposite price then (an empty side reverts too). One that stops crossing
+///   before the EndBlocker is dropped there, and its hold is released. One market order per
+///   subaccount, market and block; and none while the exchange is in post-only mode.
+/// - The minimum notional is checked at the order price (the worst price, for a market order), for
+///   every order, reduce-only included. Off-tick prices and quantities revert; nothing is rounded.
+/// - `margin` zero makes an order reduce-only. The exchange cuts a reduce-only order to what the
+///   position (less the subaccount's other closing orders) leaves to reduce.
+/// - An order holds its margin plus price times quantity times the fee. The fee is paid at the fill
+///   price; a sell filled above its worst price pays the extra fee out of its margin. 40% of every fee
+///   goes to the relayer: an empty `feeRecipient` makes that the sender, credited to its DEFAULT
+///   subaccount (whole units swept to the bank, the fraction left there).
+/// - Every write either returns true or reverts; none returns false.
 /// - The default subaccount (nonce 0) trades straight off the account's bank balance: no deposit,
 ///   and every credit to it is swept back to bank.
 /// - Only `buy`, `sell`, `buyPostOnly` and `sellPostOnly` order types exist here; atomic orders
@@ -117,6 +127,11 @@ interface IExchangeDerivatives {
         uint256 amount
     ) external returns (bool success);
 
+    /// @dev Positions on ACTIVE markets only (one on a paused market is not listed), exact, with
+    /// `marketID` in lowercase `0x` hex. 🔴 REVERTS ("negatively-signed value cannot be packed into
+    /// uint parameter") if any listed position's `cumulativeFundingEntry` is negative: it is the
+    /// market's funding index at the position's last fill or margin decrease, and goes negative once
+    /// shorts have paid on net (10-16: 712 of 2,015 mainnet positions). Margin is raw: no accrued funding.
     function subaccountPositions(string calldata subaccountID)
         external
         view
@@ -158,9 +173,12 @@ interface IExchangeDerivatives {
         external
         returns (bool success);
 
-    /// @dev `subaccountDeposit` `0x9e96621f`: a non-default subaccount's balance of `denom` in the
-    /// token's own units, rounded down; a resting order's margin hold is in the total, not the
-    /// available. A default subaccount reads zero (its funds are the bank balance).
+    /// @dev `subaccountDeposit` `0x9e96621f`: a subaccount's balance of `denom` in the token's own
+    /// units. 🔴 The exchange keeps it to 18 decimals and this answers each figure ROUNDED TO THE
+    /// NEAREST unit (half to even), available and total independently; it reverts if either is
+    /// negative. So a withdrawal of the available it answers can be refused: one unit less is always
+    /// there. A resting order's margin hold is in the total, not the available. A default subaccount
+    /// answers the fraction its whole-unit sweeps to the bank left behind.
     function subaccountDeposit(string calldata subaccountID, string calldata denom)
         external
         view

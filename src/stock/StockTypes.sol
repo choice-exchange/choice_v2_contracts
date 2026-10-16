@@ -83,7 +83,7 @@ struct StockConfig {
 /// @param orderSell the open restock order sells stock; otherwise it buys
 /// @param orderCash a buy's cash sent, or a sell's cash asked for (its limit)
 /// @param orderStock a buy's stock asked for (its limit), or a sell's stock sent
-/// @param orderDeadline when anyone may close the open order: its expiry plus `restockDeadline`
+/// @param orderDeadline past which the owner may write the open order off: its expiry plus `restockDeadline`
 /// @param makerHash the resting maker hedge order, empty when there is none
 /// @param makerFillable what of it may still fill, 1e18 units, as last read back
 /// @param orderWindow the restock-cap window the open order was counted in
@@ -95,6 +95,9 @@ struct StockConfig {
 /// @param cashDenom the cash's bank denom, which the exchange names it by; fixed at construction
 /// @param jumpPrice the price a jump from the anchor was first seen at, with `jumpSince`: a later reading
 /// unlike it is a new jump, and its clock starts again
+/// @param positionLost the short was found gone with no order of the vault's to explain it (a
+/// liquidation, a forced settlement, or a market paused, whose positions the exchange does not list):
+/// no share is priced, and no market migration, until the owner has looked and accepted the NAV
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -134,6 +137,7 @@ struct StockState {
     uint256 cashBooked;
     string cashDenom;
     uint128 jumpPrice;
+    bool positionLost;
 }
 
 /// @notice The shares deposits minted to one holder that may not leave it before `until`. A deposit
@@ -261,6 +265,7 @@ struct StockContext {
     uint56 tokenPerShare;
     bool actionHalt;
     IStockRatios ratios;
+    uint32 cashFeedId;
 }
 
 /// @notice The price a call may act on, and whether it may.

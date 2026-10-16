@@ -18,6 +18,7 @@ abstract contract StockModule is ReentrancyGuardTransient {
     address private immutable SELF;
 
     error NotDelegated();
+    error NotSelf();
     error NotOwner();
     error NotKeeper();
     error NotPauser();

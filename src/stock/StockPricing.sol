@@ -7,6 +7,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {TickMath} from "infinity-core/src/pool-cl/libraries/TickMath.sol";
 import {Currency} from "infinity-core/src/types/Currency.sol";
 
+import {IExchangeDerivatives} from "../interfaces/IExchangeDerivatives.sol";
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
 import {StockLib} from "./StockLib.sol";
@@ -187,7 +188,9 @@ library StockPricing {
         uint256 inTransit = s.orderOpen ? s.orderStock : 0;
         int256 before = _shares(ctx, s.stockBooked + inTransit);
         int256 next = _shares(ctx, bookedAfter + inTransit);
-        int256 live = StockLib.liveShort(s);
+        (bool readable, bool found, IExchangeDerivatives.DerivativePosition memory p) = StockLib.readPosition(s);
+        if (!readable) return true; // nothing can be judged against a short the exchange cannot read
+        int256 live = found ? StockLib.signed(p) : int256(0);
         int256 pending = s.hedgeBlock == block.number ? s.pendingQty : int256(0);
         int256 resting = s.makerSell ? s.makerFillable.toInt256() : -s.makerFillable.toInt256();
         uint256 sharePrice = Math.mulDiv(price, ctx.tokenPerShare, StockLib.RATIO_ONE);

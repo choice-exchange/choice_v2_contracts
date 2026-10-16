@@ -343,7 +343,7 @@ contract StockInvariantTest is StockVaultHarness {
         x.setFixingConfig(
             FixingConfig({
                 interval: 60,
-                delayMs: 2000,
+                delayMs: 5000,
                 settleWindow: 300,
                 spreadBps: 10,
                 sizeBps: 0,

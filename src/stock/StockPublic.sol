@@ -166,6 +166,12 @@ contract StockPublic is StockModule {
         StockPricing.poke(l.config, l.state, l.ctx);
     }
 
+    /// @notice The vault's own call, from `StockOps.beforeNav`: see `StockHedge.settleFunding`.
+    function settleFunding() external delegated {
+        if (msg.sender != address(this)) revert NotSelf();
+        StockHedge.settleFunding(StockStorage.layout().state);
+    }
+
     function confirmHedge() external delegated nonReentrant {
         StockHedge.confirmHedge(StockStorage.layout().state);
     }
@@ -187,8 +193,7 @@ contract StockPublic is StockModule {
         StockHedge.topUpMargin(l.config, l.state, l.ctx, msg.sender == l.keeper);
     }
 
-    /// @notice Close the open restock order on what has arrived, or as lapsed past its deadline.
-    /// Anyone. See `StockRestock.settle`.
+    /// @notice Close the open restock order on what has arrived. Anyone. See `StockRestock.settle`.
     function settleRestock() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
         StockRestock.settle(l.state, l.ctx);

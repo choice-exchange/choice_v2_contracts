@@ -59,8 +59,10 @@ library StockFixing {
     uint32 internal constant MIN_INTERVAL = 1 minutes;
     uint32 internal constant MAX_INTERVAL = 1 days;
     uint32 internal constant GRID_MS = 200;
-    /// @dev Block times trail the wall clock by about a block; 2 s keeps every commit blind.
-    uint32 internal constant MIN_DELAY_MS = 2000;
+    /// @dev Block times trail the wall clock: a transaction runs up to its height's length after its
+    /// block's time (BFT time is the previous height's median precommit), measured up to 2.6 s over
+    /// 40k blocks (10-16). 5 s keeps every commit blind.
+    uint32 internal constant MIN_DELAY_MS = 5000;
     uint32 internal constant MAX_DELAY_MS = 60_000;
     uint32 internal constant MIN_SETTLE_WINDOW = 5;
     uint32 internal constant MAX_SETTLE_WINDOW = 10 minutes;
@@ -169,7 +171,14 @@ library StockFixing {
 
         IPriceStore.Price memory p = ctx.store.verify(update, ctx.feedId);
         if (p.timestampUs != uint256(b.tickMs) * 1000) revert WrongTick(p.timestampUs, uint256(b.tickMs) * 1000);
-        uint256 price = StockLib.perToken(ctx, StockLib.toWad(p.price, p.exponent));
+        uint256 usd = StockLib.toWad(p.price, p.exponent);
+        if (ctx.cashFeedId != 0) {
+            // The cash's price from the same update, so at the same tick: the settler picks no moment.
+            IPriceStore.Price memory q = ctx.store.verify(update, ctx.cashFeedId);
+            uint256 cashUsd = StockLib.toWad(q.price, q.exponent);
+            usd = cashUsd == 0 ? 0 : Math.mulDiv(usd, 1e18, cashUsd);
+        }
+        uint256 price = StockLib.perToken(ctx, usd);
         Refusal why = _check(c, s, ctx, p, price, b.tickMs / 1000);
         if (why != Refusal.None) revert FixingRefused(why);
 
