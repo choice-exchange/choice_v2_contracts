@@ -77,6 +77,14 @@ contract StockAdmin is StockModule {
         return StockHedge.placeMaker(l.config, l.state, l.ctx, _restockOpen(l), price);
     }
 
+    /// @notice Close the short with a reduce-only buy when the exchange cannot read the position back:
+    /// the keeper or the owner. See `StockHedge.coverUnreadable`.
+    function coverUnreadable(uint256 qty, uint256 worstPrice) external nonReentrant {
+        _keeperOrOwner();
+        StockLayout storage l = StockStorage.layout();
+        StockHedge.coverUnreadable(l.config, l.state, l.ctx, qty, worstPrice);
+    }
+
     /// @notice Fill a quote the issuer signed, both legs in this transaction. See `StockQuotes`.
     function fillQuote(IssuerQuote calldata q, bytes calldata sig) external onlyKeeper nonReentrant {
         StockQuotes.fill(StockStorage.layout(), q, sig);
@@ -228,10 +236,20 @@ contract StockAdmin is StockModule {
         emit RestockMemoSet(memo);
     }
 
-    /// @notice Accept the current share price after a person has looked at a NAV jump.
+    /// @notice Accept the current share price after a person has looked at a NAV jump, or at a short
+    /// that went missing (`StockState.positionLost`: liquidated, settled, or on a paused market).
     function acceptNav() external onlyOwner {
-        StockStorage.layout().state.lastSharePrice = 0;
+        StockState storage s = StockStorage.layout().state;
+        s.lastSharePrice = 0;
+        s.positionLost = false;
         emit NavAccepted();
+    }
+
+    /// @notice Write off a restock order the issuer has neither filled nor refunded by its deadline. See
+    /// `StockRestock.writeOff`.
+    function writeOffRestock() external onlyOwner nonReentrant {
+        StockLayout storage l = StockStorage.layout();
+        StockRestock.writeOff(l.state, l.ctx);
     }
 
     /// @notice Recover a token sent here by mistake. Never the cash, the stock or the vault's own

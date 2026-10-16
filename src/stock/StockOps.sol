@@ -31,6 +31,9 @@ library StockOps {
         uint256 spreadBps,
         bool closed
     );
+    /// @notice A share was priced with the short's funding unsettled: the exchange refused the settle,
+    /// or settling would have left the position unreadable (see `StockOps.beforeNav`).
+    event FundingUnsettled();
 
     // -------------------------------------------------------------------------------------
     // Fills
@@ -72,19 +75,24 @@ library StockOps {
     // -------------------------------------------------------------------------------------
 
     /// @notice Everything a deposit or withdrawal must see before it prices shares: not paused, no
-    /// pending hedge or open lock, the market open for this vault and the price fresh; then the
-    /// short's funding settled, so the value it prices off is exact.
+    /// pending hedge or open lock, no short gone unexplained, the market open for this vault and the
+    /// price fresh; then the short's funding settled, so the value it prices off is exact.
     function beforeNav(StockConfig storage c, StockState storage s, StockContext memory ctx, uint8 flag) external {
         if (s.paused & flag != 0) revert IsPaused(flag);
-        if (ctx.vault.getLocker() != address(0) || s.hedgeBlock == block.number) revert NavNotReady();
+        if (ctx.vault.getLocker() != address(0) || s.hedgeBlock == block.number || s.positionLost) {
+            revert NavNotReady();
+        }
         requireNavPrice(c, ctx);
-        (bool found,) = StockLib.position(s);
-        if (found) {
+        (bool readable, bool found,) = StockLib.readPosition(s);
+        if (found || !readable) {
             // A one-unit margin decrease applies accrued funding in the same transaction and moves
-            // nothing that matters. If the exchange refuses it (a short under its initial margin
-            // ratio), the value is read with funding unsettled rather than freezing every exit.
-            string memory sub = StockLib.subaccount();
-            try StockLib.EXCHANGE.decreasePositionMargin(address(this), sub, sub, s.marketId, 1) {} catch {}
+            // nothing that matters. It also stamps the market's funding index on the position, and a
+            // negative index makes the position unreadable (`StockLib.readPosition`): so it runs as a
+            // call to the vault itself (`StockHedge.settleFunding`) that reverts, undoing it, unless the
+            // position still reads after. A refusal either way leaves funding unsettled rather than
+            // freezing every exit; and on an unreadable position this is the one move that can heal it.
+            (bool ok,) = address(this).call(abi.encodeWithSignature("settleFunding()"));
+            if (!ok) emit FundingUnsettled();
         }
     }
 

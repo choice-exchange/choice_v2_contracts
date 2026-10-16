@@ -42,6 +42,7 @@ interface IStockVaultExtension {
     // permissionless
     function pushPrice(bytes calldata update) external returns (uint256);
     function poke() external;
+    function settleFunding() external; // the vault's own call only
     function confirmHedge() external;
     function syncHedge() external returns (bool);
     function cancelMaker() external;
@@ -74,6 +75,7 @@ interface IStockVaultExtension {
     function fromClaims(bool isCash, uint256 amount) external;
     function pause(uint8 flags) external;
     function haltAction() external;
+    function coverUnreadable(uint256 qty, uint256 worstPrice) external;
 
     // owner
     function setConfig(StockConfig calldata config_) external;
@@ -90,5 +92,6 @@ interface IStockVaultExtension {
     function migrateMarket(string calldata marketId_, uint64 qtyTick, uint64 priceTick) external;
     function setRestockMemo(bytes calldata memo) external;
     function acceptNav() external;
+    function writeOffRestock() external;
     function sweep(address token, address to, uint256 amount) external;
 }

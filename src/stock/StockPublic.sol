@@ -166,6 +166,12 @@ contract StockPublic is StockModule {
         StockPricing.poke(l.config, l.state, l.ctx);
     }
 
+    /// @notice The vault's own call, from `StockOps.beforeNav`: see `StockHedge.settleFunding`.
+    function settleFunding() external delegated {
+        if (msg.sender != address(this)) revert NotSelf();
+        StockHedge.settleFunding(StockStorage.layout().state);
+    }
+
     function confirmHedge() external delegated nonReentrant {
         StockHedge.confirmHedge(StockStorage.layout().state);
     }

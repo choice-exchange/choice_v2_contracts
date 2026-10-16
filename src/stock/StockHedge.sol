@@ -32,22 +32,25 @@ library StockHedge {
     error MakerPriceOutOfBand(uint256 price, uint256 low, uint256 high);
     error NoActionPending();
     error HedgeOpen();
-    error NoMarket();
+    error PositionReadable();
+    error BadCover();
 
     event HedgeOrdered(bool sell, uint256 quantity, uint256 worstPrice, uint256 margin, string orderHash);
     event MakerPlaced(bool sell, uint256 quantity, uint256 price, uint256 margin, string orderHash);
     event MakerCancelled(string orderHash, uint256 fillableLeft);
     event HedgeConfirmed(int256 shortQty);
     event MarginAdded(uint256 amount);
+    event PositionLost(int256 shortConfirmed);
 
     // -------------------------------------------------------------------------------------
     // Hedge
     // -------------------------------------------------------------------------------------
 
     /// @notice Read the short back from the position, then bring the subaccount's free cash back to the
-    /// bank (best effort: if the exchange refuses, it stays there, still in the value).
+    /// bank (best effort: if the exchange refuses, it stays there, still in the value). The cash comes
+    /// back even when the position cannot be read.
     function confirmHedge(StockState storage s) external {
-        _confirm(s);
+        _confirm(s, false);
         (uint256 available,) = StockLib.subaccountCash(s);
         if (available == 0) return;
         try StockLib.EXCHANGE.withdraw(address(this), StockLib.subaccount(), s.cashDenom, available) returns (bool ok) {
@@ -56,10 +59,22 @@ library StockHedge {
     }
 
     /// @dev Read the short back from the position: the truth a pending order is judged against. A
-    /// resting maker order is read back too: what may still fill, or cleared once it is gone.
-    function _confirm(StockState storage s) private {
+    /// resting maker order is read back too: what may still fill, or cleared once it is gone. A short
+    /// found gone with no buy of the vault's that could have covered it marks the position lost. When
+    /// the exchange cannot read the position (`StockLib.readPosition`), `strict` reverts and otherwise
+    /// nothing is confirmed.
+    function _confirm(StockState storage s, bool strict) private {
         if (s.hedgeBlock == block.number) revert HedgePending();
-        s.shortConfirmed = StockLib.liveShort(s);
+        (bool readable, bool found, IExchangeDerivatives.DerivativePosition memory p) = StockLib.readPosition(s);
+        if (!readable) {
+            if (strict) revert StockLib.PositionUnreadable();
+            return;
+        }
+        if (!found && s.shortConfirmed > 0 && !_covered(s)) {
+            s.positionLost = true;
+            emit PositionLost(s.shortConfirmed);
+        }
+        s.shortConfirmed = found ? StockLib.signed(p) : int256(0);
         s.pendingQty = 0;
         if (bytes(s.makerHash).length != 0) {
             (bool live, IExchangeDerivatives.TrimmedDerivativeLimitOrder memory o) = StockLib.makerOrder(s);
@@ -67,6 +82,14 @@ library StockHedge {
             else _clearMaker(s);
         }
         emit HedgeConfirmed(s.shortConfirmed);
+    }
+
+    /// @dev Whether the vault's own buys could have covered the whole confirmed short: a cover from an
+    /// earlier block, and whatever was left to fill of a resting maker buy.
+    function _covered(StockState storage s) private view returns (bool) {
+        uint256 buying = s.pendingQty < 0 ? StockLib.abs(s.pendingQty) : 0;
+        if (bytes(s.makerHash).length != 0 && !s.makerSell) buying += s.makerFillable;
+        return buying >= StockLib.abs(s.shortConfirmed);
     }
 
     /// @notice Confirm the short, then move it toward the target exposure in one market order if
@@ -84,7 +107,7 @@ library StockHedge {
         bool restockOpen,
         bool isKeeper
     ) external returns (bool ordered) {
-        _confirm(s);
+        _confirm(s, true);
         if (bytes(s.makerHash).length != 0) {
             _requireMakerReplaceable(c, s, isKeeper);
             _cancelMaker(s);
@@ -109,16 +132,45 @@ library StockHedge {
             : Math.ceilDiv(
                     Math.mulDiv(r.sharePrice, StockLib.BPS + slip, StockLib.BPS, Math.Rounding.Ceil), c.priceTick
                 ) * c.priceTick;
-        uint256 margin = _holdMargin(c, s, ctx, sell, qty, worst, r.sharePrice);
+        _marketOrder(s, sell, qty, worst, _holdMargin(c, s, ctx, sell, qty, worst, r.sharePrice));
+        return true;
+    }
 
-        string memory sub = StockLib.subaccount();
+    /// @notice The way out when the exchange cannot read the position back (`StockLib.readPosition`):
+    /// then nothing that needs the read works (no hedge, no value, no exit), and while the market's
+    /// funding index stays negative no fill or margin move can make it readable again. A reduce-only
+    /// market buy needs no read: the exchange cuts it to the short, so `qty` at least the short closes
+    /// it, and with no position the read works again. A resting maker order is cancelled first, so the
+    /// cut leaves the whole short to this order. `worst` is on the tick and within `hedgeSlippageBps`
+    /// above the mark.
+    function coverUnreadable(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext memory ctx,
+        uint256 qty,
+        uint256 worst
+    ) external {
+        if (s.hedgeBlock == block.number) revert HedgePending();
+        (bool readable,,) = StockLib.readPosition(s);
+        if (readable) revert PositionReadable();
+        uint256 cap = Math.mulDiv(StockLib.markSharePrice(ctx), StockLib.BPS + c.hedgeSlippageBps, StockLib.BPS);
+        if (qty == 0 || qty % c.qtyTick != 0 || worst > cap || worst % c.priceTick != 0) revert BadCover();
+        if (bytes(s.makerHash).length != 0) {
+            (bool live,) = StockLib.makerOrder(s);
+            if (live) _cancelMaker(s);
+            else _clearMaker(s);
+        }
+        _marketOrder(s, false, qty, worst, 0);
+    }
+
+    function _marketOrder(StockState storage s, bool sell, uint256 qty, uint256 worst, uint256 margin) private {
         string memory orderHash =
             StockLib.EXCHANGE
         .createDerivativeMarketOrder(
             address(this),
             IExchangeDerivatives.DerivativeOrder({
                 marketID: s.marketId,
-                subaccountID: sub,
+                subaccountID: StockLib.subaccount(),
                 feeRecipient: "",
                 price: worst,
                 quantity: qty,
@@ -133,7 +185,6 @@ library StockHedge {
         s.lastHedgeTime = uint64(block.timestamp);
         s.pendingQty = sell ? qty.toInt256() : -qty.toInt256();
         emit HedgeOrdered(sell, qty, worst, margin, orderHash);
-        return true;
     }
 
     /// @notice Rest a post-only order at `price` for the same gap `syncHedge` would cross the book
@@ -150,7 +201,7 @@ library StockHedge {
         uint256 price
     ) external returns (bool placed) {
         if (c.makerTimeout == 0) revert MakerOff();
-        _confirm(s);
+        _confirm(s, true);
         if (bytes(s.makerHash).length != 0) _cancelMaker(s);
         Reference memory r = StockLib.storedReference(c, ctx);
         if (r.reason != Refusal.None) revert StockLib.PriceNotUsable(r.reason);
@@ -195,13 +246,15 @@ library StockHedge {
     function cancelMaker(StockConfig storage c, StockState storage s, StockContext memory ctx, bool isKeeper) external {
         if (bytes(s.makerHash).length == 0) revert NoMaker();
         _requireMakerReplaceable(c, s, isKeeper);
-        _confirm(s);
+        _confirm(s, true);
         if (bytes(s.makerHash).length != 0) _cancelMaker(s);
         _fund(s, ctx, 0);
     }
 
     /// @dev The order that would bring the short to target: which way, and how much in shares, rounded
-    /// to the tick; zero inside the band or under the minimum. A buy only ever reduces a short.
+    /// to the tick; zero inside the band or under the minimum. A buy only ever reduces a short. The
+    /// exchange checks its minimum notional at the ORDER price, which may be `hedgeSlippageBps` under the
+    /// reference, so the minimum is judged there.
     function _hedgeOrder(
         StockConfig storage c,
         StockState storage s,
@@ -216,7 +269,8 @@ library StockHedge {
         qty = mag / c.qtyTick * c.qtyTick;
         // forge-lint: disable-next-line(unsafe-typecast) - sign tested.
         if (!sell) qty = Math.min(qty, s.shortConfirmed > 0 ? uint256(s.shortConfirmed) : 0);
-        if (qty == 0 || StockLib.unitsToCash(ctx, qty, r.sharePrice) < c.minHedge) qty = 0;
+        uint256 lowest = r.sharePrice * (StockLib.BPS - c.hedgeSlippageBps) / StockLib.BPS;
+        if (qty == 0 || StockLib.unitsToCash(ctx, qty, lowest) < c.minHedge) qty = 0;
     }
 
     /// @dev An opening order's margin, made available in the hedge subaccount; a reducing order
@@ -291,8 +345,9 @@ library StockHedge {
     }
 
     /// @notice Point the vault at a new perp market, with that market's ticks, as when the old one is
-    /// settled ahead of a split: only during a corporate-action halt, and only with nothing open on the
-    /// old one.
+    /// settled ahead of a split: only during a corporate-action halt, only with nothing open on the old
+    /// one, and only once the owner has accepted the NAV a vanished short left (a forced settlement
+    /// marks the position lost: so does a market merely paused, whose short would still be there).
     function migrateMarket(
         StockConfig storage c,
         StockState storage s,
@@ -303,11 +358,22 @@ library StockHedge {
     ) external {
         if (!StockLib.actionPending(ctx)) revert NoActionPending();
         (bool found,) = StockLib.position(s);
-        if (found || s.pendingQty != 0 || s.shortConfirmed != 0 || bytes(s.makerHash).length != 0) revert HedgeOpen();
-        if (bytes(marketId).length == 0) revert NoMarket();
+        if (found || s.positionLost || s.pendingQty != 0 || s.shortConfirmed != 0 || bytes(s.makerHash).length != 0) {
+            revert HedgeOpen();
+        }
+        StockLib.requireMarketId(marketId);
         if (qtyTick == 0 || priceTick == 0) revert StockLib.BadConfig();
         s.marketId = marketId;
         (c.qtyTick, c.priceTick) = (qtyTick, priceTick);
+    }
+
+    /// @notice Settle the short's accrued funding into its margin with a one-unit margin decrease, kept
+    /// only if the exchange can still read the position after it. Only the vault calls it, on itself,
+    /// so that a revert undoes the decrease: see `StockOps.beforeNav`.
+    function settleFunding(StockState storage s) external {
+        string memory sub = StockLib.subaccount();
+        StockLib.EXCHANGE.decreasePositionMargin(address(this), sub, sub, s.marketId, 1);
+        StockLib.position(s);
     }
 
     /// @notice Bring the short back to its target leverage: its equity (margin plus unrealised PnL,

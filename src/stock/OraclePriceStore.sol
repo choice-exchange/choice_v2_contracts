@@ -19,10 +19,16 @@ import {PriceStore} from "./PriceStore.sol";
 /// **How old the module's price is.** `0x67` dates a price by the block it landed in, in whole seconds,
 /// not by the feed's own time. Relayers land an update about 0.8 s after Pyth publishes it (2 s at p99), so
 /// the store dates the module's price (`feedTimestampUs`) `relayLagMs` earlier, rounded down to the second,
-/// and a reader judging staleness sees it at least that old. Its `timestampUs` is when it landed: a signed
-/// update from before then may be older than it, so a vault takes one handed to a fill only if its feed
-/// moved after that. A feed whose market is shut stops landing (the module keeps only a newer feed time), so
+/// and a reader judging staleness sees it at least that old. Its `timestampUs` is the second it landed: a
+/// vault takes a signed update handed to a fill only if its feed moved after that. (The module's own feed
+/// time can sit up to ~0.8 s past that floored second, measured 10-16, so a filler may still choose
+/// between two prices that close together: inside any spread, and the price that keeps a fresh signed
+/// update usable.) A feed whose market is shut stops landing (the module keeps only a newer feed time), so
 /// its date stays at the close, as weekend mode needs.
+///
+/// 🔴 Who lands what, and when, is up to the relayers: anyone may relay any signed update newer than the
+/// module's, however old, and one without a feed time is stamped with its batch time (10-16 review). So a
+/// module price is only as fresh as the freshest relay says, never provably fresher.
 contract OraclePriceStore is PriceStore {
     IOraclePrecompile internal constant ORACLE = IOraclePrecompile(0x0000000000000000000000000000000000000067);
     uint8 internal constant PYTH_PRO = 14;

@@ -59,6 +59,9 @@ library StockLib {
     uint32 internal constant MIN_QUEUE_DEADLINE = 1 hours;
     uint32 internal constant MAX_QUEUE_DEADLINE = 14 days;
     uint32 internal constant MAX_DEPOSIT_LOCK = 1 days;
+    /// @dev The oldest the cash's own price may be for a fill, a hedge, a restock or a share price:
+    /// relayers land it with every batch, every second or so, weekends included.
+    uint256 internal constant MAX_CASH_AGE_MS = 60_000;
 
     /// @dev The exchange subaccount the short trades from. Not the default one, which trades off the
     /// bank balance: here its margin, PnL, fees and funding move a deposit of its own, so the bank
@@ -82,6 +85,8 @@ library StockLib {
     uint16 internal constant MAX_ACTION_MOVE = 3000;
 
     error BadConfig();
+    error BadMarket();
+    error PositionUnreadable();
     error PriceNotUsable(Refusal reason);
     error OracleMissing();
     error CashShort(uint256 needed, uint256 own);
@@ -107,7 +112,7 @@ library StockLib {
         (r.session, r.sessionStart) = ctx.calendar.sessionAt(block.timestamp);
         r.closed = r.session == MarketCalendar.Session.Closed
             || (r.session == MarketCalendar.Session.Overnight && !c.overnightLive);
-        r.sharePrice = toWad(p.price, p.exponent);
+        r.sharePrice = inCash(ctx, toWad(p.price, p.exponent), MAX_CASH_AGE_MS);
         r.price = perToken(ctx, r.sharePrice);
         if (r.price == 0) {
             r.reason = Refusal.Stale;
@@ -234,8 +239,22 @@ library StockLib {
     /// @dev The stored price per share, as the perp marks it: any age, but it must exist.
     function markSharePrice(StockContext memory ctx) internal view returns (uint256 price) {
         IPriceStore.Price memory p = ctx.store.latest(ctx.feedId);
-        price = toWad(p.price, p.exponent);
+        price = inCash(ctx, toWad(p.price, p.exponent), type(uint256).max);
         if (price == 0) revert OracleMissing();
+    }
+
+    /// @dev A 1e18 USD price as a price in the cash. The feeds price the stock in USD, but the cash is
+    /// a stablecoin, and the perp the short trades is marked in it (the stock's feed over the cash's,
+    /// measured 10-16: AAPL/USDC = feed 922 / feed 7), so everything the vault does prices in the cash.
+    /// Zero, which refuses, when the cash's own price is missing or more than `maxAgeMs` old; a vault with
+    /// no cash feed takes the cash as exactly one USD.
+    function inCash(StockContext memory ctx, uint256 usd, uint256 maxAgeMs) internal view returns (uint256) {
+        if (ctx.cashFeedId == 0 || usd == 0) return usd;
+        IPriceStore.Price memory q = ctx.store.latest(ctx.cashFeedId);
+        uint256 cashUsd = toWad(q.price, q.exponent);
+        uint256 ageMs = block.timestamp * 1000 - Math.min(block.timestamp * 1000, q.feedTimestampUs / 1000);
+        if (cashUsd == 0 || ageMs > maxAgeMs) return 0;
+        return Math.mulDiv(usd, 1e18, cashUsd);
     }
 
     /// @dev A per-share price as a per-token price.
@@ -362,21 +381,57 @@ library StockLib {
     /// this block is not in it yet; one from an earlier block is, filled or not.
     function liveShort(StockState storage s) internal view returns (int256) {
         (bool found, IExchangeDerivatives.DerivativePosition memory p) = position(s);
-        if (!found) return 0;
+        return found ? signed(p) : int256(0);
+    }
+
+    /// @dev A position as a short: positive short, negative long.
+    function signed(IExchangeDerivatives.DerivativePosition memory p) internal pure returns (int256) {
         return p.isLong ? -p.quantity.toInt256() : p.quantity.toInt256();
     }
 
+    /// @dev The position, reverting `PositionUnreadable` when the exchange cannot answer (see `readPosition`).
     function position(StockState storage s)
         internal
         view
-        returns (bool, IExchangeDerivatives.DerivativePosition memory p)
+        returns (bool found, IExchangeDerivatives.DerivativePosition memory p)
     {
-        IExchangeDerivatives.DerivativePosition[] memory all = EXCHANGE.subaccountPositions(subaccount());
-        bytes32 h = keccak256(bytes(s.marketId));
-        for (uint256 k; k < all.length; ++k) {
-            if (keccak256(bytes(all[k].marketID)) == h) return (true, all[k]);
+        bool readable;
+        (readable, found, p) = readPosition(s);
+        if (!readable) revert PositionUnreadable();
+    }
+
+    /// @dev The vault's position on its market, as the exchange has it now. 🔴 The precompile packs a
+    /// position's cumulative funding entry as a uint256 and REVERTS the whole read when one is negative
+    /// ("negatively-signed value cannot be packed"): the entry is the market's funding index as of the
+    /// position's last fill or margin decrease, and that index goes negative once shorts have paid on net
+    /// (10-16: 712 of 2,015 mainnet positions). Then `readable` is false and nothing else means anything.
+    /// It also lists positions on ACTIVE markets only: one on a paused market reads as none.
+    function readPosition(StockState storage s)
+        internal
+        view
+        returns (bool readable, bool found, IExchangeDerivatives.DerivativePosition memory p)
+    {
+        try EXCHANGE.subaccountPositions(subaccount()) returns (IExchangeDerivatives.DerivativePosition[] memory all) {
+            bytes32 h = keccak256(bytes(s.marketId));
+            for (uint256 k; k < all.length; ++k) {
+                if (keccak256(bytes(all[k].marketID)) == h) return (true, true, all[k]);
+            }
+            return (true, false, p);
+        } catch {
+            return (false, false, p);
         }
-        return (false, p);
+    }
+
+    /// @dev Revert unless `id` is a market id as the exchange answers it: `0x` and 64 LOWERCASE hex
+    /// digits. Orders take any spelling, but positions come back in this one, and the vault finds its
+    /// own by comparing strings: a misspelt id would never find the short it opened.
+    function requireMarketId(string memory id) internal pure {
+        bytes memory b = bytes(id);
+        if (b.length != 66 || b[0] != "0" || b[1] != "x") revert BadMarket();
+        for (uint256 k = 2; k < 66; ++k) {
+            bytes1 c = b[k];
+            if ((c < "0" || c > "9") && (c < "a" || c > "f")) revert BadMarket();
+        }
     }
 
     /// @dev The resting maker order as the exchange has it now, if it still rests.

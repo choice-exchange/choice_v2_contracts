@@ -105,6 +105,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
                 registry: address(registry),
                 ratios: ratios,
                 feedId: FEED,
+                cashFeedId: _cashFeed(),
                 marketId: MARKET,
                 cashDenom: CASH_DENOM,
                 owner: OWNER,
@@ -154,6 +155,11 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
+
+    /// The cash's own USD feed; none (the cash taken as exactly one USD) unless a suite names one.
+    function _cashFeed() internal view virtual returns (uint32) {
+        return 0;
+    }
 
     /// The price store every vault in the suite reads; a suite may swap in another kind.
     function _newStore() internal virtual returns (PriceStore) {

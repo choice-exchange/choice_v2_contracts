@@ -46,6 +46,7 @@ contract StockFactory is Ownable2Step {
         ICLPoolManager poolManager;
         IERC20 cash;
         string cashDenom;
+        uint32 cashFeedId;
         IPriceStore store;
         MarketCalendar calendar;
         address modules;
@@ -69,6 +70,8 @@ contract StockFactory is Ownable2Step {
     bytes32 public immutable VAULT_CODE_HASH;
     ICLPoolManager public immutable POOL_MANAGER;
     IERC20 public immutable CASH;
+    /// @notice The cash's own USD feed, which every vault prices the stock through. See `StockLib.inCash`.
+    uint32 public immutable CASH_FEED_ID;
     IPriceStore public immutable PRICE_STORE;
     MarketCalendar public immutable CALENDAR;
     address public immutable MODULES;
@@ -94,6 +97,7 @@ contract StockFactory is Ownable2Step {
         VAULT_CODE_HASH = p.vaultCodeHash;
         POOL_MANAGER = p.poolManager;
         CASH = p.cash;
+        CASH_FEED_ID = p.cashFeedId;
         PRICE_STORE = p.store;
         CALENDAR = p.calendar;
         MODULES = p.modules;
@@ -120,6 +124,7 @@ contract StockFactory is Ownable2Step {
             registry: address(REGISTRY),
             ratios: RATIOS,
             feedId: x.feedId,
+            cashFeedId: CASH_FEED_ID,
             marketId: x.marketId,
             cashDenom: cashDenom,
             owner: address(this),

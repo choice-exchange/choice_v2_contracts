@@ -113,6 +113,9 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     /// @notice The first module of the chain every selector this contract does not know reaches.
     address public immutable MODULES;
     uint32 public immutable FEED_ID;
+    /// @notice The cash's own feed (a stablecoin in USD), which every USD price is divided by; zero
+    /// takes the cash as exactly one USD. See `StockLib.inCash`.
+    uint32 public immutable CASH_FEED_ID;
     /// @notice Where tokens-per-share ratio changes are announced; zero when the owner alone sets them.
     IStockRatios public immutable RATIOS;
     Currency internal immutable CASH;
@@ -145,6 +148,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         address registry;
         IStockRatios ratios;
         uint32 feedId;
+        uint32 cashFeedId;
         string marketId;
         /// @dev The cash's bank denom, as the exchange names it (an MTS token: "erc20:0x…").
         string cashDenom;
@@ -165,12 +169,14 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
                 || init.registry.code.length == 0 || bytes(init.marketId).length == 0
                 || bytes(init.cashDenom).length == 0
         ) revert ZeroAddress();
+        StockLib.requireMarketId(init.marketId);
         StockOps.checkConfig(config_);
         POOL_MANAGER = init.poolManager;
         VAULT = IProtocolFees(address(init.poolManager)).vault();
         PRICE_STORE = init.store;
         MODULES = init.modules;
         FEED_ID = init.feedId;
+        CASH_FEED_ID = init.cashFeedId;
         RATIOS = init.ratios;
         CASH = Currency.wrap(address(init.cash));
         STOCK = Currency.wrap(address(init.stock));
@@ -189,7 +195,8 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             feedId: init.feedId,
             tokenPerShare: uint56(StockLib.RATIO_ONE),
             actionHalt: false,
-            ratios: init.ratios
+            ratios: init.ratios,
+            cashFeedId: init.cashFeedId
         });
         l.allowlistOn = true;
         l.registry = init.registry;
@@ -530,7 +537,8 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
             feedId: FEED_ID,
             tokenPerShare: stored.tokenPerShare,
             actionHalt: stored.actionHalt,
-            ratios: RATIOS
+            ratios: RATIOS,
+            cashFeedId: CASH_FEED_ID
         });
     }
 }

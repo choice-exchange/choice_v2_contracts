@@ -95,6 +95,9 @@ struct StockConfig {
 /// @param cashDenom the cash's bank denom, which the exchange names it by; fixed at construction
 /// @param jumpPrice the price a jump from the anchor was first seen at, with `jumpSince`: a later reading
 /// unlike it is a new jump, and its clock starts again
+/// @param positionLost the short was found gone with no order of the vault's to explain it (a
+/// liquidation, a forced settlement, or a market paused, whose positions the exchange does not list):
+/// no share is priced, and no market migration, until the owner has looked and accepted the NAV
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -134,6 +137,7 @@ struct StockState {
     uint256 cashBooked;
     string cashDenom;
     uint128 jumpPrice;
+    bool positionLost;
 }
 
 /// @notice The shares deposits minted to one holder that may not leave it before `until`. A deposit
@@ -261,6 +265,7 @@ struct StockContext {
     uint56 tokenPerShare;
     bool actionHalt;
     IStockRatios ratios;
+    uint32 cashFeedId;
 }
 
 /// @notice The price a call may act on, and whether it may.

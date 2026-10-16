@@ -26,10 +26,11 @@ import {Reference, StockConfig, StockContext, StockLayout, StockState} from "./S
 /// - **Closing**, by anyone, on what has arrived, which both ledgers show: stock above `stockBooked` (a
 ///   buy's delivery, a sell's stock refunded) or cash above `cashBooked` (a sell's payment, a buy's
 ///   refund; the short trades from its own subaccount, so only fee-share dust arrives otherwise).
-///   Until then an arrival is out of the value, so nothing counts twice. An order that has had
-///   nothing back by its expiry plus `restockDeadline` lapses: it leaves the value, and what arrives
-///   later is booked as a windfall. Whatever arrived before the order is booked as one first, so
-///   only this order's own legs settle it. Faking a close takes a gift of the whole leg.
+///   Until then an arrival is out of the value, so nothing counts twice. An order stays open, and in
+///   the value, until one of its legs arrives: past its expiry plus `restockDeadline` the owner may
+///   write it off (`writeOff`), and what arrives later is booked as a windfall. Whatever arrived before
+///   the order is booked as one first, so only this order's own legs settle it. Faking a close takes a
+///   gift of the whole leg.
 library StockRestock {
     using SafeCast for uint256;
 
@@ -124,8 +125,7 @@ library StockRestock {
 
     /// @notice Close the open order on what has arrived. Anyone, any time:
     /// - stock at least the order's (a buy delivered, a sell refunded): booked, and moved into claims;
-    /// - else cash at least the order's (a sell paid at its limit or better, a buy refunded): booked;
-    /// - else, past the deadline, the order lapses with nothing booked.
+    /// - else cash at least the order's (a sell paid at its limit or better, a buy refunded): booked.
     /// A refund, either way, gives back what the order counted against the daily cap.
     function settle(StockState storage s, StockContext memory ctx) external {
         if (!s.orderOpen) revert RestockUnavailable();
@@ -152,12 +152,22 @@ library StockRestock {
                 StockLib.uncountRestock(s, s.orderWindow, s.orderCounted);
                 emit RestockRefunded(false, s.orderCash);
             }
-        } else if (block.timestamp > s.orderDeadline) {
-            s.orderOpen = false;
-            emit RestockLapsed(sell, sell ? s.orderStock : s.orderCash);
         } else {
             revert NotDelivered(surplus, s.orderStock);
         }
+    }
+
+    /// @notice Close an order the issuer has neither filled nor refunded by its deadline, as never to be
+    /// (the owner's call, once it has asked the issuer): it leaves the value, what did arrive is booked,
+    /// and whatever arrives later is a windfall. Nobody else may, and the deadline alone does not: the
+    /// issuer has refunded hours past it (10-15), and a late leg would otherwise settle the NEXT order,
+    /// closing it as refunded while the issuer still holds it.
+    function writeOff(StockState storage s, StockContext memory ctx) external {
+        if (!s.orderOpen) revert RestockUnavailable();
+        if (block.timestamp <= s.orderDeadline) revert NotDelivered(StockLib.unbooked(s, ctx), s.orderStock);
+        s.orderOpen = false;
+        emit RestockLapsed(s.orderSell, s.orderSell ? s.orderStock : s.orderCash);
+        _bookWindfalls(s, ctx);
     }
 
     /// @notice Book stock and cash that arrived with no order open (a late leg of a lapsed order, an
