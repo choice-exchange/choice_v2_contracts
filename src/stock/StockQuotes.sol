@@ -94,10 +94,11 @@ library StockQuotes {
             uint256 got = _pull(stockToken, issuer, q.stock);
             cashToken.safeTransfer(issuer, q.cash);
             s.stockBooked += got;
+            s.cashBooked -= q.cash;
         } else {
             if (q.stock > s.stockBooked) revert NotEnoughStock(q.stock, s.stockBooked);
             StockLib.ensureToken(ctx, ctx.stock, q.stock);
-            _pull(cashToken, issuer, q.cash);
+            s.cashBooked += _pull(cashToken, issuer, q.cash);
             stockToken.safeTransfer(issuer, q.stock);
             s.stockBooked -= q.stock;
         }

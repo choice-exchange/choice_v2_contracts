@@ -131,6 +131,7 @@ library StockQueue {
 
         IStockVaultSelf(address(this)).burnEscrowed(e.shares);
         s.cashOwed += cash.toUint128();
+        s.cashBooked -= cash;
         e.cash = cash.toUint128();
         e.sharesLeft = e.shares;
         e.status = SETTLED;
@@ -166,6 +167,7 @@ library StockQueue {
         s.stockBooked -= stockOut;
         s.stockOwed += stockOut.toUint128();
         s.cashOwed += cashNow.toUint128();
+        s.cashBooked -= cashNow;
         s.debtOwed += debt.toUint128();
         (e.stock, e.cash, e.debt) = (stockOut.toUint128(), cashNow.toUint128(), debt.toUint128());
         e.sharesLeft = e.shares;
@@ -191,6 +193,7 @@ library StockQueue {
         uint128 debt = e.debt;
         s.debtOwed -= debt;
         s.cashOwed += debt;
+        s.cashBooked -= debt;
         e.cash += debt;
         e.debt = 0;
         e.status = SETTLED;

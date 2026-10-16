@@ -284,8 +284,9 @@ library StockPricing {
         ctx.actionHalt = false;
         uint256 price = StockLib.markPrice(ctx);
         uint256 against = expectedPrice != 0 ? expectedPrice : s.anchorPrice;
-        if (against == 0 || maxMoveBps > StockLib.MAX_ACTION_MOVE || StockLib.deviationBps(price, against) > maxMoveBps)
-        revert ActionMove(price, against);
+        bool refused =
+            against == 0 || maxMoveBps > StockLib.MAX_ACTION_MOVE || StockLib.deviationBps(price, against) > maxMoveBps;
+        if (refused) revert ActionMove(price, against);
         s.anchorPrice = price.toUint128();
         s.jumpSince = 0;
         s.wideUntil = uint64(block.timestamp + c.reanchorWide);

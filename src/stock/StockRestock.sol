@@ -22,11 +22,13 @@ import {Reference, StockConfig, StockContext, StockLayout, StockState} from "./S
 ///   better, or refunds it after the expiry. One order is open at a time.
 /// - **In transit.** A buy is valued at its cash and its stock is hedged as if held. A sell's stock
 ///   stays in the value at the mark and in the hedge until it is paid.
-/// - **Closing.** Stock arriving is seen on the stock ledger: a buy's delivery, or a sell's stock coming
-///   back as a refund. Cash arriving cannot be told apart from other cash, so a buy's refund or a sell's
-///   payment closes the order on the keeper's word (it watches the issuer's transfer), or on anyone's
-///   once the expiry plus `restockDeadline` has passed. Nothing halts: a mistaken close only drops the
-///   order from the value until what arrives is booked (`syncWindfall` for stock, at once for cash).
+/// - **Closing**, by anyone, on what has arrived, which both ledgers show: stock above `stockBooked` (a
+///   buy's delivery, a sell's stock refunded) or cash above `cashBooked` (a sell's payment, a buy's
+///   refund; the short trades from its own subaccount, so only fee-share dust arrives otherwise).
+///   Until then an arrival is out of the value, so nothing counts twice. An order that has had
+///   nothing back by its expiry plus `restockDeadline` lapses: it leaves the value, and what arrives
+///   later is booked as a windfall. Whatever arrived before the order is booked as one first, so
+///   only this order's own legs settle it. Faking a close takes a gift of the whole leg.
 library StockRestock {
     using SafeCast for uint256;
 
@@ -46,7 +48,9 @@ library StockRestock {
     event RestockOrdered(bool sell, uint256 amountIn, uint256 limitOut, uint64 deadline, bytes memo);
     event Restocked(bool sell, uint256 amountIn, uint256 amountOut);
     event RestockRefunded(bool sell, uint256 amountIn);
+    event RestockLapsed(bool sell, uint256 amountIn);
     event Windfall(uint256 stock);
+    event CashWindfall(uint256 cash);
 
     /// @notice Send a LIMIT order to the issuer: `amountIn` of cash for at least `limitOut` stock, or
     /// (`sell`) `amountIn` of stock for at least `limitOut` cash, open for `expiryUnits` of the issuer's
@@ -75,13 +79,9 @@ library StockRestock {
         StockLib.requireUsable(r);
         StockLib.requireAnchored(c, s, r.price);
         if (StockLib.ownStock(s, ctx) < s.stockBooked) revert StockDeficit();
-        // Book any stock already here (a late delivery or refund of an earlier order) so that only what
-        // arrives for THIS order can settle it.
-        uint256 stray = StockLib.unbooked(s, ctx);
-        if (stray != 0) {
-            s.stockBooked += stray;
-            emit Windfall(stray);
-        }
+        // Book anything already here (a late leg of an earlier order) so that only what arrives for
+        // THIS order can settle it.
+        _bookWindfalls(s, ctx);
         uint256 keep = StockLib.BPS - c.restockSlippageBps;
         if (sell) {
             if (amountIn > s.stockBooked) revert NotEnoughStock(amountIn, s.stockBooked);
@@ -103,6 +103,7 @@ library StockRestock {
             uint256 own = StockLib.ownCash(s, ctx);
             if (own < amountIn + keepCash) revert StockLib.CashShort(amountIn + keepCash, own);
             StockLib.spendOwnCash(s, ctx, amountIn);
+            s.cashBooked -= amountIn;
         }
         s.orderOpen = true;
         s.orderSell = sell;
@@ -119,12 +120,15 @@ library StockRestock {
         emit RestockOrdered(sell, amountIn, limitOut, s.orderDeadline, memo);
     }
 
-    /// @notice Close the open order on what has arrived. Stock at least the order's (a buy delivered, a
-    /// sell refunded) is booked and moved into claims. Otherwise the cash leg is taken to have arrived (a
-    /// sell paid, a buy refunded): on the keeper's word any time, on anyone's past the deadline.
-    function settle(StockState storage s, StockContext memory ctx, bool isKeeper) external {
+    /// @notice Close the open order on what has arrived. Anyone, any time:
+    /// - stock at least the order's (a buy delivered, a sell refunded): booked, and moved into claims;
+    /// - else cash at least the order's (a sell paid at its limit or better, a buy refunded): booked;
+    /// - else, past the deadline, the order lapses with nothing booked.
+    /// A refund, either way, gives back what the order counted against the daily cap.
+    function settle(StockState storage s, StockContext memory ctx) external {
         if (!s.orderOpen) revert RestockUnavailable();
         uint256 surplus = StockLib.unbooked(s, ctx);
+        uint256 cashIn = StockLib.unbookedCash(s, ctx);
         bool sell = s.orderSell;
         if (surplus >= s.orderStock) {
             s.stockBooked += surplus;
@@ -132,28 +136,46 @@ library StockRestock {
             uint256 tokens = IERC20(Currency.unwrap(ctx.stock)).balanceOf(address(this));
             if (tokens != 0) StockLib.lock(ctx, StockLib.OP_TO_CLAIMS, ctx.stock, tokens);
             if (sell) {
-                // The stock came back, which the vault can see: the order no longer counts.
                 StockLib.uncountRestock(s, s.orderWindow, s.orderCounted);
                 emit RestockRefunded(true, s.orderStock);
             } else {
                 emit Restocked(false, s.orderCash, surplus);
             }
-        } else if (isKeeper || block.timestamp > s.orderDeadline) {
+        } else if (cashIn >= s.orderCash) {
+            s.cashBooked += cashIn;
             s.orderOpen = false;
-            if (sell) emit Restocked(true, s.orderStock, s.orderCash);
-            else emit RestockRefunded(false, s.orderCash);
+            if (sell) {
+                emit Restocked(true, s.orderStock, cashIn);
+            } else {
+                StockLib.uncountRestock(s, s.orderWindow, s.orderCounted);
+                emit RestockRefunded(false, s.orderCash);
+            }
+        } else if (block.timestamp > s.orderDeadline) {
+            s.orderOpen = false;
+            emit RestockLapsed(sell, sell ? s.orderStock : s.orderCash);
         } else {
             revert NotDelivered(surplus, s.orderStock);
         }
     }
 
-    /// @notice Book stock that arrived with no order open (a late delivery or refund, an in-kind
-    /// dividend, a donation). Refused while an order is open, which a delivery must settle first.
+    /// @notice Book stock and cash that arrived with no order open (a late leg of a lapsed order, an
+    /// in-kind dividend, a donation). Refused while an order is open, which its own legs settle first.
     function syncWindfall(StockState storage s, StockContext memory ctx) external {
         if (s.orderOpen) revert OrderOpen();
-        uint256 surplus = StockLib.unbooked(s, ctx);
-        s.stockBooked += surplus;
-        emit Windfall(surplus);
+        _bookWindfalls(s, ctx);
+    }
+
+    function _bookWindfalls(StockState storage s, StockContext memory ctx) private {
+        uint256 stock = StockLib.unbooked(s, ctx);
+        if (stock != 0) {
+            s.stockBooked += stock;
+            emit Windfall(stock);
+        }
+        uint256 cash = StockLib.unbookedCash(s, ctx);
+        if (cash != 0) {
+            s.cashBooked += cash;
+            emit CashWindfall(cash);
+        }
     }
 
     /// @notice Revert unless `t` is a usable memo template: at most `MAX_MEMO` bytes, each placeholder

@@ -45,6 +45,7 @@ contract StockFactory is Ownable2Step {
         bytes32 vaultCodeHash;
         ICLPoolManager poolManager;
         IERC20 cash;
+        string cashDenom;
         IPriceStore store;
         MarketCalendar calendar;
         address modules;
@@ -74,6 +75,8 @@ contract StockFactory is Ownable2Step {
     StockRegistry public immutable REGISTRY;
     IStockRatios public immutable RATIOS;
     address public immutable VAULT_OWNER;
+    /// @notice The cash's bank denom, which every vault's hedge subaccount is funded in.
+    string public cashDenom;
 
     error WrongCode();
     error DeployFailed();
@@ -85,8 +88,9 @@ contract StockFactory is Ownable2Step {
         if (
             p.vaultCodeHash == bytes32(0) || address(p.poolManager) == address(0) || address(p.cash) == address(0)
                 || address(p.store) == address(0) || address(p.calendar) == address(0) || p.modules == address(0)
-                || address(p.registry) == address(0) || p.vaultOwner == address(0)
+                || address(p.registry) == address(0) || p.vaultOwner == address(0) || bytes(p.cashDenom).length == 0
         ) revert ZeroAddress();
+        cashDenom = p.cashDenom;
         VAULT_CODE_HASH = p.vaultCodeHash;
         POOL_MANAGER = p.poolManager;
         CASH = p.cash;
@@ -117,6 +121,7 @@ contract StockFactory is Ownable2Step {
             ratios: RATIOS,
             feedId: x.feedId,
             marketId: x.marketId,
+            cashDenom: cashDenom,
             owner: address(this),
             name: x.name,
             symbol: x.symbol
