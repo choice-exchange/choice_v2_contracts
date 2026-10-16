@@ -28,6 +28,7 @@ library StockPricing {
     error NoActionPending();
     error BadRatio(uint256 ratio, uint256 announced);
     error ActionMove(uint256 price, uint256 anchor);
+    error MoveBoundTooWide(uint256 maxMoveBps, uint256 ratioMove);
 
     // -------------------------------------------------------------------------------------
     // Fills
@@ -84,8 +85,10 @@ library StockPricing {
         if (g != Refusal.None) return _refuse(f, g);
     }
 
-    /// @notice The newer of the stored price and a signed update handed in with the swap. A bad
-    /// update is ignored, never fatal.
+    /// @notice The stored price, or a signed update handed in with the swap whose feed price moved after
+    /// the stored one was stamped (for the oracle module's price, after it landed). Not merely a later
+    /// batch: whoever fills chooses whether to hand one in, so the only updates that may replace the
+    /// stored price are ones that carry news since it. A bad update is ignored, never fatal.
     function pickPrice(StockContext memory ctx, bytes calldata hookData)
         internal
         view
@@ -94,7 +97,7 @@ library StockPricing {
         p = ctx.store.latest(ctx.feedId);
         if (hookData.length != 0) {
             try ctx.store.verify(hookData, ctx.feedId) returns (IPriceStore.Price memory q) {
-                if (q.price > 0 && q.timestampUs > p.timestampUs) p = q;
+                if (q.price > 0 && q.feedTimestampUs > p.timestampUs) p = q;
             } catch {}
         }
     }
@@ -168,10 +171,11 @@ library StockPricing {
         return Refusal.None;
     }
 
-    /// @dev Exposure may grow only up to `maxUnhedged`, judged against the confirmed short and
-    /// against the short a pending hedge, or what may still fill of a resting maker order, would
-    /// leave: until it is read back, it might not have filled, and it might have. (A market hedge
-    /// cancels any maker order first, so at most one of the two is ever open.)
+    /// @dev Exposure may grow only up to `maxUnhedged`, judged against the short as the exchange has it
+    /// now (a liquidation counts at once, not at the next confirmation) and against the short a hedge
+    /// order from this block, or what may still fill of a resting maker order, would leave: neither is
+    /// in the position yet, and each might fill. (A market hedge cancels any maker order first, so at
+    /// most one of the two is ever open.)
     function _widensExposure(
         StockConfig storage c,
         StockState storage s,
@@ -183,10 +187,12 @@ library StockPricing {
         uint256 inTransit = s.orderOpen ? s.orderStock : 0;
         int256 before = _shares(ctx, s.stockBooked + inTransit);
         int256 next = _shares(ctx, bookedAfter + inTransit);
+        int256 live = StockLib.liveShort(s);
+        int256 pending = s.hedgeBlock == block.number ? s.pendingQty : int256(0);
         int256 resting = s.makerSell ? s.makerFillable.toInt256() : -s.makerFillable.toInt256();
         uint256 sharePrice = Math.mulDiv(price, ctx.tokenPerShare, StockLib.RATIO_ONE);
         for (uint256 k; k < 2; ++k) {
-            int256 short_ = k == 0 ? s.shortConfirmed : s.shortConfirmed + s.pendingQty + resting;
+            int256 short_ = k == 0 ? live : live + pending + resting;
             uint256 b = StockLib.abs(before - short_);
             uint256 a = StockLib.abs(next - short_);
             if (a > b && StockLib.unitsToCash(ctx, a, sharePrice) > c.maxUnhedged) return true;
@@ -232,7 +238,9 @@ library StockPricing {
 
     /// @notice Keep the jump breaker's anchor on the feed. A move within the breaker re-anchors at
     /// once; a jump is noted, and re-anchored only once it has stood for `reanchorDelay`, after
-    /// which fills pay `reanchorBps` more for `reanchorWide`. Permissionless: it can only follow
+    /// which fills pay `reanchorBps` more for `reanchorWide`. A reading more than the breaker away from
+    /// the price the jump was noted at is a different jump (the first may have come and gone unseen),
+    /// and its clock starts again. Permissionless: it can only follow
     /// a signed price, and only slowly across a jump. A jump past `MAX_ACTION_MOVE` is never
     /// followed: it is what a split looks like when the feed moves before the ratio registry does,
     /// so it halts the vault for the owner's `acceptAction`, as an announced ratio would.
@@ -247,8 +255,9 @@ library StockPricing {
             s.anchorPrice = r.price.toUint128();
             s.jumpSince = 0;
             emit Anchored(r.price);
-        } else if (s.jumpSince == 0) {
+        } else if (s.jumpSince == 0 || StockLib.deviationBps(r.price, s.jumpPrice) > c.maxJumpBps) {
             s.jumpSince = uint64(block.timestamp);
+            s.jumpPrice = r.price.toUint128();
             emit JumpSeen(r.price, s.anchorPrice);
         } else if (block.timestamp >= uint256(s.jumpSince) + c.reanchorDelay) {
             s.anchorPrice = r.price.toUint128();
@@ -266,6 +275,9 @@ library StockPricing {
     /// accepted before the feed reflects it is refused. When the market really has moved further than
     /// that while halted (a merger, a gap on news), the owner states the per-token price it expects
     /// (`expectedPrice`, 1e18) and the check is against that instead, so no move strands the halt.
+    /// When the ratio changes, `maxMoveBps` must be under half the move the change itself makes to an
+    /// unmoved feed, so an early acceptance of a split smaller than `MAX_ACTION_MOVE` (a 5:4 moves 25%)
+    /// is caught whatever bound the owner passes.
     function acceptAction(
         StockConfig storage c,
         StockState storage s,
@@ -280,6 +292,8 @@ library StockPricing {
         if (ratio < StockLib.MIN_RATIO || ratio > StockLib.MAX_RATIO || ratio != announced) {
             revert BadRatio(ratio, announced);
         }
+        uint256 ratioMove = StockLib.deviationBps(ctx.tokenPerShare, ratio);
+        if (2 * uint256(maxMoveBps) >= ratioMove && ratioMove != 0) revert MoveBoundTooWide(maxMoveBps, ratioMove);
         ctx.tokenPerShare = ratio;
         ctx.actionHalt = false;
         uint256 price = StockLib.markPrice(ctx);

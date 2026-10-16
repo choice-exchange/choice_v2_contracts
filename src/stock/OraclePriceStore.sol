@@ -18,9 +18,11 @@ import {PriceStore} from "./PriceStore.sol";
 ///
 /// **How old the module's price is.** `0x67` dates a price by the block it landed in, in whole seconds,
 /// not by the feed's own time. Relayers land an update about 0.8 s after Pyth publishes it (2 s at p99), so
-/// the store dates the module's price `relayLagMs` earlier, rounded down to the second, and a reader judging
-/// staleness sees it at least that old. A feed whose market is shut stops landing (the module keeps only a
-/// newer feed time), so its date stays at the close, as weekend mode needs.
+/// the store dates the module's price (`feedTimestampUs`) `relayLagMs` earlier, rounded down to the second,
+/// and a reader judging staleness sees it at least that old. Its `timestampUs` is when it landed: a signed
+/// update from before then may be older than it, so a vault takes one handed to a fill only if its feed
+/// moved after that. A feed whose market is shut stops landing (the module keeps only a newer feed time), so
+/// its date stays at the close, as weekend mode needs.
 contract OraclePriceStore is PriceStore {
     IOraclePrecompile internal constant ORACLE = IOraclePrecompile(0x0000000000000000000000000000000000000067);
     uint8 internal constant PYTH_PRO = 14;
@@ -47,8 +49,8 @@ contract OraclePriceStore is PriceStore {
         if (m.feedTimestampUs > p.feedTimestampUs) p = m;
     }
 
-    /// @notice The oracle module's price for `feedId`, dated `relayLagMs` before the second it landed;
-    /// all zero when the module has none.
+    /// @notice The oracle module's price for `feedId`: its feed time `relayLagMs` before the second it
+    /// landed, its batch time that second; all zero when the module has none.
     function moduleLatest(uint32 feedId) public view returns (Price memory p) {
         try ORACLE.oraclePricePairState(PYTH_PRO, Strings.toString(feedId), "USD") returns (
             IOraclePrecompile.PricePairState memory s
@@ -57,8 +59,8 @@ contract OraclePriceStore is PriceStore {
             uint256 lagUs = uint256(relayLagMs) * 1000;
             uint256 landedUs = uint256(s.baseTimestamp) * 1e6;
             if (mantissa == 0 || mantissa > uint64(type(int64).max) || landedUs <= lagUs) return p;
-            p.timestampUs = uint64(landedUs - lagUs);
-            p.feedTimestampUs = p.timestampUs;
+            p.timestampUs = uint64(landedUs);
+            p.feedTimestampUs = uint64(landedUs - lagUs);
             // forge-lint: disable-next-line(unsafe-typecast) - bounded by int64's max above.
             p.price = int64(uint64(mantissa));
             p.exponent = EXPONENT;

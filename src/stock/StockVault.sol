@@ -36,6 +36,7 @@ import {StockLib} from "./StockLib.sol";
 import {StockOps} from "./StockOps.sol";
 import {StockPricing} from "./StockPricing.sol";
 import {
+    DepositLock,
     Fill,
     Reference,
     Refusal,
@@ -129,6 +130,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     error NotDepositor(address caller);
     error UnexpectedLock();
     error NotSelf();
+    error SharesLocked(uint256 locked, uint256 until);
 
     event PoolRegistered(PoolId indexed poolId, bool stockIsCurrency0);
     event FillRefused(Refusal reason);
@@ -218,8 +220,9 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return BITMAP;
     }
 
-    /// @notice Cash, booked stock at the stored price, the short at margin plus PnL, and an open
-    /// restock order's cash. ⚠️ Accrued funding is counted only once settled; deposits and
+    /// @notice Booked cash, booked stock at the stored price, the hedge subaccount's cash, the short at
+    /// margin plus PnL, and an open restock order's stock (see `StockHedge.value`). ⚠️ Accrued funding
+    /// is counted only once settled; deposits and
     /// withdrawals settle it first, so the previews (which cannot) are off by the unsettled
     /// funding: when it is owed to the short, a deposit mints a little less than `previewDeposit`.
     /// Read `navReady` before trusting this mid-block.
@@ -247,16 +250,16 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return StockPricing.quote(l.config, l.state, _ctx(), w, hookData);
     }
 
-    /// @notice The short to add (positive) or cover (negative) to reach the target, 1e18 units,
-    /// against the confirmed short: what `syncHedge` would act on now.
+    /// @notice The short to add (positive) or cover (negative), 1e18 units, against the position as the
+    /// exchange has it now: what `syncHedge` would act on, once past the band.
     function hedgeGap() external view returns (int256) {
         StockLayout storage l = StockStorage.layout();
         StockContext memory ctx = _ctx();
         (MarketCalendar.Session session,) = ctx.calendar.sessionAt(block.timestamp);
         bool closed = session == MarketCalendar.Session.Closed
             || (session == MarketCalendar.Session.Overnight && !l.config.overnightLive);
-        bool restockOpen = !closed && l.issuer != address(0) && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
-        return StockHedge.gapNow(l.config, l.state, ctx, restockOpen);
+        bool restockOpen = l.issuer != address(0) && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
+        return StockHedge.gapNow(l.config, l.state, ctx, restockOpen, closed);
     }
 
     // -------------------------------------------------------------------------------------
@@ -414,23 +417,49 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return _convertToShares(maxDeposit(receiver), Math.Rounding.Floor);
     }
 
-    /// @notice Withdrawals are paid from cash on hand above the reserve, never by unwinding stock;
-    /// zero whenever one would be refused now (see `_navOpen`).
+    /// @notice Withdrawals are paid from cash on hand above the reserve, never by unwinding stock, and
+    /// never from shares a recent deposit locked; zero whenever one would be refused now (see `_navOpen`).
     function maxWithdraw(address owner_) public view override returns (uint256) {
         if (!_navOpen(StockLib.PAUSE_WITHDRAWALS)) return 0;
-        return Math.min(_convertToAssets(balanceOf(owner_), Math.Rounding.Floor), _freeCash());
+        return Math.min(_convertToAssets(_unlocked(owner_), Math.Rounding.Floor), _freeCash());
     }
 
     function maxRedeem(address owner_) public view override returns (uint256) {
         if (!_navOpen(StockLib.PAUSE_WITHDRAWALS)) return 0;
-        return Math.min(balanceOf(owner_), _convertToShares(_freeCash(), Math.Rounding.Floor));
+        return Math.min(_unlocked(owner_), _convertToShares(_freeCash(), Math.Rounding.Floor));
     }
 
+    /// @dev A deposit's shares are locked to their receiver for `depositLock` (see `DepositLock`).
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         StockLayout storage l = StockStorage.layout();
         if (l.allowlistOn && !l.isDepositor[caller] && caller != owner()) revert NotDepositor(caller);
         super._deposit(caller, receiver, assets, shares);
         l.state.cashBooked += assets;
+        uint256 lock = l.config.depositLock;
+        if (lock != 0) {
+            DepositLock storage d = l.depositLocks[receiver];
+            d.shares = (block.timestamp < d.until ? d.shares : 0) + shares.toUint128();
+            d.until = uint64(block.timestamp + lock);
+        }
+    }
+
+    /// @dev Shares a deposit locked may not leave their holder, by withdrawal, queued redemption or
+    /// transfer, until the lock ends: nobody can deposit at the stored price, push a newer signed one and
+    /// take the difference straight back out. The vault's own escrow is never locked.
+    function _update(address from, address to, uint256 value) internal override {
+        if (from != address(0) && from != address(this) && balanceOf(from) < value + _locked(from)) {
+            revert SharesLocked(_locked(from), StockStorage.layout().depositLocks[from].until);
+        }
+        super._update(from, to, value);
+    }
+
+    function _locked(address holder) internal view returns (uint256) {
+        DepositLock storage d = StockStorage.layout().depositLocks[holder];
+        return block.timestamp < d.until ? d.shares : 0;
+    }
+
+    function _unlocked(address holder) internal view returns (uint256) {
+        return balanceOf(holder) - _locked(holder);
     }
 
     function _withdraw(address caller, address receiver, address owner_, uint256 assets, uint256 shares)

@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {IERC4626} from "@openzeppelin/contracts/interfaces/IERC4626.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
@@ -12,7 +13,7 @@ import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {SubaccountLib} from "../libraries/SubaccountLib.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
 import {PythLazerLib} from "./PythLazerLib.sol";
-import {Reference, Refusal, StockConfig, StockContext, StockState} from "./StockTypes.sol";
+import {Reference, Refusal, StockConfig, StockContext, StockLayout, StockState} from "./StockTypes.sol";
 
 /// @title StockLib
 /// @notice What every body of a `StockVault` shares: the hard limits and flags, the errors more than one
@@ -57,6 +58,7 @@ library StockLib {
     uint8 internal constant DECIMALS_OFFSET = 6;
     uint32 internal constant MIN_QUEUE_DEADLINE = 1 hours;
     uint32 internal constant MAX_QUEUE_DEADLINE = 14 days;
+    uint32 internal constant MAX_DEPOSIT_LOCK = 1 days;
 
     /// @dev The exchange subaccount the short trades from. Not the default one, which trades off the
     /// bank balance: here its margin, PnL, fees and funding move a deposit of its own, so the bank
@@ -177,31 +179,43 @@ library StockLib {
     // The hedge gap
     // -------------------------------------------------------------------------------------
 
-    /// @notice The short the vault should add (positive) or cover (negative), 1e18 units, against
-    /// the confirmed short.
+    /// @notice The short the vault should add (positive) or cover (negative) against `short_`, 1e18
+    /// units. The short tracks what the vault holds. While the issuer can restock (`restockOpen`) it may
+    /// run ahead of that toward the target inventory, by at most `maxUnhedged`: if the restock never
+    /// comes, that is the exposure left. That pre-short is put on only while the market is open and only
+    /// as far as today's restock room, but once on it is kept across a close or a spent room, so the
+    /// short does not churn at every session boundary. So it moves only when it is outside a range:
+    /// from the holding plus what may be put on now, to the holding plus the most it may run ahead.
     function hedgeGap(
         StockConfig storage c,
         StockState storage s,
         StockContext memory ctx,
         uint256 price,
-        bool restockOpen
+        bool restockOpen,
+        bool closed,
+        int256 short_
     ) internal view returns (int256) {
         // A restock order counts as held both ways: a buy's stock is on its way, a sell's is still ours.
-        uint256 units = toUnits(Math.min(s.stockBooked, ownStock(s, ctx)), ctx.stockDecimals);
-        if (s.orderOpen) units += toUnits(s.orderStock, ctx.stockDecimals);
+        uint256 low = toUnits(Math.min(s.stockBooked, ownStock(s, ctx)), ctx.stockDecimals);
+        if (s.orderOpen) low += toUnits(s.orderStock, ctx.stockDecimals);
+        uint256 high = low;
         // No pre-hedge while an in-kind epoch unwinds: its debt is paid from cash the short would hold.
         if (restockOpen && s.debtOwed == 0) {
             uint256 held = stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor) + orderValue(s, ctx, price);
             if (c.targetInventory > held) {
-                uint256 used = block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW ? 0 : s.restockUsed;
-                uint256 room = c.restockDailyCap > used ? c.restockDailyCap - used : 0;
-                // Never short more than `maxUnhedged` ahead of what is held, whatever the target:
-                // if the restock never comes, that is the exposure left.
-                uint256 gapCash = Math.min(Math.min(c.targetInventory - held, room), c.maxUnhedged);
-                units += cashToUnits(ctx, gapCash, price);
+                uint256 ahead = Math.min(c.targetInventory - held, c.maxUnhedged);
+                high += cashToUnits(ctx, ahead, price);
+                if (!closed) {
+                    uint256 used =
+                        block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW ? 0 : s.restockUsed;
+                    uint256 room = c.restockDailyCap > used ? c.restockDailyCap - used : 0;
+                    low += cashToUnits(ctx, Math.min(ahead, room), price);
+                }
             }
         }
-        return toShares(ctx, units).toInt256() - s.shortConfirmed;
+        int256 lo = toShares(ctx, low).toInt256();
+        int256 hi = toShares(ctx, high).toInt256();
+        return short_ < lo ? lo - short_ : short_ > hi ? hi - short_ : int256(0);
     }
 
     // -------------------------------------------------------------------------------------
@@ -324,12 +338,28 @@ library StockLib {
         return uint256(c.cashReserve) + s.debtOwed;
     }
 
+    /// @dev Cash a restock buy may not spend: `cashKept`, plus the open redeem epoch's value, the cash the
+    /// queue is waiting for (an instant withdrawal cannot take it either).
+    function cashKeptQueued(StockLayout storage l) internal view returns (uint256) {
+        uint256 shares = l.epochs[l.redeemEpoch].shares;
+        uint256 queued = shares == 0 ? 0 : IERC4626(address(this)).convertToAssets(shares);
+        return cashKept(l.config, l.state) + queued;
+    }
+
     /// @dev Make `amount` of cash available as the token for the vault to spend, refusing to dip
     /// into what it holds for fixing-lane requesters. The caller books what it spends.
     function spendOwnCash(StockState storage s, StockContext memory ctx, uint256 amount) internal {
         uint256 own = ownCash(s, ctx);
         if (own < amount) revert CashShort(amount, own);
         ensureToken(ctx, ctx.cash, amount);
+    }
+
+    /// @dev The short as the exchange has it now, 1e18 units (positive = short). A hedge order placed in
+    /// this block is not in it yet; one from an earlier block is, filled or not.
+    function liveShort(StockState storage s) internal view returns (int256) {
+        (bool found, IExchangeDerivatives.DerivativePosition memory p) = position(s);
+        if (!found) return 0;
+        return p.isLong ? -p.quantity.toInt256() : p.quantity.toInt256();
     }
 
     function position(StockState storage s)

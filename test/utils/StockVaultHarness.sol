@@ -209,7 +209,8 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             restockDailyCap: 10_000e6,
             minRedeem: 10e6,
             qtyTick: 1e15,
-            priceTick: 1e16
+            priceTick: 1e16,
+            depositLock: 0
         });
     }
 

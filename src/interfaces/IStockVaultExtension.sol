@@ -35,6 +35,7 @@ interface IStockVaultExtension {
     function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256);
     function claimableRedeemRequest(uint256 requestId, address controller) external view returns (uint256);
     function claimableRedeem(address controller) external view returns (uint256 cashOut, uint256 stockOut);
+    function lockedShares(address holder) external view returns (uint256 shares, uint64 until);
     function isOperator(address controller, address operator) external view returns (bool);
     function redeemQueue(uint64 epoch) external view returns (uint64 open, uint64 unwinding, RedeemEpoch memory e);
 
@@ -86,7 +87,7 @@ interface IStockVaultExtension {
     function unpause(uint8 flags) external;
     function acceptAction(uint56 ratio, uint16 maxMoveBps) external;
     function acceptActionAt(uint56 ratio, uint16 maxMoveBps, uint256 expectedPrice) external;
-    function migrateMarket(string calldata marketId_) external;
+    function migrateMarket(string calldata marketId_, uint64 qtyTick, uint64 priceTick) external;
     function setRestockMemo(bytes calldata memo) external;
     function acceptNav() external;
     function sweep(address token, address to, uint256 amount) external;

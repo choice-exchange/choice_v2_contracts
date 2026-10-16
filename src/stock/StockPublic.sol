@@ -12,6 +12,7 @@ import {StockQueue} from "./StockQueue.sol";
 import {StockQuotes} from "./StockQuotes.sol";
 import {StockRestock} from "./StockRestock.sol";
 import {
+    DepositLock,
     FixingBatch,
     FixingConfig,
     FixingRequest,
@@ -128,6 +129,12 @@ contract StockPublic is StockModule {
     /// @notice What `claimRedeem` would pay `controller` now.
     function claimableRedeem(address controller) external view delegated returns (uint256 cashOut, uint256 stockOut) {
         (, cashOut, stockOut) = StockQueue.claimable(StockStorage.layout(), controller);
+    }
+
+    /// @notice The shares of `holder`'s that recent deposits lock, and until when (zero once free).
+    function lockedShares(address holder) external view delegated returns (uint256 shares, uint64 until) {
+        DepositLock storage d = StockStorage.layout().depositLocks[holder];
+        if (block.timestamp < d.until) return (d.shares, d.until);
     }
 
     function isOperator(address controller, address operator) external view delegated returns (bool) {

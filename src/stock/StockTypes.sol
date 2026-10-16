@@ -65,6 +65,8 @@ struct StockConfig {
     // -- the perp market's ticks, 1e18 format
     uint64 qtyTick;
     uint64 priceTick;
+    // -- exits
+    uint32 depositLock; // how long the shares a deposit mints stay with their receiver; zero = off
 }
 
 /// @notice What a stock vault keeps between calls.
@@ -91,6 +93,8 @@ struct StockConfig {
 /// arrivals: one above it is an issuer's payment or refund, a windfall, or the relayer share of the
 /// short's own fees (dust, whole units only), not yet booked
 /// @param cashDenom the cash's bank denom, which the exchange names it by; fixed at construction
+/// @param jumpPrice the price a jump from the anchor was first seen at, with `jumpSince`: a later reading
+/// unlike it is a new jump, and its clock starts again
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -129,6 +133,15 @@ struct StockState {
     uint96 orderCounted;
     uint256 cashBooked;
     string cashDenom;
+    uint128 jumpPrice;
+}
+
+/// @notice The shares deposits minted to one holder that may not leave it before `until`. A deposit
+/// adds its shares and restarts the clock while earlier ones are still held, so each deposit is held
+/// the whole `depositLock`; shares the holder had before are free.
+struct DepositLock {
+    uint64 until;
+    uint128 shares;
 }
 
 /// @notice The fixing lane's tunables, set by the owner inside the limits in `StockFixing`. A batch
@@ -339,6 +352,7 @@ struct StockLayout {
     mapping(address controller => RedeemAccount) redeems;
     mapping(address controller => mapping(address operator => bool)) operators;
     bytes restockMemo;
+    mapping(address holder => DepositLock) depositLocks;
 }
 
 library StockStorage {

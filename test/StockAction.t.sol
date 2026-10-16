@@ -178,7 +178,7 @@ contract StockActionTest is StockVaultHarness {
         assertApproxEqAbs(sv.totalAssets(), nav, 1, "the settlement paid the margin back");
 
         vm.startPrank(OWNER);
-        x.migrateMarket(NEW_MARKET);
+        x.migrateMarket(NEW_MARKET, 1e15, 1e16);
         _price(MANTISSA / 4);
         x.acceptAction(QUARTER, 100);
         vm.stopPrank();
@@ -202,14 +202,14 @@ contract StockActionTest is StockVaultHarness {
     function test_migrationNeedsAHaltAndNothingOpen() public {
         vm.prank(OWNER);
         vm.expectRevert(StockHedge.NoActionPending.selector);
-        x.migrateMarket(NEW_MARKET);
+        x.migrateMarket(NEW_MARKET, 1e15, 1e16);
 
         _hedge(PRICE);
         vm.prank(GUARDIAN);
         x.haltAction();
         vm.prank(OWNER);
         vm.expectRevert(StockHedge.HedgeOpen.selector);
-        x.migrateMarket(NEW_MARKET);
+        x.migrateMarket(NEW_MARKET, 1e15, 1e16);
     }
 
     // ── any ratio ─────────────────────────────────────────────────────────
@@ -222,7 +222,10 @@ contract StockActionTest is StockVaultHarness {
         uint256 nav = sv.totalAssets();
         _announce(ratio);
         _price(int64(uint64(uint256(uint64(MANTISSA)) * ratio / 1e12)));
-        _accept(uint56(ratio));
+        // The feed moved with the ratio, so the price per token has not moved: a zero bound passes, and
+        // it is under half of any ratio's own move, however small the change.
+        vm.prank(OWNER);
+        x.acceptAction(uint56(ratio), 0);
         assertApproxEqRel(sv.quoteFill(true, 300e6, true, "").price, PRICE, 4e13);
         assertApproxEqRel(sv.totalAssets(), nav, 4e13);
         assertEq(uint256(sv.quoteFill(true, 300e6, true, "").reason), uint256(Refusal.None));

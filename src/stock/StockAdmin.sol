@@ -48,7 +48,7 @@ contract StockAdmin is StockModule {
     event AllowlistUpdated(bool on);
     event CurveOpenUpdated(bool open);
     event ActionAccepted(uint256 tokenPerShare);
-    event MarketMigrated(string marketId);
+    event MarketMigrated(string marketId, uint64 qtyTick, uint64 priceTick);
     event RestockMemoSet(bytes memo);
     event NavAccepted();
     event Swept(address indexed token, address indexed to, uint256 amount);
@@ -207,12 +207,17 @@ contract StockAdmin is StockModule {
         emit ActionAccepted(ratio);
     }
 
-    /// @notice Move the short to a new perp market, as when the old one is settled ahead of a split.
-    /// Only while halted, and with no position, pending hedge or maker order on the old one.
-    function migrateMarket(string calldata marketId_) external onlyOwner nonReentrant {
+    /// @notice Move the short to a new perp market, as when the old one is settled ahead of a split, with
+    /// that market's quantity and price ticks (1e18 format). Only while halted, and with no position,
+    /// pending hedge or maker order on the old one.
+    function migrateMarket(string calldata marketId_, uint64 qtyTick, uint64 priceTick)
+        external
+        onlyOwner
+        nonReentrant
+    {
         StockLayout storage l = StockStorage.layout();
-        StockHedge.migrateMarket(l.state, l.ctx, marketId_);
-        emit MarketMigrated(marketId_);
+        StockHedge.migrateMarket(l.config, l.state, l.ctx, marketId_, qtyTick, priceTick);
+        emit MarketMigrated(marketId_, qtyTick, priceTick);
     }
 
     /// @notice The issuer's order memo, with placeholder bytes 0x01 (amount offered), 0x02 (amount

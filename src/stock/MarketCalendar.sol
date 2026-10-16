@@ -53,7 +53,6 @@ contract MarketCalendar is Ownable2Step {
     mapping(uint32 day => DayType) public dayType;
 
     error NotGuardianOrOwner();
-    error ClosedTooLong(uint256 t);
 
     event DaySet(uint32 indexed day, DayType dayType);
     event GuardianUpdated(address guardian);
@@ -73,7 +72,10 @@ contract MarketCalendar is Ownable2Step {
     }
 
     /// @notice The session at UTC time `t` and when it began, in UTC. For a closed spell, `start`
-    /// is the end of the last session before it: the close whose price a frozen market holds.
+    /// is the end of the last session before it: the close whose price a frozen market holds. A spell
+    /// longer than `MAX_LOOKBACK_DAYS` (only a run of unscheduled closures makes one) answers `t`
+    /// itself: its close is too far back to price off, so a reader that wants a price from after the
+    /// close needs one from now. It never reverts, so a reader can refuse rather than fail.
     function sessionAt(uint256 t) public view returns (Session s, uint256 start) {
         int256 off = utcOffset(t);
         // forge-lint: disable-next-line(unsafe-typecast) - block timestamps are far below 2**255.
@@ -166,7 +168,7 @@ contract MarketCalendar is Ownable2Step {
             int256 base = int256(uint256(prev)) * DAY;
             return _utc(base + (kind == DayType.Half ? HALF_POST_END : POST_END));
         }
-        revert ClosedTooLong(t);
+        return t;
     }
 
     /// @dev A New York local time (seconds, as if it were UTC) back to UTC. No session boundary

@@ -59,8 +59,7 @@ library StockHedge {
     /// resting maker order is read back too: what may still fill, or cleared once it is gone.
     function _confirm(StockState storage s) private {
         if (s.hedgeBlock == block.number) revert HedgePending();
-        (bool found, IExchangeDerivatives.DerivativePosition memory p) = StockLib.position(s);
-        s.shortConfirmed = !found ? int256(0) : (p.isLong ? -p.quantity.toInt256() : p.quantity.toInt256());
+        s.shortConfirmed = StockLib.liveShort(s);
         s.pendingQty = 0;
         if (bytes(s.makerHash).length != 0) {
             (bool live, IExchangeDerivatives.TrimmedDerivativeLimitOrder memory o) = StockLib.makerOrder(s);
@@ -74,8 +73,9 @@ library StockHedge {
     /// it has drifted past the band. Keeper any time; anyone else `publicHedgeDelay` after the last.
     /// A resting maker order is cancelled first: by the keeper any time, by anyone once it has
     /// rested `makerTimeout`.
-    /// @param restockOpen whether the issuer can be ordered from now: then the short tracks the
-    /// target inventory and the issuer closes the gap; otherwise it tracks what the vault holds.
+    /// @param restockOpen whether the issuer can be ordered from: then the short may run ahead of what
+    /// the vault holds toward the target inventory, and the issuer closes the gap; otherwise it tracks
+    /// what the vault holds. See `StockLib.hedgeGap`.
     /// @return ordered whether an order went out
     function syncHedge(
         StockConfig storage c,
@@ -209,7 +209,7 @@ library StockHedge {
         Reference memory r,
         bool restockOpen
     ) private view returns (bool sell, uint256 qty) {
-        int256 gap = StockLib.hedgeGap(c, s, ctx, r.price, restockOpen && !r.closed);
+        int256 gap = StockLib.hedgeGap(c, s, ctx, r.price, restockOpen, r.closed, s.shortConfirmed);
         uint256 mag = StockLib.abs(gap);
         if (StockLib.unitsToCash(ctx, mag, r.sharePrice) < c.hedgeBand) return (false, 0);
         sell = gap > 0;
@@ -280,23 +280,34 @@ library StockHedge {
         s.makerPlacedAt = 0;
     }
 
-    /// @notice The short to add (positive) or cover (negative) to reach the target now, in shares.
-    function gapNow(StockConfig storage c, StockState storage s, StockContext memory ctx, bool restockOpen)
+    /// @notice The short to add (positive) or cover (negative) to bring the position as the exchange
+    /// has it now into range, in shares.
+    function gapNow(StockConfig storage c, StockState storage s, StockContext memory ctx, bool restockOpen, bool closed)
         external
         view
         returns (int256)
     {
-        return StockLib.hedgeGap(c, s, ctx, StockLib.markPrice(ctx), restockOpen);
+        return StockLib.hedgeGap(c, s, ctx, StockLib.markPrice(ctx), restockOpen, closed, StockLib.liveShort(s));
     }
 
-    /// @notice Point the vault at a new perp market, as when the old one is settled ahead of a split:
-    /// only during a corporate-action halt, and only with nothing open on the old one.
-    function migrateMarket(StockState storage s, StockContext memory ctx, string calldata marketId) external {
+    /// @notice Point the vault at a new perp market, with that market's ticks, as when the old one is
+    /// settled ahead of a split: only during a corporate-action halt, and only with nothing open on the
+    /// old one.
+    function migrateMarket(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext memory ctx,
+        string calldata marketId,
+        uint64 qtyTick,
+        uint64 priceTick
+    ) external {
         if (!StockLib.actionPending(ctx)) revert NoActionPending();
         (bool found,) = StockLib.position(s);
         if (found || s.pendingQty != 0 || s.shortConfirmed != 0 || bytes(s.makerHash).length != 0) revert HedgeOpen();
         if (bytes(marketId).length == 0) revert NoMarket();
+        if (qtyTick == 0 || priceTick == 0) revert StockLib.BadConfig();
         s.marketId = marketId;
+        (c.qtyTick, c.priceTick) = (qtyTick, priceTick);
     }
 
     /// @notice Bring the short back to its target leverage: its equity (margin plus unrealised PnL,
