@@ -4,8 +4,8 @@ pragma solidity 0.8.26;
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
 import {StockFixing} from "../src/stock/StockFixing.sol";
+import {StockModule} from "../src/stock/StockModule.sol";
 import {StockLib} from "../src/stock/StockLib.sol";
-import {StockVaultExtension} from "../src/stock/StockVaultExtension.sol";
 import {FixingBatch, FixingConfig, FixingRequest, Refusal, StockConfig} from "../src/stock/StockTypes.sol";
 import {LazerBuilder} from "./utils/LazerBuilder.sol";
 import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
@@ -60,7 +60,7 @@ contract StockFixingTest is StockVaultHarness {
 
     function _commit(address who, bool cashIn, uint256 amount) internal returns (uint256) {
         vm.prank(who);
-        return sv.commitFixing(BOUNDARY, cashIn, amount, who);
+        return x.commitFixing(BOUNDARY, cashIn, amount, who);
     }
 
     /// The update stamped at `tsUs`, its feed current at that time.
@@ -72,7 +72,7 @@ contract StockFixingTest is StockVaultHarness {
 
     function _settle(int64 mantissa) internal {
         vm.warp(BOUNDARY + 3);
-        sv.settleFixing(BOUNDARY, _at(TICK_US, mantissa));
+        x.settleFixing(BOUNDARY, _at(TICK_US, mantissa));
     }
 
     function _askAt(uint256 price, uint256 bps) internal pure returns (uint256) {
@@ -95,7 +95,7 @@ contract StockFixingTest is StockVaultHarness {
         _settle(31_000_000); // 310
 
         uint256 out = Math.mulDiv(3_000e6, 1e30, _askAt(310e18, 10));
-        FixingBatch memory b = sv.fixingBatch(BOUNDARY);
+        FixingBatch memory b = x.fixingBatch(BOUNDARY);
         assertTrue(b.settled);
         assertEq(b.price, 310e18);
         assertEq(b.spreadBps, 10);
@@ -104,7 +104,7 @@ contract StockFixingTest is StockVaultHarness {
         assertEq(x.state().anchorPrice, 310e18, "a fixing is a fresh anchor");
 
         uint256 before = stock.balanceOf(BUYER);
-        (uint256 got, uint256 refund) = sv.claimFixing(id);
+        (uint256 got, uint256 refund) = x.claimFixing(id);
         assertEq(got, out);
         assertEq(refund, 0);
         assertEq(stock.balanceOf(BUYER) - before, out);
@@ -122,8 +122,8 @@ contract StockFixingTest is StockVaultHarness {
         assertEq(x.state().stockBooked, 30 ether + 5 ether - stockOut, "the vault carries only the net");
 
         uint256 sellerCash = cash.balanceOf(SELLER);
-        sv.claimFixing(buyId);
-        sv.claimFixing(sellId);
+        x.claimFixing(buyId);
+        x.claimFixing(sellId);
         assertEq(stock.balanceOf(BUYER), 1_000 ether + stockOut);
         assertEq(cash.balanceOf(SELLER) - sellerCash, cashOut);
         assertEq(x.state().cashOwed, 0);
@@ -139,7 +139,7 @@ contract StockFixingTest is StockVaultHarness {
         uint256 c = _commit(BUYER3, true, 1_001e6);
         _settle(MANTISSA);
 
-        FixingBatch memory batch = sv.fixingBatch(BOUNDARY);
+        FixingBatch memory batch = x.fixingBatch(BOUNDARY);
         assertEq(batch.buy.out, 5 ether, "the net is held to maxNet");
         uint256 filled = Math.mulDiv(5 ether, _askAt(PRICE, 10), 1e30, Math.Rounding.Ceil);
         assertEq(batch.buy.filled, filled);
@@ -148,7 +148,7 @@ contract StockFixingTest is StockVaultHarness {
         uint256 refunds;
         uint256[3] memory ids = [a, b, c];
         for (uint256 k; k < 3; ++k) {
-            (uint256 o, uint256 r) = sv.claimFixing(ids[k]);
+            (uint256 o, uint256 r) = x.claimFixing(ids[k]);
             outs += o;
             refunds += r;
         }
@@ -156,7 +156,7 @@ contract StockFixingTest is StockVaultHarness {
         assertEq(refunds, 3_001e6 - filled, "every unfilled unit refunded");
         assertEq(x.state().cashOwed, 0);
         assertEq(x.state().stockOwed, 0);
-        batch = sv.fixingBatch(BOUNDARY);
+        batch = x.fixingBatch(BOUNDARY);
         assertEq(batch.buy.amountIn, 0);
         assertEq(batch.buy.out, 0);
     }
@@ -164,7 +164,7 @@ contract StockFixingTest is StockVaultHarness {
     function test_theBuySideIsCutToTheBookedStock() public {
         uint256 id = _commit(BUYER, true, 12_000e6); // 40 STOCK, 30 booked
         _settle(MANTISSA);
-        (uint256 out, uint256 refund) = sv.claimFixing(id);
+        (uint256 out, uint256 refund) = x.claimFixing(id);
         assertEq(out, 30 ether);
         assertEq(refund, 12_000e6 - Math.mulDiv(30 ether, _askAt(PRICE, 10), 1e30, Math.Rounding.Ceil));
         assertEq(x.state().stockBooked, 0);
@@ -174,7 +174,7 @@ contract StockFixingTest is StockVaultHarness {
         // 10,000 cash, 3x: at most 7,500 of stock comes in, leaving 2,500 to margin its short.
         uint256 id = _commit(SELLER, false, 40 ether);
         _settle(MANTISSA);
-        (uint256 out, uint256 refund) = sv.claimFixing(id);
+        (uint256 out, uint256 refund) = x.claimFixing(id);
         assertEq(refund, 15 ether);
         assertEq(out, Math.mulDiv(25 ether, _bidAt(PRICE, 10), 1e30));
         assertEq(x.state().stockBooked, 55 ether);
@@ -187,7 +187,7 @@ contract StockFixingTest is StockVaultHarness {
         _setCfg(c);
         uint256 id = _commit(SELLER, false, 20 ether);
         _settle(MANTISSA);
-        (, uint256 refund) = sv.claimFixing(id);
+        (, uint256 refund) = x.claimFixing(id);
         assertEq(refund, 10 ether);
     }
 
@@ -199,21 +199,21 @@ contract StockFixingTest is StockVaultHarness {
         uint64[2] memory wrong = [TICK_US + 200_000, TICK_US - 200_000];
         for (uint256 k; k < 2; ++k) {
             vm.expectRevert(abi.encodeWithSelector(StockFixing.WrongTick.selector, wrong[k], TICK_US));
-            sv.settleFixing(BOUNDARY, _at(wrong[k], MANTISSA));
+            x.settleFixing(BOUNDARY, _at(wrong[k], MANTISSA));
         }
-        sv.settleFixing(BOUNDARY, _at(TICK_US, MANTISSA));
+        x.settleFixing(BOUNDARY, _at(TICK_US, MANTISSA));
         vm.expectRevert(StockFixing.AlreadySettled.selector);
-        sv.settleFixing(BOUNDARY, _at(TICK_US, MANTISSA));
+        x.settleFixing(BOUNDARY, _at(TICK_US, MANTISSA));
     }
 
     function test_aCommitMustNameTheNextBoundary() public {
         vm.prank(BUYER);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.WrongBoundary.selector, BOUNDARY));
-        sv.commitFixing(BOUNDARY + 3600, true, 1_000e6, BUYER);
+        x.commitFixing(BOUNDARY + 3600, true, 1_000e6, BUYER);
         vm.warp(BOUNDARY);
         vm.prank(BUYER);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.WrongBoundary.selector, BOUNDARY + 3600));
-        sv.commitFixing(BOUNDARY, true, 1_000e6, BUYER);
+        x.commitFixing(BOUNDARY, true, 1_000e6, BUYER);
     }
 
     function test_aStaleFeedAtTheTickIsRefused() public {
@@ -223,7 +223,7 @@ contract StockFixingTest is StockVaultHarness {
         f.feedTimestampUs = TICK_US - 1_501_000; // older than maxAge at the tick
         bytes memory u = LazerBuilder.one(SIGNER_KEY, TICK_US, f);
         _expectRefused(Refusal.Stale);
-        sv.settleFixing(BOUNDARY, u);
+        x.settleFixing(BOUNDARY, u);
     }
 
     function test_aJumpFromTheAnchorIsRefused() public {
@@ -232,7 +232,7 @@ contract StockFixingTest is StockVaultHarness {
         vm.warp(BOUNDARY + 3);
         bytes memory u = _at(TICK_US, 40_000_000);
         _expectRefused(Refusal.Jump);
-        sv.settleFixing(BOUNDARY, u);
+        x.settleFixing(BOUNDARY, u);
     }
 
     function test_theSignerReportingTheMarketShutIsAHalt() public {
@@ -243,7 +243,7 @@ contract StockFixingTest is StockVaultHarness {
         f.session = 4;
         bytes memory u = LazerBuilder.one(SIGNER_KEY, TICK_US, f);
         _expectRefused(Refusal.Halted);
-        sv.settleFixing(BOUNDARY, u);
+        x.settleFixing(BOUNDARY, u);
     }
 
     function test_aSpreadOverTheMaximumIsRefused() public {
@@ -253,7 +253,7 @@ contract StockFixingTest is StockVaultHarness {
         vm.warp(BOUNDARY + 3);
         bytes memory u = _at(TICK_US, MANTISSA);
         _expectRefused(Refusal.Spread);
-        sv.settleFixing(BOUNDARY, u);
+        x.settleFixing(BOUNDARY, u);
     }
 
     function test_theSpreadAddsConfidenceAndTheMarketSpread() public {
@@ -264,8 +264,8 @@ contract StockFixingTest is StockVaultHarness {
         f.confidence = 6_000; // 2 bps of 30,000,000
         f.bestBid = 29_988_000;
         f.bestAsk = 30_012_000; // 4 bps half-width
-        sv.settleFixing(BOUNDARY, LazerBuilder.one(SIGNER_KEY, TICK_US, f));
-        assertEq(sv.fixingBatch(BOUNDARY).spreadBps, 16);
+        x.settleFixing(BOUNDARY, LazerBuilder.one(SIGNER_KEY, TICK_US, f));
+        assertEq(x.fixingBatch(BOUNDARY).spreadBps, 16);
     }
 
     function test_theSizeTermReadsTheNet() public {
@@ -276,7 +276,7 @@ contract StockFixingTest is StockVaultHarness {
         _commit(BUYER, true, 6_000e6);
         _commit(SELLER, false, 10 ether); // 3,000 crosses: the net is 3,000
         _settle(MANTISSA);
-        assertEq(sv.fixingBatch(BOUNDARY).spreadBps, 20);
+        assertEq(x.fixingBatch(BOUNDARY).spreadBps, 20);
     }
 
     // ── sessions ──────────────────────────────────────────────────────────
@@ -287,7 +287,7 @@ contract StockFixingTest is StockVaultHarness {
         uint64 next = uint64(SAT + 13 hours);
         vm.prank(BUYER);
         vm.expectRevert(StockFixing.SessionClosed.selector);
-        sv.commitFixing(next, true, 1_000e6, BUYER);
+        x.commitFixing(next, true, 1_000e6, BUYER);
     }
 
     function test_overnightTicksOnlyWhenOvernightIsLive() public {
@@ -299,7 +299,7 @@ contract StockFixingTest is StockVaultHarness {
         uint64 next = uint64(WED + 3 hours);
         vm.prank(BUYER);
         vm.expectRevert(StockFixing.SessionClosed.selector);
-        sv.commitFixing(next, true, 1_000e6, BUYER);
+        x.commitFixing(next, true, 1_000e6, BUYER);
     }
 
     // ── escrow, lapse, pause ──────────────────────────────────────────────
@@ -308,7 +308,7 @@ contract StockFixingTest is StockVaultHarness {
         uint256 id = _commit(BUYER, true, 3_000e6);
         vm.warp(BOUNDARY + 3);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.NotYetSettled.selector, BOUNDARY + 32));
-        sv.claimFixing(id);
+        x.claimFixing(id);
     }
 
     function test_aBatchNotSettledInItsWindowLapsesAndRefundsInFull() public {
@@ -317,12 +317,12 @@ contract StockFixingTest is StockVaultHarness {
         vm.warp(BOUNDARY + 33);
         bytes memory u = _at(TICK_US, MANTISSA);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.SettleWindowClosed.selector, BOUNDARY + 32));
-        sv.settleFixing(BOUNDARY, u);
+        x.settleFixing(BOUNDARY, u);
 
-        (uint256 out, uint256 refund) = sv.claimFixing(id);
+        (uint256 out, uint256 refund) = x.claimFixing(id);
         assertEq(out, 0);
         assertEq(refund, 3_000e6);
-        sv.claimFixing(sellId);
+        x.claimFixing(sellId);
         assertEq(cash.balanceOf(BUYER), 1_000_000e6);
         assertEq(stock.balanceOf(SELLER), 1_000 ether);
         assertEq(x.state().cashOwed, 0);
@@ -335,13 +335,13 @@ contract StockFixingTest is StockVaultHarness {
         x.pause(StockLib.PAUSE_FIXING);
         vm.prank(BUYER2);
         vm.expectRevert(StockFixing.FixingPaused.selector);
-        sv.commitFixing(BOUNDARY, true, 1_000e6, BUYER2);
+        x.commitFixing(BOUNDARY, true, 1_000e6, BUYER2);
         vm.warp(BOUNDARY + 3);
         bytes memory u = _at(TICK_US, MANTISSA);
         vm.expectRevert(StockFixing.FixingPaused.selector);
-        sv.settleFixing(BOUNDARY, u);
+        x.settleFixing(BOUNDARY, u);
         vm.warp(BOUNDARY + 33);
-        (, uint256 refund) = sv.claimFixing(id);
+        (, uint256 refund) = x.claimFixing(id);
         assertEq(refund, 3_000e6);
     }
 
@@ -373,10 +373,10 @@ contract StockFixingTest is StockVaultHarness {
         _commit(BUYER, true, 50_000e6);
         vm.prank(OWNER);
         sv.withdraw(9_000e6, OWNER, OWNER);
-        // 1,000 of its own cash left against 30 STOCK to hedge at 1x: 8,946 of margin at the
-        // worst price, plus 1% for the fee.
+        // 1,000 of its own cash left against 30 STOCK to hedge at 1x: 9,000 of margin at the mark
+        // plus 54 for the order opening 1.80 under it, plus 1% for the fee.
         vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockLib.CashShort.selector, 9_035_460_001, 1_000e6));
+        vm.expectRevert(abi.encodeWithSelector(StockLib.CashShort.selector, 9_144_540_001, 1_000e6));
         x.syncHedge();
         assertEq(x.state().cashOwed, 50_000e6);
     }
@@ -410,7 +410,7 @@ contract StockFixingTest is StockVaultHarness {
             x.setFixingConfig(bad[k]);
         }
         vm.prank(KEEPER);
-        vm.expectRevert(StockVaultExtension.NotOwner.selector);
+        vm.expectRevert(StockModule.NotOwner.selector);
         x.setFixingConfig(_fixCfg());
     }
 
@@ -420,7 +420,7 @@ contract StockFixingTest is StockVaultHarness {
         _setFix(fc);
         vm.prank(BUYER);
         vm.expectRevert(StockFixing.FixingClosed.selector);
-        sv.commitFixing(BOUNDARY, true, 1_000e6, BUYER);
+        x.commitFixing(BOUNDARY, true, 1_000e6, BUYER);
     }
 
     function test_aConfigChangeDoesNotMoveACommittedBatch() public {
@@ -429,7 +429,7 @@ contract StockFixingTest is StockVaultHarness {
         fc.delayMs = 4000;
         fc.settleWindow = 5;
         _setFix(fc);
-        FixingBatch memory b = sv.fixingBatch(BOUNDARY);
+        FixingBatch memory b = x.fixingBatch(BOUNDARY);
         assertEq(b.tickMs, TICK_US / 1000);
         assertEq(b.deadline, BOUNDARY + 32);
         _settle(MANTISSA);
@@ -438,33 +438,33 @@ contract StockFixingTest is StockVaultHarness {
     function test_requestSizeLimits() public {
         vm.prank(BUYER);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.RequestTooSmall.selector, 9e6, 10e6));
-        sv.commitFixing(BOUNDARY, true, 9e6, BUYER);
+        x.commitFixing(BOUNDARY, true, 9e6, BUYER);
         FixingConfig memory fc = _fixCfg();
         fc.maxSide = 5_000e6;
         _setFix(fc);
         _commit(BUYER, true, 4_000e6);
         vm.prank(BUYER2);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.SideFull.selector, 2_000e6, 1_000e6));
-        sv.commitFixing(BOUNDARY, true, 2_000e6, BUYER2);
+        x.commitFixing(BOUNDARY, true, 2_000e6, BUYER2);
         // Stock is valued at the stored price: 20 STOCK is 6,000.
         vm.prank(SELLER);
         vm.expectRevert(abi.encodeWithSelector(StockFixing.SideFull.selector, 6_000e6, 5_000e6));
-        sv.commitFixing(BOUNDARY, false, 20 ether, SELLER);
+        x.commitFixing(BOUNDARY, false, 20 ether, SELLER);
     }
 
     // ── permissionless ────────────────────────────────────────────────────
 
     function test_anyoneClaimsButOnlyTheRecipientIsPaid() public {
         vm.prank(BUYER);
-        uint256 id = sv.commitFixing(BOUNDARY, true, 3_000e6, BUYER2);
+        uint256 id = x.commitFixing(BOUNDARY, true, 3_000e6, BUYER2);
         _settle(MANTISSA);
-        FixingRequest memory r = sv.fixingRequest(id);
+        FixingRequest memory r = x.fixingRequest(id);
         assertEq(r.recipient, BUYER2);
         vm.prank(address(0xDEAD));
-        (uint256 out,) = sv.claimFixing(id);
+        (uint256 out,) = x.claimFixing(id);
         assertEq(stock.balanceOf(BUYER2), 1_000 ether + out);
         vm.expectRevert(StockFixing.NoRequest.selector);
-        sv.claimFixing(id);
+        x.claimFixing(id);
     }
 
     function test_settlementGasDoesNotGrowWithRequests() public {
@@ -472,18 +472,18 @@ contract StockFixingTest is StockVaultHarness {
         _commit(BUYER, true, 1_000e6);
         vm.warp(BOUNDARY + 3);
         uint256 g = gasleft();
-        sv.settleFixing(BOUNDARY, _at(TICK_US, MANTISSA));
+        x.settleFixing(BOUNDARY, _at(TICK_US, MANTISSA));
         uint256 one = g - gasleft();
 
         uint64 next = BOUNDARY + 3600;
         for (uint256 k; k < 40; ++k) {
             vm.prank(BUYER);
-            sv.commitFixing(next, true, 20e6, BUYER);
+            x.commitFixing(next, true, 20e6, BUYER);
         }
         vm.warp(next + 3);
         bytes memory u = _at((next * 1000 + 2000) * 1000, MANTISSA);
         g = gasleft();
-        sv.settleFixing(next, u);
+        x.settleFixing(next, u);
         uint256 forty = g - gasleft();
         assertLt(forty, one + 25_000, "one total per side, whatever the count");
     }
@@ -509,7 +509,7 @@ contract StockFixingTest is StockVaultHarness {
         uint256 stockPaid;
         for (uint256 k; k < 3; ++k) {
             if (ids[k] == 0) continue;
-            (uint256 o, uint256 r) = sv.claimFixing(ids[k]);
+            (uint256 o, uint256 r) = x.claimFixing(ids[k]);
             if (k < 2) {
                 stockPaid += o;
                 cashPaid += r;

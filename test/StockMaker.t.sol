@@ -2,8 +2,9 @@
 pragma solidity 0.8.26;
 
 import {IExchangeDerivatives} from "../src/interfaces/IExchangeDerivatives.sol";
+import {StockModule} from "../src/stock/StockModule.sol";
+import {StockHedge} from "../src/stock/StockHedge.sol";
 import {StockLib} from "../src/stock/StockLib.sol";
-import {StockVault} from "../src/stock/StockVault.sol";
 import {Refusal, StockConfig, StockState} from "../src/stock/StockTypes.sol";
 import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 
@@ -23,7 +24,7 @@ contract StockMakerTest is StockVaultHarness {
 
     function _place(uint256 price) internal returns (string memory) {
         vm.prank(KEEPER);
-        assertTrue(sv.placeMaker(price));
+        assertTrue(x.placeMaker(price));
         return x.state().makerHash;
     }
 
@@ -115,7 +116,7 @@ contract StockMakerTest is StockVaultHarness {
     function test_insideTheBandNothingIsPlaced() public {
         _hedge(300e18);
         vm.prank(KEEPER);
-        assertFalse(sv.placeMaker(300.5e18));
+        assertFalse(x.placeMaker(300.5e18));
         assertEq(exchange.limitOrdersPlaced(), 0);
     }
 
@@ -125,8 +126,8 @@ contract StockMakerTest is StockVaultHarness {
         uint256[3] memory bad = [uint256(301.81e18), 298.19e18, 300.001e18];
         for (uint256 k; k < 3; ++k) {
             vm.prank(KEEPER);
-            vm.expectRevert(abi.encodeWithSelector(StockLib.MakerPriceOutOfBand.selector, bad[k], 298.2e18, 301.8e18));
-            sv.placeMaker(bad[k]);
+            vm.expectRevert(abi.encodeWithSelector(StockHedge.MakerPriceOutOfBand.selector, bad[k], 298.2e18, 301.8e18));
+            x.placeMaker(bad[k]);
         }
     }
 
@@ -134,20 +135,20 @@ contract StockMakerTest is StockVaultHarness {
         exchange.setBook(300.6e18, 300.7e18);
         vm.prank(KEEPER);
         vm.expectRevert(bytes("exceeds top of book"));
-        sv.placeMaker(300.5e18);
+        x.placeMaker(300.5e18);
     }
 
     function test_onlyTheKeeperPlaces() public {
         vm.prank(TRADER);
-        vm.expectRevert(StockVault.NotKeeper.selector);
-        sv.placeMaker(300.5e18);
+        vm.expectRevert(StockModule.NotKeeper.selector);
+        x.placeMaker(300.5e18);
     }
 
     function test_makerHedgingCanBeOff() public {
         _setCfg(_cfg()); // makerTimeout 0
         vm.prank(KEEPER);
-        vm.expectRevert(StockLib.MakerOff.selector);
-        sv.placeMaker(300.5e18);
+        vm.expectRevert(StockHedge.MakerOff.selector);
+        x.placeMaker(300.5e18);
     }
 
     function test_theMakerTimeoutIsBounded() public {
@@ -163,14 +164,14 @@ contract StockMakerTest is StockVaultHarness {
     function test_anyoneCancelsOnlyAfterTheTimeout() public {
         _place(300.5e18);
         vm.prank(TRADER);
-        vm.expectRevert(abi.encodeWithSelector(StockLib.MakerResting.selector, T_REGULAR + TIMEOUT));
-        sv.cancelMaker();
+        vm.expectRevert(abi.encodeWithSelector(StockHedge.MakerResting.selector, T_REGULAR + TIMEOUT));
+        x.cancelMaker();
         vm.warp(T_REGULAR + TIMEOUT);
         vm.prank(TRADER);
-        sv.cancelMaker();
+        x.cancelMaker();
         assertEq(bytes(x.state().makerHash).length, 0);
-        vm.expectRevert(StockLib.NoMaker.selector);
-        sv.cancelMaker();
+        vm.expectRevert(StockHedge.NoMaker.selector);
+        x.cancelMaker();
     }
 
     function test_aMarketHedgeCancelsTheMakerOrderFirst() public {
@@ -187,7 +188,7 @@ contract StockMakerTest is StockVaultHarness {
         vm.warp(T_REGULAR + 300); // past publicHedgeDelay, not the maker timeout
         _price(MANTISSA);
         vm.prank(TRADER);
-        vm.expectRevert(abi.encodeWithSelector(StockLib.MakerResting.selector, T_REGULAR + TIMEOUT));
+        vm.expectRevert(abi.encodeWithSelector(StockHedge.MakerResting.selector, T_REGULAR + TIMEOUT));
         x.syncHedge();
         vm.warp(T_REGULAR + TIMEOUT);
         _price(MANTISSA);
@@ -208,7 +209,7 @@ contract StockMakerTest is StockVaultHarness {
         _expectRefusal(Refusal.Unhedged);
         _swap(true, false, 1 ether);
         vm.prank(KEEPER);
-        sv.cancelMaker();
+        x.cancelMaker();
         _swap(true, false, 1 ether);
         assertEq(x.state().stockBooked, 29 ether);
     }

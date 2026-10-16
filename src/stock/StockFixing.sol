@@ -169,7 +169,7 @@ library StockFixing {
 
         IPriceStore.Price memory p = ctx.store.verify(update, ctx.feedId);
         if (p.timestampUs != uint256(b.tickMs) * 1000) revert WrongTick(p.timestampUs, uint256(b.tickMs) * 1000);
-        uint256 price = StockLib.toWad(p.price, p.exponent);
+        uint256 price = StockLib.perToken(ctx, StockLib.toWad(p.price, p.exponent));
         Refusal why = _check(c, s, ctx, p, price, b.tickMs / 1000);
         if (why != Refusal.None) revert FixingRefused(why);
 
@@ -186,6 +186,7 @@ library StockFixing {
         s.cashOwed = s.cashOwed - buyFilled.toUint128() + cashOut.toUint128();
         s.stockOwed = s.stockOwed - sellFilled.toUint128() + stockOut.toUint128();
         s.stockBooked = s.stockBooked + sellFilled - stockOut;
+        s.cashBooked = s.cashBooked + buyFilled - cashOut;
         (b.buy.filled, b.buy.out) = (buyFilled.toUint128(), stockOut.toUint128());
         (b.sell.filled, b.sell.out) = (sellFilled.toUint128(), cashOut.toUint128());
         b.price = price.toUint128();
@@ -213,6 +214,7 @@ library StockFixing {
         if (price == 0 || uint256(p.feedTimestampUs) + uint256(c.maxAgeMs) * 1000 < p.timestampUs) {
             return Refusal.Stale;
         }
+        if (StockLib.actionPending(ctx)) return Refusal.Action;
         if (!_open(c, ctx, tick)) return Refusal.Closed;
         if (p.flags & PythLazerLib.HAS_SESSION != 0 && p.marketSession == PythLazerLib.SESSION_CLOSED) {
             return Refusal.Halted;
@@ -286,9 +288,10 @@ library StockFixing {
             // hedging that value needs value * 10 / leverageX10 of margin; both must fit above the
             // reserve.
             uint256 own = StockLib.ownCash(s, ctx);
-            uint256 room = own > c.cashReserve ? own - c.cashReserve : 0;
+            uint256 kept = StockLib.cashKept(c, s);
+            uint256 room = own > kept ? own - kept : 0;
             uint256 capValue = Math.min(fc.maxNet, room * c.leverageX10 / (uint256(c.leverageX10) + 10));
-            uint256 heldValue = StockLib.stockToCash(ctx, s.stockBooked, price, Math.Rounding.Ceil);
+            uint256 heldValue = StockLib.stockToCash(ctx, StockLib.stockInventory(s), price, Math.Rounding.Ceil);
             capValue = Math.min(capValue, c.maxInventory > heldValue ? c.maxInventory - heldValue : 0);
             uint256 cap = Math.mulDiv(capValue, scale, price);
             if (sellIn - stockOut > cap) sellFilled = stockOut + cap;
