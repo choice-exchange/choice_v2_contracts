@@ -25,6 +25,7 @@ import {MarketCalendar} from "../../src/stock/MarketCalendar.sol";
 import {PriceStore} from "../../src/stock/PriceStore.sol";
 import {StockPublic} from "../../src/stock/StockPublic.sol";
 import {StockAdmin} from "../../src/stock/StockAdmin.sol";
+import {StockRatios} from "../../src/stock/StockRatios.sol";
 import {StockRegistry} from "../../src/stock/StockRegistry.sol";
 import {StockVault} from "../../src/stock/StockVault.sol";
 import {Refusal, StockConfig} from "../../src/stock/StockTypes.sol";
@@ -43,10 +44,12 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     address internal constant ISSUER = address(0x155E);
     address internal constant TRADER = address(0x7AD3);
     address internal constant DEPOSITOR = address(0xDE90);
+    address internal constant UPDATER = address(0x9A70);
     address internal constant EXCHANGE = 0x0000000000000000000000000000000000000065;
     uint256 internal constant SIGNER_KEY = 0x5161;
     uint32 internal constant FEED = 7;
     string internal constant MARKET = "0x00000000000000000000000000000000000000000000000000000000000000aa";
+    string internal constant CASH_DENOM = "erc20:cash";
     int64 internal constant MANTISSA = 30_000_000; // 300.00000, exponent -5
     uint256 internal constant PRICE = 300e18;
 
@@ -62,6 +65,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     PriceStore internal store;
     MarketCalendar internal calendar;
     StockRegistry internal registry;
+    StockRatios internal ratios;
     StockVault internal sv;
     IStockVaultExtension internal x;
     MockERC20 internal cash;
@@ -84,11 +88,12 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
 
         vm.etch(EXCHANGE, address(new MockStockExchange()).code);
         exchange = MockStockExchange(EXCHANGE);
-        exchange.setCash(cash);
+        exchange.setCash(cash, CASH_DENOM);
 
-        store = new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
+        store = _newStore();
         calendar = new MarketCalendar(OWNER, GUARDIAN);
         registry = new StockRegistry(OWNER);
+        ratios = new StockRatios(OWNER, UPDATER);
         sv = new StockVault(
             StockVault.Init({
                 cash: IERC20(address(cash)),
@@ -98,8 +103,10 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
                 calendar: calendar,
                 modules: address(new StockPublic(address(new StockAdmin()))),
                 registry: address(registry),
+                ratios: ratios,
                 feedId: FEED,
                 marketId: MARKET,
+                cashDenom: CASH_DENOM,
                 owner: OWNER,
                 name: "Stock vault",
                 symbol: "SV"
@@ -148,6 +155,11 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
 
     // ── helpers ───────────────────────────────────────────────────────────
 
+    /// The price store every vault in the suite reads; a suite may swap in another kind.
+    function _newStore() internal virtual returns (PriceStore) {
+        return new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
+    }
+
     function _cfg() internal pure returns (StockConfig memory) {
         return StockConfig({
             spreadRegular: 25,
@@ -177,6 +189,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             window: 3600,
             publicHedgeDelay: 300,
             restockDeadline: 3600,
+            restockExpiryUnit: 1 days,
             makerTimeout: 0,
             queueDeadline: 2 days,
             exitFeeBps: 20,
@@ -267,7 +280,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
     }
 
     function _sub() internal view returns (string memory) {
-        return SubaccountLib.defaultSubaccount(address(sv));
+        return SubaccountLib.subaccount(address(sv), 1);
     }
 
     function _claims(MockERC20 t) internal view returns (uint256) {

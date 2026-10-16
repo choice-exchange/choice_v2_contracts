@@ -359,6 +359,7 @@ contract StockVaultTest is StockVaultHarness {
     function test_inventoryCap() public {
         StockConfig memory c = _cfg();
         c.maxInventory = 9_500e6;
+        c.restockDailyCap = 9_500e6; // never above the inventory cap
         _setCfg(c);
         _expectRefusal(Refusal.InventoryCap);
         _swap(false, true, 2 ether);
@@ -606,7 +607,8 @@ contract StockVaultTest is StockVaultHarness {
         assertFalse(o.isBuy);
         assertEq(o.quantity, 30 ether);
         assertEq(o.worstPrice, 298.2e18); // 300 less 60 bp, on the 0.01 tick
-        assertEq(o.margin, Math.mulDiv(30 ether, 298.2e18, 1e18) * 10 / 30);
+        // Initial margin at the mark (the higher price), plus the 1.80 a share the order opens under it.
+        assertEq(o.margin, Math.mulDiv(30 ether, PRICE, 1e18) * 10 / 30 + Math.mulDiv(30 ether, 1.8e18, 1e18));
     }
 
     function test_aDroppedHedgeIsReadBackAsNothing() public {
@@ -694,12 +696,16 @@ contract StockVaultTest is StockVaultHarness {
         assertLt(shares, previewBefore, "the funding is in the price the deposit paid");
     }
 
-    function test_aFailedFundingSettlementStopsDeposits() public {
+    /// A refused funding settlement (a short under its initial margin ratio refuses any decrease) must not
+    /// freeze deposits and exits: the value is read with funding unsettled.
+    function test_aFailedFundingSettlementDoesNotStopDeposits() public {
         _hedge(PRICE);
         exchange.setFailDecrease(true);
+        cash.mint(OWNER, 1e6);
         vm.prank(OWNER);
-        vm.expectRevert(bytes("decrease failed"));
         sv.deposit(1e6, OWNER);
+        vm.prank(OWNER);
+        sv.withdraw(1e6, OWNER, OWNER);
     }
 
     function test_aNavJumpStopsDepositsUntilAccepted() public {
@@ -728,88 +734,6 @@ contract StockVaultTest is StockVaultHarness {
         sv.withdraw(1_001e6, OWNER, OWNER);
         vm.prank(OWNER);
         sv.withdraw(1_000e6, OWNER, OWNER);
-    }
-
-    // ── restock ───────────────────────────────────────────────────────────
-
-    function test_restockCountsTheOrderOnceThroughDelivery() public {
-        uint256 nav = sv.totalAssets();
-        vm.prank(KEEPER);
-        x.restock(3_000e6, 9.8 ether, hex"cafe");
-        assertEq(cash.balanceOf(ISSUER), 3_000e6);
-        assertEq(sv.totalAssets(), nav, "in transit at the cash sent");
-
-        stock.mint(address(sv), 10 ether); // the issuer delivers
-        assertEq(sv.totalAssets(), nav, "a delivery is not counted twice before it is booked");
-
-        x.settleRestock();
-        StockState memory s = x.state();
-        assertFalse(s.orderOpen);
-        assertEq(s.stockBooked, 40 ether);
-        assertEq(_claims(stock), 40 ether, "the delivery goes straight to claims");
-        assertEq(sv.totalAssets(), nav, "3,000 of cash became 3,000 of stock");
-    }
-
-    function test_restockMinimumMustBeNearTheReference() public {
-        vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockOps.MinOutTooLow.selector, 2_700e6, 2_910e6));
-        x.restock(3_000e6, 9 ether, "");
-    }
-
-    function test_restockDailyCapAndOneAtATime() public {
-        vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockOps.RestockCapExceeded.selector, 10_001e6, 10_000e6));
-        x.restock(10_001e6, 34 ether, "");
-        vm.prank(KEEPER);
-        x.restock(1_000e6, 3.3 ether, "");
-        vm.prank(KEEPER);
-        vm.expectRevert(StockOps.RestockUnavailable.selector);
-        x.restock(1_000e6, 3.3 ether, "");
-    }
-
-    function test_restockOnlyWhileTheMarketIsOpen() public {
-        _weekendPrice();
-        vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockLib.PriceNotUsable.selector, Refusal.Closed));
-        x.restock(1_000e6, 3.3 ether, "");
-    }
-
-    function test_anUndeliveredOrderExpiresAndHaltsRestocking() public {
-        uint256 nav = sv.totalAssets();
-        vm.prank(KEEPER);
-        x.restock(3_000e6, 9.8 ether, "");
-        stock.mint(address(sv), 5 ether); // short of the minimum
-        vm.expectRevert(abi.encodeWithSelector(StockOps.NotDelivered.selector, 5 ether, 9.8 ether));
-        x.settleRestock();
-
-        vm.warp(block.timestamp + 3601);
-        x.settleRestock();
-        assertTrue(x.state().restockHalted);
-        assertEq(sv.totalAssets(), nav - 3_000e6, "the lost order leaves the value");
-
-        _price(MANTISSA);
-        vm.prank(KEEPER);
-        vm.expectRevert(StockOps.RestockUnavailable.selector);
-        x.restock(1_000e6, 3.3 ether, "");
-
-        x.syncWindfall(); // the partial delivery is booked as a windfall
-        assertEq(x.state().stockBooked, 35 ether);
-        vm.prank(OWNER);
-        x.clearRestockHalt();
-        vm.prank(KEEPER);
-        x.restock(1_000e6, 3.3 ether, "");
-    }
-
-    function test_windfallWaitsForAnOpenOrder() public {
-        vm.prank(KEEPER);
-        x.restock(1_000e6, 3.3 ether, "");
-        vm.expectRevert(StockOps.OrderOpen.selector);
-        x.syncWindfall();
-    }
-
-    function test_onlyTheKeeperRestocks() public {
-        vm.expectRevert(StockModule.NotKeeper.selector);
-        x.restock(1_000e6, 3.3 ether, "");
     }
 
     // ── a stock-quoted launch, routed through the vault ──────────────────

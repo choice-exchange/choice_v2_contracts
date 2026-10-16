@@ -5,7 +5,6 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
-import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 
 import {Currency} from "infinity-core/src/types/Currency.sol";
 
@@ -20,14 +19,15 @@ import {IssuerQuote, Reference, StockConfig, StockContext, StockLayout, StockSta
 ///   vault's `quoteSigner` (an EOA, or a contract through ERC-1271). Rotating the signer voids every
 ///   outstanding quote; each nonce fills once; a quote expires.
 /// - Its price must sit within `restockSlippageBps` of a fresh reference while the market is open for
-///   the vault: no worse than that for a buy, no lower for a sale.
+///   the vault, no worse than that for a buy and no lower for a sale, and the reference may not be a
+///   jump from the anchor.
 /// - Both legs move in one transaction and are pulled from the issuer's account (`issuer`), which
 ///   approves the vault on both tokens. The vault pulls the issuer's leg first and checks what arrived.
 /// - A buy counts against the daily restock cap and the inventory cap and spends only the vault's own
-///   cash. A sale sells only booked stock. Selling stock to the issuer goes only through this path.
+///   cash. A sale sells only booked stock. The optional path: LIMIT memo orders (`StockRestock`) are
+///   the default restock, in both directions.
 library StockQuotes {
     using SafeERC20 for IERC20;
-    using SafeCast for uint256;
 
     bytes32 internal constant QUOTE_TYPEHASH =
         keccak256("IssuerQuote(bool vaultBuys,uint256 stock,uint256 cash,uint256 nonce,uint64 expiry)");
@@ -44,7 +44,6 @@ library StockQuotes {
     error StockDeficit();
     error InventoryCapExceeded(uint256 value, uint256 cap);
     error NotEnoughStock(uint256 wanted, uint256 booked);
-    error RestockCapExceeded(uint256 wanted, uint256 remaining);
     error ShortDelivery(uint256 got, uint256 wanted);
 
     event QuoteFilled(uint256 indexed nonce, bool vaultBuys, uint256 stock, uint256 cash, uint256 mark);
@@ -74,6 +73,7 @@ library StockQuotes {
 
         Reference memory r = StockLib.storedReference(c, ctx);
         StockLib.requireUsable(r);
+        StockLib.requireAnchored(c, s, r.price);
         if (StockLib.ownStock(s, ctx) < s.stockBooked) revert StockDeficit();
         uint256 fair = StockLib.stockToCash(ctx, q.stock, r.price, Math.Rounding.Floor);
         uint256 low = fair * (StockLib.BPS - c.restockSlippageBps) / StockLib.BPS;
@@ -83,32 +83,26 @@ library StockQuotes {
         IERC20 stockToken = IERC20(Currency.unwrap(ctx.stock));
         IERC20 cashToken = IERC20(Currency.unwrap(ctx.cash));
         if (q.vaultBuys) {
-            _countRestock(c, s, q.cash);
-            uint256 value = StockLib.stockToCash(ctx, s.stockBooked + q.stock, r.price, Math.Rounding.Ceil);
+            StockLib.countRestock(c, s, q.cash);
+            uint256 value = StockLib.stockToCash(ctx, StockLib.stockInventory(s) + q.stock, r.price, Math.Rounding.Ceil);
             if (value > c.maxInventory) revert InventoryCapExceeded(value, c.maxInventory);
+            // The reserve, an unwinding epoch's debt and the margin to hedge what comes in stay.
+            uint256 keepCash = StockLib.cashKept(c, s) + fair * 10 / c.leverageX10;
+            uint256 own = StockLib.ownCash(s, ctx);
+            if (own < q.cash + keepCash) revert StockLib.CashShort(q.cash + keepCash, own);
             StockLib.spendOwnCash(s, ctx, q.cash);
             uint256 got = _pull(stockToken, issuer, q.stock);
             cashToken.safeTransfer(issuer, q.cash);
             s.stockBooked += got;
+            s.cashBooked -= q.cash;
         } else {
             if (q.stock > s.stockBooked) revert NotEnoughStock(q.stock, s.stockBooked);
             StockLib.ensureToken(ctx, ctx.stock, q.stock);
-            _pull(cashToken, issuer, q.cash);
+            s.cashBooked += _pull(cashToken, issuer, q.cash);
             stockToken.safeTransfer(issuer, q.stock);
             s.stockBooked -= q.stock;
         }
         emit QuoteFilled(q.nonce, q.vaultBuys, q.stock, q.cash, r.price);
-    }
-
-    /// @dev The daily restock cap, shared with tracked memo orders.
-    function _countRestock(StockConfig storage c, StockState storage s, uint256 cash) private {
-        if (block.timestamp >= uint256(s.restockWindowStart) + StockLib.RESTOCK_CAP_WINDOW) {
-            s.restockWindowStart = uint64(block.timestamp);
-            s.restockUsed = 0;
-        }
-        uint256 remaining = c.restockDailyCap > s.restockUsed ? c.restockDailyCap - s.restockUsed : 0;
-        if (cash > remaining) revert RestockCapExceeded(cash, remaining);
-        s.restockUsed += cash.toUint96();
     }
 
     /// @dev Pull `amount` from `from` and return what arrived, which must be all of it.

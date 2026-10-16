@@ -178,7 +178,7 @@ contract StockQuotesTest is StockVaultHarness {
         IssuerQuote memory big = _quote(true, 34 ether, 10_200e6);
         bytes memory sig = _sign(QUOTE_KEY, big);
         vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockQuotes.RestockCapExceeded.selector, 10_200e6, 10_000e6));
+        vm.expectRevert(abi.encodeWithSelector(StockLib.RestockCapExceeded.selector, 10_200e6, 10_000e6));
         x.fillQuote(big, sig);
 
         StockConfig memory c = _cfg();
@@ -200,14 +200,15 @@ contract StockQuotesTest is StockVaultHarness {
     }
 
     function test_aBuySpendsOnlyTheVaultsOwnCash() public {
-        // Withdraw all but 100 of the vault's cash: a 300 buy cannot come out of anyone else's.
+        // Withdraw all but 100 of the vault's cash: a 300 buy (plus the 100 of margin its stock's short
+        // needs at 3x) cannot come out of anyone else's.
         uint256 free = sv.maxWithdraw(OWNER) - 100e6;
         vm.prank(OWNER);
         sv.withdraw(free, OWNER, OWNER);
         IssuerQuote memory q = _quote(true, 1 ether, 300e6);
         bytes memory sig = _sign(QUOTE_KEY, q);
         vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockLib.CashShort.selector, 300e6, 100e6));
+        vm.expectRevert(abi.encodeWithSelector(StockLib.CashShort.selector, 400e6, 100e6));
         x.fillQuote(q, sig);
     }
 

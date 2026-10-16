@@ -23,6 +23,9 @@ abstract contract StockModule is ReentrancyGuardTransient {
     error NotPauser();
     error ZeroAddress();
 
+    /// @notice A corporate action halted the vault: by hand (`by` = who), or a ratio change seen.
+    event ActionHalted(address indexed by);
+
     constructor() {
         SELF = address(this);
     }
@@ -44,7 +47,7 @@ abstract contract StockModule is ReentrancyGuardTransient {
 
     /// @dev Whether the issuer can be ordered from now: then the short tracks the target inventory.
     function _restockOpen(StockLayout storage l) internal view returns (bool) {
-        return l.issuer != address(0) && !l.state.restockHalted && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
+        return l.issuer != address(0) && l.state.paused & StockLib.PAUSE_RESTOCK == 0;
     }
 
     function _owner() internal view returns (address) {
@@ -63,6 +66,12 @@ abstract contract StockModule is ReentrancyGuardTransient {
     function _onlyKeeper() internal view {
         _delegated();
         if (msg.sender != StockStorage.layout().keeper) revert NotKeeper();
+    }
+
+    /// @dev The guardian, the keeper or the owner: who may pause and halt.
+    function _pauser() internal view {
+        StockLayout storage l = StockStorage.layout();
+        if (msg.sender != l.guardian && msg.sender != l.keeper && msg.sender != _owner()) revert NotPauser();
     }
 
     function _keeperOrOwner() internal view {

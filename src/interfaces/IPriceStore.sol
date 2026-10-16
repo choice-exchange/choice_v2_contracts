@@ -6,7 +6,8 @@ interface IPriceStore {
     /// @notice One feed of one signed update, as the signer published it.
     /// @param timestampUs the update's own time, microseconds since 1970, on its channel's grid
     /// @param feedTimestampUs when this feed's price last changed upstream (Lazer property 12),
-    /// never later than `timestampUs`; equal to it when the update does not carry the property.
+    /// never later than `timestampUs`. An update without it (or without the exponent, or off channel
+    /// 3) is never stored or verified: see `PythLazerLib.REQUIRED`.
     /// 🔴 Staleness is a per-feed question: a feed whose market is shut still rides every fresh
     /// batch, carrying its last close here.
     /// @param price the price mantissa: the value is `price * 10**exponent`; zero means missing
