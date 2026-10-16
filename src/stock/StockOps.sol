@@ -142,6 +142,7 @@ library StockOps {
                 || c.queueDeadline > StockLib.MAX_QUEUE_DEADLINE
         ) revert StockLib.BadConfig();
         if (c.targetInventory > c.maxInventory || c.qtyTick == 0 || c.priceTick == 0) revert StockLib.BadConfig();
+        if (c.depositLock > StockLib.MAX_DEPOSIT_LOCK) revert StockLib.BadConfig();
     }
 
     function requireNavPrice(StockConfig storage c, StockContext memory ctx) internal view {

@@ -86,8 +86,9 @@ library StockQuotes {
             StockLib.countRestock(c, s, q.cash);
             uint256 value = StockLib.stockToCash(ctx, StockLib.stockInventory(s) + q.stock, r.price, Math.Rounding.Ceil);
             if (value > c.maxInventory) revert InventoryCapExceeded(value, c.maxInventory);
-            // The reserve, an unwinding epoch's debt and the margin to hedge what comes in stay.
-            uint256 keepCash = StockLib.cashKept(c, s) + fair * 10 / c.leverageX10;
+            // The reserve, an unwinding epoch's debt, the open epoch's value and the margin to hedge
+            // what comes in stay.
+            uint256 keepCash = StockLib.cashKeptQueued(l) + fair * 10 / c.leverageX10;
             uint256 own = StockLib.ownCash(s, ctx);
             if (own < q.cash + keepCash) revert StockLib.CashShort(q.cash + keepCash, own);
             StockLib.spendOwnCash(s, ctx, q.cash);

@@ -37,7 +37,7 @@ contract OraclePriceStoreTest is StockVaultHarness {
         assertEq(p.price, 34_269_672_000);
         assertEq(p.exponent, -8);
         assertEq(p.feedTimestampUs, (block.timestamp + 5) * 1e6 - 1e6);
-        assertEq(p.timestampUs, p.feedTimestampUs);
+        assertEq(p.timestampUs, (block.timestamp + 5) * 1e6, "the batch time is when it landed");
         assertEq(store.latest(FEED).price, 34_269_672_000, "newer than the stored update");
     }
 
@@ -99,6 +99,19 @@ contract OraclePriceStoreTest is StockVaultHarness {
         Fill memory f = sv.quoteFill(true, 300e6, true, relayed);
         assertEq(uint256(f.reason), uint256(Refusal.None));
         assertEq(f.price, PRICE);
+    }
+
+    /// A signed update the filler hands in replaces the module's price only if its feed moved after the
+    /// module's price landed: one published inside the relay lag might be older, and the filler would be
+    /// choosing between two prices.
+    function test_aSignedUpdateFromInsideTheRelayLagDoesNotReplaceTheModulePrice() public {
+        vm.warp(block.timestamp + 30);
+        _module(301e18, block.timestamp); // landed this second, dated a second back
+        LazerBuilder.Feed memory f = _feed(MANTISSA);
+        f.feedTimestampUs = uint64(block.timestamp) * 1e6 - 500_000; // newer than the date, not the landing
+        Fill memory q = sv.quoteFill(true, 300e6, true, _update(f));
+        assertEq(q.price, 301e18);
+        assertEq(sv.quoteFill(true, 300e6, true, _update(_feed(MANTISSA))).price, PRICE);
     }
 
     function test_weekendModeOnAModulePriceStampedAtTheClose() public {

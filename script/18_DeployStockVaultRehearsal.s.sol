@@ -165,7 +165,8 @@ contract DeployStockVaultRehearsal is BaseScript {
             restockDailyCap: 50e6,
             minRedeem: 1e6,
             qtyTick: 1e15,
-            priceTick: 1e16
+            priceTick: 1e16,
+            depositLock: 5 minutes
         });
     }
 

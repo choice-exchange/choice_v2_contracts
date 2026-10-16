@@ -131,7 +131,9 @@ contract MarketCalendarTest is Test {
         assertEq(uint256(s), uint256(MarketCalendar.Session.Closed));
     }
 
-    function test_revertsPastTheLookback() public {
+    /// A closure longer than the lookback (the guardian can make one) answers "closed since now" rather
+    /// than reverting, so a reader refuses a frozen price instead of failing every call.
+    function test_pastTheLookbackTheCloseIsNow() public {
         uint32 first = cal.dayNumber(2026, 10, 12);
         uint32[] memory dayList = new uint32[](12);
         for (uint32 i; i < 12; ++i) {
@@ -139,10 +141,13 @@ contract MarketCalendarTest is Test {
         }
         vm.prank(OWNER);
         cal.setDays(dayList, MarketCalendar.DayType.Closed);
-        vm.expectRevert(
-            abi.encodeWithSelector(MarketCalendar.ClosedTooLong.selector, uint256(first + 11) * 86_400 + 15 * H)
-        );
-        cal.sessionAt(uint256(first + 11) * 86_400 + 15 * H);
+        uint256 t = uint256(first + 11) * 86_400 + 15 * H;
+        (MarketCalendar.Session s, uint256 start) = cal.sessionAt(t);
+        assertEq(uint256(s), uint256(MarketCalendar.Session.Closed));
+        assertEq(start, t);
+        // Inside the lookback the real close still comes back.
+        (, start) = cal.sessionAt(uint256(first + 5) * 86_400 + 15 * H);
+        assertLt(start, uint256(first) * 86_400);
     }
 
     /// Every session begins at its own start, and the second before that start belongs to a

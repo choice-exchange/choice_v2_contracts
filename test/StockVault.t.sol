@@ -552,7 +552,10 @@ contract StockVaultTest is StockVaultHarness {
         assertEq(sv.hedgeGap(), 35 ether);
     }
 
-    function test_atTheWeekendTheShortFollowsTheHolding() public {
+    /// A pre-short put on while the issuer could restock stays across the close, so the short does not
+    /// cover at every close and sell again at every open; it is covered only past the most it may run
+    /// ahead of the holding, or once restocking stops.
+    function test_atTheWeekendTheShortKeepsItsPreHedge() public {
         _hedge(PRICE);
         StockConfig memory c = _cfg();
         c.targetInventory = 9_000e6;
@@ -561,7 +564,29 @@ contract StockVaultTest is StockVaultHarness {
         _swap(true, false, 10 ether);
         assertEq(sv.hedgeGap(), 0);
         _weekendPrice(); // the issuer does not fill at the weekend
-        assertEq(sv.hedgeGap(), -10 ether);
+        assertEq(sv.hedgeGap(), 0, "the pre-short stays");
+        c.maxUnhedged = 1_500e6; // 5 at 300: now it may run only 5 ahead of the 20 held
+        _setCfg(c);
+        assertEq(sv.hedgeGap(), -5 ether);
+        vm.prank(GUARDIAN);
+        x.pause(StockLib.PAUSE_RESTOCK);
+        assertEq(sv.hedgeGap(), -10 ether, "no restock: the short follows the holding");
+    }
+
+    /// While the market is open, a spent restock room stops the pre-short growing but does not cover
+    /// what is already on.
+    function test_aSpentRestockRoomKeepsThePreShort() public {
+        StockConfig memory c = _cfg();
+        c.targetInventory = 12_000e6; // 40 at 300, holding 30
+        _setCfg(c);
+        assertEq(sv.hedgeGap(), 40 ether, "the holding plus the 10 the issuer will bring");
+        _hedge(PRICE); // short 40
+        c.restockDailyCap = 1_500e6; // now only 5 can come today
+        _setCfg(c);
+        assertEq(sv.hedgeGap(), 0, "the 10 already on is kept");
+        c.maxUnhedged = 1_500e6;
+        _setCfg(c);
+        assertEq(sv.hedgeGap(), -5 ether, "past the most it may run ahead");
     }
 
     function test_hedgeIgnoresDriftInsideTheBand() public {

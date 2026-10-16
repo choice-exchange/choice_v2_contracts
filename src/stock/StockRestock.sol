@@ -18,10 +18,11 @@ import {Reference, StockConfig, StockContext, StockLayout, StockState} from "./S
 /// - **The order.** The keeper names the side, the amount sent, the least it takes back (the limit) and
 ///   the expiry in the issuer's units. The vault checks the limit against a fresh reference and the
 ///   anchor, builds the memo from the owner's template with exactly those numbers, and sends the input
-///   to the issuer with the memo appended to the transfer. The issuer fills it whole at the limit or
-///   better, or refunds it after the expiry. One order is open at a time.
-/// - **In transit.** A buy is valued at its cash and its stock is hedged as if held. A sell's stock
-///   stays in the value at the mark and in the hedge until it is paid.
+///   to the issuer with the memo appended to the transfer. The issuer fills it whole or refunds it
+///   after the expiry: a sale at the limit or better, but a buy exactly at its limit (measured), so the
+///   buy band is a price paid, not a bound. One order is open at a time.
+/// - **In transit.** Either way the order is valued as its stock at the mark and hedged as held, until
+///   it closes: a buy's stock is on its way, a sell's is still the vault's until it is paid.
 /// - **Closing**, by anyone, on what has arrived, which both ledgers show: stock above `stockBooked` (a
 ///   buy's delivery, a sell's stock refunded) or cash above `cashBooked` (a sell's payment, a buy's
 ///   refund; the short trades from its own subaccount, so only fee-share dust arrives otherwise).
@@ -97,8 +98,9 @@ library StockRestock {
             if (inventory > c.maxInventory) revert InventoryCapExceeded(inventory, c.maxInventory);
             StockLib.countRestock(c, s, amountIn);
             s.orderCounted = amountIn.toUint96();
-            // The reserve, an unwinding epoch's debt and the margin the new stock's short needs stay.
-            uint256 keepCash = StockLib.cashKept(c, s)
+            // The reserve, an unwinding epoch's debt, the open epoch's value and the margin the new
+            // stock's short needs stay.
+            uint256 keepCash = StockLib.cashKeptQueued(l)
                 + StockLib.stockToCash(ctx, limitOut, r.price, Math.Rounding.Ceil) * 10 / c.leverageX10;
             uint256 own = StockLib.ownCash(s, ctx);
             if (own < amountIn + keepCash) revert StockLib.CashShort(amountIn + keepCash, own);

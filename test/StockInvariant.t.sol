@@ -292,7 +292,7 @@ contract StockHandler is Test {
         MockStockExchange(address(0x65)).forceSettle(sub, X.state().marketId, _sharePrice(), address(SV));
         X.confirmHedge();
         vm.startPrank(OWNER);
-        X.migrateMarket(string(abi.encodePacked("market-", vm.toString(++splits))));
+        X.migrateMarket(string(abi.encodePacked("market-", vm.toString(++splits))), 1e15, 1e16);
         ratio = next;
         vm.warp(block.timestamp + 1); // the split's price is newer than any stored
         _push();
