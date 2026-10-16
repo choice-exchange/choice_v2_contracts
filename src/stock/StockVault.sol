@@ -237,10 +237,11 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return StockHedge.value(StockStorage.layout().state, _ctx());
     }
 
-    /// @notice Whether `totalAssets` is exact right now: no hedge order pending in this block and
-    /// no Choice vault lock open.
+    /// @notice Whether `totalAssets` is exact right now: no hedge order pending in this block, no
+    /// Choice vault lock open, and the short read back and accounted for (see `StockLib.shortValued`).
     function navReady() external view returns (bool) {
-        return VAULT.getLocker() == address(0) && StockStorage.layout().state.hedgeBlock != block.number;
+        StockState storage s = StockStorage.layout().state;
+        return VAULT.getLocker() == address(0) && s.hedgeBlock != block.number && StockLib.shortValued(s);
     }
 
     /// @notice What a fill would do now, for a planner; zero amounts and a reason when it would not.
@@ -503,6 +504,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         StockLayout storage l = StockStorage.layout();
         StockState storage s = l.state;
         if (s.paused & flag != 0 || VAULT.getLocker() != address(0) || s.hedgeBlock == block.number) return false;
+        if (!StockLib.shortValued(s)) return false;
         Reference memory r = StockLib.storedReference(l.config, _ctx());
         if (r.reason != Refusal.None || r.closed) return false;
         uint256 last = s.lastSharePrice;

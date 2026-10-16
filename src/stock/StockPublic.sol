@@ -193,8 +193,7 @@ contract StockPublic is StockModule {
         StockHedge.topUpMargin(l.config, l.state, l.ctx, msg.sender == l.keeper);
     }
 
-    /// @notice Close the open restock order on what has arrived, or as lapsed past its deadline.
-    /// Anyone. See `StockRestock.settle`.
+    /// @notice Close the open restock order on what has arrived. Anyone. See `StockRestock.settle`.
     function settleRestock() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
         StockRestock.settle(l.state, l.ctx);

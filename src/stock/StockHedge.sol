@@ -70,7 +70,7 @@ library StockHedge {
             if (strict) revert StockLib.PositionUnreadable();
             return;
         }
-        if (!found && s.shortConfirmed > 0 && !_covered(s)) {
+        if (!found && !StockLib.covered(s)) {
             s.positionLost = true;
             emit PositionLost(s.shortConfirmed);
         }
@@ -82,14 +82,6 @@ library StockHedge {
             else _clearMaker(s);
         }
         emit HedgeConfirmed(s.shortConfirmed);
-    }
-
-    /// @dev Whether the vault's own buys could have covered the whole confirmed short: a cover from an
-    /// earlier block, and whatever was left to fill of a resting maker buy.
-    function _covered(StockState storage s) private view returns (bool) {
-        uint256 buying = s.pendingQty < 0 ? StockLib.abs(s.pendingQty) : 0;
-        if (bytes(s.makerHash).length != 0 && !s.makerSell) buying += s.makerFillable;
-        return buying >= StockLib.abs(s.shortConfirmed);
     }
 
     /// @notice Confirm the short, then move it toward the target exposure in one market order if
@@ -140,9 +132,12 @@ library StockHedge {
     /// then nothing that needs the read works (no hedge, no value, no exit), and while the market's
     /// funding index stays negative no fill or margin move can make it readable again. A reduce-only
     /// market buy needs no read: the exchange cuts it to the short, so `qty` at least the short closes
-    /// it, and with no position the read works again. A resting maker order is cancelled first, so the
-    /// cut leaves the whole short to this order. `worst` is on the tick and within `hedgeSlippageBps`
-    /// above the mark.
+    /// it, and with no position the read works again. `qty` must be at least the most the short can be
+    /// (the last confirmed, a sell from an earlier block, a resting maker sell): the read is gone, and a
+    /// cover asked for less could close it without the vault knowing. A resting maker order is cancelled
+    /// first, so the cut leaves the whole short to this order. `worst` is on the tick and within
+    /// `hedgeSlippageBps` above the mark. Hedging that adds to the short pauses (`PAUSE_HEDGE`) until the
+    /// owner lifts it: on a negative index, the next sale would make the position unreadable again.
     function coverUnreadable(
         StockConfig storage c,
         StockState storage s,
@@ -154,13 +149,16 @@ library StockHedge {
         (bool readable,,) = StockLib.readPosition(s);
         if (readable) revert PositionReadable();
         uint256 cap = Math.mulDiv(StockLib.markSharePrice(ctx), StockLib.BPS + c.hedgeSlippageBps, StockLib.BPS);
-        if (qty == 0 || qty % c.qtyTick != 0 || worst > cap || worst % c.priceTick != 0) revert BadCover();
+        uint256 most = (s.shortConfirmed > 0 ? StockLib.abs(s.shortConfirmed) : 0)
+            + (s.pendingQty > 0 ? StockLib.abs(s.pendingQty) : 0) + (s.makerSell ? s.makerFillable : 0);
+        if (qty < most || qty % c.qtyTick != 0 || worst > cap || worst % c.priceTick != 0) revert BadCover();
         if (bytes(s.makerHash).length != 0) {
             (bool live,) = StockLib.makerOrder(s);
             if (live) _cancelMaker(s);
             else _clearMaker(s);
         }
         _marketOrder(s, false, qty, worst, 0);
+        s.paused |= StockLib.PAUSE_HEDGE;
     }
 
     function _marketOrder(StockState storage s, bool sell, uint256 qty, uint256 worst, uint256 margin) private {
@@ -266,10 +264,11 @@ library StockHedge {
         uint256 mag = StockLib.abs(gap);
         if (StockLib.unitsToCash(ctx, mag, r.sharePrice) < c.hedgeBand) return (false, 0);
         sell = gap > 0;
+        if (sell && s.paused & StockLib.PAUSE_HEDGE != 0) return (sell, 0);
         qty = mag / c.qtyTick * c.qtyTick;
         // forge-lint: disable-next-line(unsafe-typecast) - sign tested.
         if (!sell) qty = Math.min(qty, s.shortConfirmed > 0 ? uint256(s.shortConfirmed) : 0);
-        uint256 lowest = r.sharePrice * (StockLib.BPS - c.hedgeSlippageBps) / StockLib.BPS;
+        uint256 lowest = r.sharePrice * (StockLib.BPS - c.hedgeSlippageBps) / StockLib.BPS / c.priceTick * c.priceTick;
         if (qty == 0 || StockLib.unitsToCash(ctx, qty, lowest) < c.minHedge) qty = 0;
     }
 

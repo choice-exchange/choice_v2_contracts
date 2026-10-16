@@ -32,6 +32,9 @@ library StockLib {
     uint8 internal constant PAUSE_WITHDRAWALS = 4;
     uint8 internal constant PAUSE_RESTOCK = 8;
     uint8 internal constant PAUSE_FIXING = 16;
+    /// @dev No order may ADD to the short (covers still go out): set by `coverUnreadable`, so nobody
+    /// re-opens a short on a market whose negative funding index would make it unreadable again.
+    uint8 internal constant PAUSE_HEDGE = 32;
 
     // Hard limits on the owner's tunables, so a captured owner still cannot price a fill at any
     // number it likes, run the hedge at any leverage, or let a price of any age through.
@@ -398,6 +401,23 @@ library StockLib {
         bool readable;
         (readable, found, p) = readPosition(s);
         if (!readable) revert PositionUnreadable();
+    }
+
+    /// @dev Whether the short can be valued now: the exchange reads it back, and it is not missing (gone
+    /// with no buy of the vault's to explain it, whether or not a confirmation has seen that yet).
+    function shortValued(StockState storage s) internal view returns (bool) {
+        if (s.positionLost) return false;
+        (bool readable, bool found,) = readPosition(s);
+        return readable && (found || covered(s));
+    }
+
+    /// @dev Whether the vault's own buys could have covered the whole confirmed short: a cover from an
+    /// earlier block, and whatever was left to fill of a resting maker buy.
+    function covered(StockState storage s) internal view returns (bool) {
+        if (s.shortConfirmed <= 0) return true;
+        uint256 buying = s.pendingQty < 0 ? abs(s.pendingQty) : 0;
+        if (bytes(s.makerHash).length != 0 && !s.makerSell) buying += s.makerFillable;
+        return buying >= abs(s.shortConfirmed);
     }
 
     /// @dev The vault's position on its market, as the exchange has it now. 🔴 The precompile packs a

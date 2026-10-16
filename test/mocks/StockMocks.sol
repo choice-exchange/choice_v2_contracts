@@ -103,6 +103,8 @@ contract MockStockExchange {
     bool public enforceCross;
     uint256 public reduceMarginRatio; // 1e18 = 100%
     bool public failDecrease;
+    /// @notice The most a market order fills at `endBlock` (0: all), as a thin book would leave it.
+    uint256 public fillCap;
 
     uint256 public ordersPlaced;
     uint256 public limitOrdersPlaced;
@@ -133,6 +135,10 @@ contract MockStockExchange {
 
     function setBook(uint256 bid, uint256 ask) external {
         (bestBid, bestAsk) = (bid, ask);
+    }
+
+    function setFillCap(uint256 cap) external {
+        fillCap = cap;
     }
 
     function setFailDecrease(bool fail) external {
@@ -326,6 +332,12 @@ contract MockStockExchange {
             if (!fills || inactive[_mkt(o.marketID)] || !_canFill(o)) {
                 _release(o.sender, o.subaccountID, o.hold);
                 continue;
+            }
+            if (fillCap != 0 && fillCap < o.quantity) {
+                // A partial fill: the rest of the order is dropped and its share of the hold comes back.
+                uint256 hold = o.hold * fillCap / o.quantity;
+                _release(o.sender, o.subaccountID, o.hold - hold);
+                (o.margin, o.hold, o.quantity) = (o.margin * fillCap / o.quantity, hold, fillCap);
             }
             _fill(o, fillPrice);
         }

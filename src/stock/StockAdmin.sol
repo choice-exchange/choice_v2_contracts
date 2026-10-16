@@ -79,10 +79,11 @@ contract StockAdmin is StockModule {
 
     /// @notice Close the short with a reduce-only buy when the exchange cannot read the position back:
     /// the keeper or the owner. See `StockHedge.coverUnreadable`.
-    function coverUnreadable(uint256 qty, uint256 worstPrice) external nonReentrant {
+    function coverUnreadable(uint256 qty, uint256 worstPrice) external delegated nonReentrant {
         _keeperOrOwner();
         StockLayout storage l = StockStorage.layout();
         StockHedge.coverUnreadable(l.config, l.state, l.ctx, qty, worstPrice);
+        emit Paused(StockLib.PAUSE_HEDGE, msg.sender);
     }
 
     /// @notice Fill a quote the issuer signed, both legs in this transaction. See `StockQuotes`.
@@ -114,7 +115,8 @@ contract StockAdmin is StockModule {
         StockLib.lock(ctx, StockLib.OP_FROM_CLAIMS, isCash ? ctx.cash : ctx.stock, amount);
     }
 
-    /// @notice Pause `flags` (fills 1, deposits 2, withdrawals 4, restock 8, fixing 16). Guardian,
+    /// @notice Pause `flags` (fills 1, deposits 2, withdrawals 4, restock 8, fixing 16, adding to the
+    /// short 32). Guardian,
     /// keeper or owner. A fixing batch that cannot settle while paused lapses and is refunded.
     function pause(uint8 flags) external delegated {
         _pauser();

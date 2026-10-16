@@ -93,6 +93,10 @@ library StockOps {
             // freezing every exit; and on an unreadable position this is the one move that can heal it.
             (bool ok,) = address(this).call(abi.encodeWithSignature("settleFunding()"));
             if (!ok) emit FundingUnsettled();
+        } else if (!StockLib.covered(s)) {
+            // The short is gone and nothing of the vault's covered it: a liquidation, a settlement or a
+            // paused market. No share is priced before a confirmation marks it and the owner has looked.
+            revert NavNotReady();
         }
     }
 

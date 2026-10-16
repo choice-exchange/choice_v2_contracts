@@ -171,8 +171,14 @@ library StockFixing {
 
         IPriceStore.Price memory p = ctx.store.verify(update, ctx.feedId);
         if (p.timestampUs != uint256(b.tickMs) * 1000) revert WrongTick(p.timestampUs, uint256(b.tickMs) * 1000);
-        uint256 price =
-            StockLib.perToken(ctx, StockLib.inCash(ctx, StockLib.toWad(p.price, p.exponent), StockLib.MAX_CASH_AGE_MS));
+        uint256 usd = StockLib.toWad(p.price, p.exponent);
+        if (ctx.cashFeedId != 0) {
+            // The cash's price from the same update, so at the same tick: the settler picks no moment.
+            IPriceStore.Price memory q = ctx.store.verify(update, ctx.cashFeedId);
+            uint256 cashUsd = StockLib.toWad(q.price, q.exponent);
+            usd = cashUsd == 0 ? 0 : Math.mulDiv(usd, 1e18, cashUsd);
+        }
+        uint256 price = StockLib.perToken(ctx, usd);
         Refusal why = _check(c, s, ctx, p, price, b.tickMs / 1000);
         if (why != Refusal.None) revert FixingRefused(why);
 

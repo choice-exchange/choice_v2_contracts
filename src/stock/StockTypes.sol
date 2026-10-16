@@ -83,7 +83,7 @@ struct StockConfig {
 /// @param orderSell the open restock order sells stock; otherwise it buys
 /// @param orderCash a buy's cash sent, or a sell's cash asked for (its limit)
 /// @param orderStock a buy's stock asked for (its limit), or a sell's stock sent
-/// @param orderDeadline when anyone may close the open order: its expiry plus `restockDeadline`
+/// @param orderDeadline past which the owner may write the open order off: its expiry plus `restockDeadline`
 /// @param makerHash the resting maker hedge order, empty when there is none
 /// @param makerFillable what of it may still fill, 1e18 units, as last read back
 /// @param orderWindow the restock-cap window the open order was counted in

@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 
 import {StockHedge} from "../src/stock/StockHedge.sol";
@@ -11,7 +12,7 @@ import {StockOps} from "../src/stock/StockOps.sol";
 import {StockRestock} from "../src/stock/StockRestock.sol";
 import {StockVault} from "../src/stock/StockVault.sol";
 import {PriceStore} from "../src/stock/PriceStore.sol";
-import {Refusal, StockConfig, StockState} from "../src/stock/StockTypes.sol";
+import {FixingConfig, Refusal, StockConfig, StockState} from "../src/stock/StockTypes.sol";
 import {LazerBuilder} from "./utils/LazerBuilder.sol";
 import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 
@@ -92,11 +93,17 @@ contract StockChainFidelityTest is StockVaultHarness {
         _swap(true, true, 100e6);
         x.confirmHedge(); // the cash leg still runs
 
+        assertEq(sv.maxWithdraw(OWNER), 0, "the ERC-4626 views answer zero, not revert");
+        assertEq(sv.maxDeposit(DEPOSITOR), 0);
+        assertFalse(sv.navReady());
+
         vm.expectRevert(StockModule.NotKeeper.selector);
         x.coverUnreadable(40 ether, 301.8e18);
         vm.startPrank(KEEPER);
         vm.expectRevert(StockHedge.BadCover.selector);
         x.coverUnreadable(40 ether, 301.81e18); // past the mark's slippage
+        vm.expectRevert(StockHedge.BadCover.selector);
+        x.coverUnreadable(32.999 ether, 301.8e18); // under the most the short can be: 30 confirmed, 3 sold since
         x.coverUnreadable(40 ether, 301.8e18); // more than the short: the exchange cuts it to the short
         vm.stopPrank();
         vm.roll(n + 4);
@@ -107,10 +114,42 @@ contract StockChainFidelityTest is StockVaultHarness {
         StockState memory s = x.state();
         assertEq(s.shortConfirmed, 0);
         assertFalse(s.positionLost, "its own cover closed it");
+        assertEq(s.paused & 32, 32, "adding to the short is paused");
         sv.totalAssets();
         vm.prank(KEEPER);
         vm.expectRevert(StockHedge.PositionReadable.selector);
         x.coverUnreadable(1 ether, 300e18);
+
+        // The vault holds 33 unhedged, but nobody re-opens the short (whose fill would stamp the index
+        // again) until the owner lifts the pause.
+        vm.roll(n + 5);
+        vm.prank(KEEPER);
+        assertFalse(x.syncHedge());
+        vm.prank(OWNER);
+        x.unpause(32);
+        vm.prank(KEEPER);
+        assertTrue(x.syncHedge());
+    }
+
+    /// A thin book fills the cover in pieces and the first piece stamps the index again: the second cover
+    /// still asks for the most the short could be, so the confirmation after it sees its own buy.
+    function test_aCoverFilledInPiecesIsNotALoss() public {
+        uint256 n = block.number;
+        _unreadable(n);
+        exchange.setFillCap(20 ether);
+        vm.prank(KEEPER);
+        x.coverUnreadable(33 ether, 301.8e18);
+        vm.roll(n + 4);
+        exchange.endBlock(300.5e18); // 20 of 33: 13 left, stamped negative again
+        vm.expectRevert(bytes("abi: negatively-signed value cannot be packed into uint parameter"));
+        exchange.subaccountPositions(_sub());
+        vm.prank(KEEPER);
+        x.coverUnreadable(33 ether, 301.8e18);
+        vm.roll(n + 5);
+        exchange.endBlock(300.5e18);
+        x.confirmHedge();
+        assertFalse(x.state().positionLost);
+        sv.totalAssets();
     }
 
     /// Once the market's index is back above zero, the funding settle a deposit runs re-stamps the
@@ -138,6 +177,7 @@ contract StockChainFidelityTest is StockVaultHarness {
         emit StockHedge.PositionLost(30 ether);
         x.confirmHedge();
         assertTrue(x.state().positionLost);
+        assertEq(sv.maxDeposit(DEPOSITOR), 0);
 
         cash.mint(DEPOSITOR, 100e6);
         vm.startPrank(DEPOSITOR);
@@ -152,6 +192,23 @@ contract StockChainFidelityTest is StockVaultHarness {
         x.acceptNav();
         vm.stopPrank();
         assertFalse(x.state().positionLost);
+    }
+
+    /// Before anyone confirms it, a short gone missing already stops shares being priced: nobody can
+    /// deposit, or settle the queue, at the value without it.
+    function test_aMissingShortStopsPricingEvenBeforeItIsConfirmed() public {
+        uint256 n = block.number;
+        _hedgeAt(n, 299.5e18);
+        exchange.setMarketActive(MARKET, false);
+        vm.roll(n + 2);
+        assertEq(sv.maxDeposit(DEPOSITOR), 0);
+        assertFalse(sv.navReady());
+        cash.mint(DEPOSITOR, 100e6);
+        vm.startPrank(DEPOSITOR);
+        cash.approve(address(sv), 100e6);
+        vm.expectRevert(StockOps.NavNotReady.selector);
+        sv.deposit(100e6, DEPOSITOR);
+        vm.stopPrank();
     }
 
     // ── the market id ─────────────────────────────────────────────────────
@@ -275,6 +332,44 @@ contract StockCashFeedTest is StockVaultHarness {
         vm.prank(KEEPER);
         assertTrue(x.syncHedge());
         assertEq(exchange.pending(0).worstPrice, 301.21e18);
+    }
+
+    /// The fixing lane prices its tick in the cash too, with the cash's price from the same update, so the
+    /// settler picks no moment for it: an update without the cash's feed cannot settle.
+    function test_aFixingPricesTheTickInTheCashFromTheSameUpdate() public {
+        uint64 boundary = uint64(TUE + 16 hours);
+        uint64 tickUs = (boundary * 1000 + 5000) * 1000;
+        vm.prank(OWNER);
+        x.setFixingConfig(
+            FixingConfig({
+                interval: 3600,
+                delayMs: 5000,
+                settleWindow: 30,
+                spreadBps: 10,
+                sizeBps: 0,
+                maxSpreadBps: 100,
+                minRequest: 10e6,
+                maxSide: 100_000e6,
+                maxNet: 50_000e6
+            })
+        );
+        cash.mint(TRADER, 3_000e6);
+        vm.startPrank(TRADER);
+        cash.approve(address(sv), 3_000e6);
+        x.commitFixing(boundary, true, 3_000e6, TRADER);
+        vm.stopPrank();
+        vm.warp(boundary + 6);
+
+        LazerBuilder.Feed[] memory feeds = new LazerBuilder.Feed[](1);
+        feeds[0] = LazerBuilder.Feed(FEED, MANTISSA, -5, 0, tickUs, 0, 0, -1);
+        vm.expectRevert(abi.encodeWithSelector(PriceStore.FeedNotFound.selector, CASH_FEED));
+        x.settleFixing(boundary, LazerBuilder.sign(SIGNER_KEY, LazerBuilder.payload(tickUs, feeds)));
+
+        feeds = new LazerBuilder.Feed[](2);
+        feeds[0] = LazerBuilder.Feed(FEED, MANTISSA, -5, 0, tickUs, 0, 0, -1);
+        feeds[1] = LazerBuilder.Feed(CASH_FEED, 99_000_000, -8, 0, tickUs, 0, 0, -1);
+        x.settleFixing(boundary, LazerBuilder.sign(SIGNER_KEY, LazerBuilder.payload(tickUs, feeds)));
+        assertEq(x.fixingBatch(boundary).price, Math.mulDiv(PRICE, 1e18, 0.99e18));
     }
 
     function test_aStaleCashPriceRefusesLikeAStaleStockPrice() public {
