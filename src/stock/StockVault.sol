@@ -37,6 +37,7 @@ import {StockOps} from "./StockOps.sol";
 import {StockPricing} from "./StockPricing.sol";
 import {
     Fill,
+    Reference,
     Refusal,
     StockConfig,
     StockContext,
@@ -394,10 +395,12 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return super.redeem(shares, receiver, owner_);
     }
 
-    /// @notice Room under the TVL cap; zero while deposits are paused.
+    /// @notice Room under the TVL cap; zero whenever a deposit would be refused now (see `_navOpen`).
+    /// The allowlist is not applied: it holds the caller, whom this view does not see, and an outsider
+    /// is better told `NotDepositor` than a zero maximum.
     function maxDeposit(address) public view override returns (uint256) {
         StockLayout storage l = StockStorage.layout();
-        if (l.state.paused & StockLib.PAUSE_DEPOSITS != 0) return 0;
+        if (!_navOpen(StockLib.PAUSE_DEPOSITS)) return 0;
         uint256 total = totalAssets();
         return l.config.tvlCap > total ? l.config.tvlCap - total : 0;
     }
@@ -406,14 +409,15 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return _convertToShares(maxDeposit(receiver), Math.Rounding.Floor);
     }
 
-    /// @notice Withdrawals are paid from cash on hand above the reserve, never by unwinding stock.
+    /// @notice Withdrawals are paid from cash on hand above the reserve, never by unwinding stock;
+    /// zero whenever one would be refused now (see `_navOpen`).
     function maxWithdraw(address owner_) public view override returns (uint256) {
-        if (StockStorage.layout().state.paused & StockLib.PAUSE_WITHDRAWALS != 0) return 0;
+        if (!_navOpen(StockLib.PAUSE_WITHDRAWALS)) return 0;
         return Math.min(_convertToAssets(balanceOf(owner_), Math.Rounding.Floor), _freeCash());
     }
 
     function maxRedeem(address owner_) public view override returns (uint256) {
-        if (StockStorage.layout().state.paused & StockLib.PAUSE_WITHDRAWALS != 0) return 0;
+        if (!_navOpen(StockLib.PAUSE_WITHDRAWALS)) return 0;
         return Math.min(balanceOf(owner_), _convertToShares(_freeCash(), Math.Rounding.Floor));
     }
 
@@ -446,6 +450,21 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         StockLayout storage l = StockStorage.layout();
         StockOps.beforeNav(l.config, l.state, _ctx(), flag);
         StockOps.checkSharePrice(l.config, l.state, _convertToAssets(10 ** decimals(), Math.Rounding.Floor));
+    }
+
+    /// @dev Whether `_beforeNav(flag)` would pass now: not paused, no lock open or hedge pending, the
+    /// market open and the price fresh, and the share price inside the NAV breaker (judged before the
+    /// funding a deposit or withdrawal settles first, which this view cannot). ERC-4626 wants a `max*`
+    /// view to answer zero for a call that would revert.
+    function _navOpen(uint8 flag) internal view returns (bool) {
+        StockLayout storage l = StockStorage.layout();
+        StockState storage s = l.state;
+        if (s.paused & flag != 0 || VAULT.getLocker() != address(0) || s.hedgeBlock == block.number) return false;
+        Reference memory r = StockLib.storedReference(l.config, _ctx());
+        if (r.reason != Refusal.None || r.closed) return false;
+        uint256 last = s.lastSharePrice;
+        return last == 0
+            || StockLib.deviationBps(_convertToAssets(10 ** decimals(), Math.Rounding.Floor), last) <= l.config.navJumpBps;
     }
 
     /// @dev Own cash above the reserve and above what the redeem queue is waiting for: the open

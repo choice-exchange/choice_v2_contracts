@@ -115,7 +115,17 @@ library StockLib {
         if (r.closed) {
             // Weekend mode needs the close itself: a price from before the close is an outage
             // that started in session, not a frozen market.
-            if (p.feedTimestampUs / 1e6 + c.closeTolerance < r.sessionStart) r.reason = Refusal.Stale;
+            uint256 feedS = p.feedTimestampUs / 1e6;
+            if (feedS + c.closeTolerance < r.sessionStart) {
+                r.reason = Refusal.Stale;
+            } else if (
+                r.session == MarketCalendar.Session.Overnight && feedS > r.sessionStart + c.closeTolerance
+                    && r.ageMs > c.maxAgeMs
+            ) {
+                // An overnight priced as closed, on a price from after the close: the overnight
+                // market is trading, so its price must be as fresh as one in session.
+                r.reason = Refusal.Stale;
+            }
         } else if (r.ageMs > c.maxAgeMs) {
             r.reason = Refusal.Stale;
         } else if (p.flags & PythLazerLib.HAS_SESSION != 0 && p.marketSession == PythLazerLib.SESSION_CLOSED) {

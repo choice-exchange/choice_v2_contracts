@@ -47,7 +47,7 @@ struct StockConfig {
     uint32 queueDeadline; // how long a redeem epoch may wait before anyone may settle it in kind
     uint16 exitFeeBps; // charged on a queued exit's cash, kept by those who stay, to cover the unwind
     bool weekendFills;
-    bool overnightLive; // false: the overnight session is treated as closed, priced at the 20:00 close
+    bool overnightLive; // false: the overnight session is priced as closed (a price moved since the 20:00 close must still be fresh)
     // -- caps
     uint96 maxTrade;
     uint96 maxTradeClosed;
@@ -194,6 +194,8 @@ struct IssuerQuote {
 /// @param cash and `stock`: what is left to claim, paid pro rata on what remains (the last claim
 /// takes the dust); `debt` is cash owed to an in-kind epoch until the short is cut
 /// @param status 0 open, 1 in kind and waiting for its debt, 2 settled
+/// @param feeBps the exit fee when the epoch opened: a queued request cannot be cancelled, so a later
+/// raise never applies to it
 struct RedeemEpoch {
     uint128 shares;
     uint128 sharesLeft;
@@ -202,6 +204,7 @@ struct RedeemEpoch {
     uint128 debt;
     uint64 openedAt;
     uint8 status;
+    uint16 feeBps;
 }
 
 /// @notice A controller's place in the queue: its latest request, and what earlier settled ones left

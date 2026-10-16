@@ -6,9 +6,10 @@ import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IExchangeDerivatives} from "../src/interfaces/IExchangeDerivatives.sol";
 import {StockAdmin} from "../src/stock/StockAdmin.sol";
 import {StockHedge} from "../src/stock/StockHedge.sol";
+import {StockLib} from "../src/stock/StockLib.sol";
 import {StockPricing} from "../src/stock/StockPricing.sol";
 import {StockRestock} from "../src/stock/StockRestock.sol";
-import {Refusal, StockConfig} from "../src/stock/StockTypes.sol";
+import {Fill, RedeemEpoch, Refusal, StockConfig} from "../src/stock/StockTypes.sol";
 import {LazerBuilder} from "./utils/LazerBuilder.sol";
 import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 
@@ -141,5 +142,81 @@ contract StockReviewFixesTest is StockVaultHarness {
         x.topUpMargin();
         vm.prank(KEEPER);
         x.topUpMargin();
+    }
+
+    // ── 10-16: Lows ───────────────────────────────────────────────────────
+
+    /// The overnight market trades: a price it moved to and then left is as stale as one in session.
+    function test_anOvernightPricedAsClosedNeedsAFreshPriceOnceItMoves() public {
+        StockConfig memory c = _cfg();
+        c.overnightLive = false;
+        _setCfg(c);
+        vm.warp(WED + 6 hours); // 02:00 New York; the close was Tuesday 20:00 (WED + 0h)
+        LazerBuilder.Feed memory f = _feed(MANTISSA);
+        f.feedTimestampUs = uint64(WED + 1 hours) * 1e6; // traded at 21:00, nothing since
+        store.update(_update(f));
+        assertEq(uint256(sv.quoteFill(true, 300e6, true, "").reason), uint256(Refusal.Stale));
+
+        _price(MANTISSA);
+        Fill memory q = sv.quoteFill(true, 300e6, true, "");
+        assertEq(uint256(q.reason), uint256(Refusal.None));
+        assertTrue(q.closed);
+        assertEq(q.spreadBps, 80, "still priced as closed");
+    }
+
+    function test_aQueuedRequestPaysTheFeeItWasMadeUnder() public {
+        uint256 shares = sv.balanceOf(OWNER) / 10;
+        uint256 gross = sv.convertToAssets(shares);
+        vm.prank(OWNER);
+        x.requestRedeem(shares, OWNER, OWNER);
+        StockConfig memory c = _cfg();
+        c.exitFeeBps = 200; // raised after a request that cannot be cancelled
+        _setCfg(c);
+        x.settleRedeems();
+        (,, RedeemEpoch memory e) = x.redeemQueue(1);
+        assertEq(e.feeBps, 20);
+        assertEq(e.cash, gross * (10_000 - 20) / 10_000);
+    }
+
+    function test_aQueueSettlementMovesTheBreakersLastPrice() public {
+        StockConfig memory c = _cfg();
+        c.navJumpBps = 10;
+        _setCfg(c);
+        uint256 shares = sv.balanceOf(OWNER) / 2;
+        vm.prank(OWNER);
+        x.requestRedeem(shares, OWNER, OWNER);
+        uint256 before = sv.convertToAssets(1e12);
+        x.settleRedeems(); // the 20 bps fee on half the vault lifts the share price about 20 bps
+        uint256 price = sv.convertToAssets(1e12);
+        assertGt(price, before * (10_000 + 15) / 10_000);
+        assertEq(x.state().lastSharePrice, price);
+
+        cash.mint(DEPOSITOR, 100e6);
+        vm.startPrank(DEPOSITOR);
+        cash.approve(address(sv), type(uint256).max);
+        sv.deposit(100e6, DEPOSITOR); // not a NavJump
+        vm.stopPrank();
+    }
+
+    function test_maxViewsAreZeroWhenTheCallWouldRevert() public {
+        assertGt(sv.maxDeposit(DEPOSITOR), 0);
+        assertGt(sv.maxWithdraw(OWNER), 0);
+        assertGt(sv.maxRedeem(OWNER), 0);
+
+        vm.warp(block.timestamp + 10); // in session, and the price is 10 s old
+        assertEq(sv.maxDeposit(DEPOSITOR), 0);
+        assertEq(sv.maxMint(DEPOSITOR), 0);
+        assertEq(sv.maxWithdraw(OWNER), 0);
+        assertEq(sv.maxRedeem(OWNER), 0);
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(StockLib.PriceNotUsable.selector, Refusal.Stale));
+        sv.withdraw(1e6, OWNER, OWNER);
+
+        vm.warp(SAT + 12 hours); // closed, on Friday's close
+        LazerBuilder.Feed memory f = _feed(MANTISSA);
+        f.feedTimestampUs = uint64(SAT) * 1e6 - 200_000;
+        store.update(_update(f));
+        assertEq(sv.maxDeposit(DEPOSITOR), 0);
+        assertEq(sv.maxWithdraw(OWNER), 0);
     }
 }

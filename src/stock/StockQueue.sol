@@ -96,7 +96,10 @@ library StockQueue {
         }
         IStockVaultSelf(address(this)).escrowShares(owner, msg.sender, shares);
         RedeemEpoch storage e = l.epochs[current];
-        if (e.shares == 0) e.openedAt = uint64(block.timestamp);
+        if (e.shares == 0) {
+            e.openedAt = uint64(block.timestamp);
+            e.feeBps = l.config.exitFeeBps;
+        }
         e.shares += shares.toUint128();
         r.epoch = current;
         r.shares += shares.toUint128();
@@ -122,7 +125,7 @@ library StockQueue {
         _priceShares(c, s, ctx);
 
         uint256 gross = IERC4626(address(this)).convertToAssets(e.shares);
-        uint256 cash = gross * (StockLib.BPS - c.exitFeeBps) / StockLib.BPS;
+        uint256 cash = gross * (StockLib.BPS - _fee(c, e)) / StockLib.BPS;
         uint256 free = _free(c, s, ctx);
         if (cash > free) revert CashShortForQueue(cash, free);
 
@@ -132,6 +135,7 @@ library StockQueue {
         e.sharesLeft = e.shares;
         e.status = SETTLED;
         l.redeemEpoch = id + 1;
+        _recordSharePrice(s);
         emit RedeemsSettled(id, e.shares, cash, gross - cash);
     }
 
@@ -153,7 +157,7 @@ library StockQueue {
         // Everything else the vault is worth: the short, a restock in transit, a maker order's margin.
         uint256 rest = IERC4626(address(this)).totalAssets() - own
             - StockLib.stockToCash(ctx, booked, StockLib.markPrice(ctx), Math.Rounding.Floor);
-        uint256 keep = StockLib.BPS - c.exitFeeBps;
+        uint256 keep = StockLib.BPS - _fee(c, e);
         uint256 stockOut = Math.mulDiv(booked, e.shares, supply);
         uint256 cashNow = Math.mulDiv(own, e.shares, supply) * keep / StockLib.BPS;
         uint256 debt = Math.mulDiv(rest, e.shares, supply) * keep / StockLib.BPS;
@@ -172,6 +176,7 @@ library StockQueue {
             l.unwinding = id;
         }
         l.redeemEpoch = id + 1;
+        _recordSharePrice(s);
         emit InKindStarted(id, e.shares, stockOut, cashNow, debt);
     }
 
@@ -274,6 +279,18 @@ library StockQueue {
         StockOps.beforeNav(c, s, ctx, StockLib.PAUSE_WITHDRAWALS);
         IERC4626 v = IERC4626(address(this));
         StockOps.checkSharePrice(c, s, v.convertToAssets(10 ** v.decimals()));
+    }
+
+    /// @dev The exit fee an epoch pays: the lower of the fee when it opened and the fee now.
+    function _fee(StockConfig storage c, RedeemEpoch storage e) private view returns (uint256) {
+        return Math.min(e.feeBps, c.exitFeeBps);
+    }
+
+    /// @dev The exit fee stays with those who stay, so a settlement moves the share price on purpose:
+    /// the NAV breaker takes the new price as its last, or the next deposit or withdrawal would trip it.
+    function _recordSharePrice(StockState storage s) private {
+        IERC4626 v = IERC4626(address(this));
+        s.lastSharePrice = v.convertToAssets(10 ** v.decimals());
     }
 
     function _free(StockConfig storage c, StockState storage s, StockContext memory ctx)
