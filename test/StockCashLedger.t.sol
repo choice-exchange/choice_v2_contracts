@@ -33,9 +33,10 @@ contract StockCashLedgerTest is StockVaultHarness {
             "nothing on the default subaccount"
         );
         (uint256 available, uint256 total) = _subCash();
-        assertEq(total, 0, "the margin went into the position");
-        assertEq(available, 0, "the confirmation brought the fee hold back");
-        assertEq(_bank(), bank - MARGIN);
+        // One unit stays: the vault never withdraws the last unit the exchange reports (it rounds).
+        assertEq(total, 1, "the margin went into the position");
+        assertEq(available, 1, "the confirmation brought the fee hold back");
+        assertEq(_bank(), bank - MARGIN - 1);
         assertEq(x.state().cashBooked, _bank(), "booked as it left");
         assertEq(sv.totalAssets(), nav);
     }
@@ -47,7 +48,7 @@ contract StockCashLedgerTest is StockVaultHarness {
         exchange.forceSettle(_sub(), MARKET, PRICE, address(sv)); // closed at its entry: the margin back
         assertEq(_bank(), bank, "the bank does not move");
         (uint256 available,) = _subCash();
-        assertEq(available, MARGIN);
+        assertEq(available, MARGIN + 1, "plus the unit the hedge left");
         assertEq(sv.totalAssets(), nav, "the subaccount's cash is in the value");
         x.confirmHedge();
         assertEq(_bank(), bank + MARGIN);
@@ -72,9 +73,9 @@ contract StockCashLedgerTest is StockVaultHarness {
         vm.prank(KEEPER);
         x.cancelMaker();
         (, total) = _subCash();
-        assertEq(total, 0);
-        assertEq(_bank(), bank, "cancelled: back in the bank, booked");
-        assertEq(x.state().cashBooked, bank);
+        assertEq(total, 1, "all but the unit a withdrawal leaves");
+        assertEq(_bank(), bank - 1, "cancelled: back in the bank, booked");
+        assertEq(x.state().cashBooked, bank - 1);
     }
 
     function test_aDonationIsOutOfTheValueUntilBooked() public {
