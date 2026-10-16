@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {StockAdmin} from "../src/stock/StockAdmin.sol";
 import {StockLib} from "../src/stock/StockLib.sol";
 import {StockModule} from "../src/stock/StockModule.sol";
 import {StockRestock} from "../src/stock/StockRestock.sol";
@@ -123,11 +124,50 @@ contract StockRestockTest is StockVaultHarness {
         x.restock(false, 10_001e6, 34 ether, 1);
 
         _order(true, 25 ether, 7_400e6); // 7,500 of stock
-        stock.mint(address(sv), 25 ether);
-        x.settleRestock(); // refunded
+        cash.mint(address(sv), 7_400e6);
+        vm.prank(KEEPER);
+        x.settleRestock(); // paid
         vm.prank(KEEPER);
         vm.expectRevert(abi.encodeWithSelector(StockLib.RestockCapExceeded.selector, 3_000e6, 2_500e6));
         x.restock(false, 3_000e6, 9.8 ether, 1);
+    }
+
+    function test_aSaleRefundedInStockGivesItsCapBack() public {
+        _order(true, 25 ether, 7_400e6);
+        assertEq(x.state().restockUsed, 7_500e6);
+        stock.mint(address(sv), 25 ether); // the issuer sends the stock back
+        x.settleRestock();
+        assertEq(x.state().restockUsed, 0, "seen to come back, so it no longer counts");
+        _order(false, 6_000e6, 19.9 ether);
+    }
+
+    function test_aCashRefundIsGivenBackOnlyByTheOwner() public {
+        _order(false, 3_000e6, 9.8 ether);
+        cash.mint(address(sv), 3_000e6); // the issuer refunds
+        vm.prank(KEEPER);
+        x.settleRestock();
+        assertEq(x.state().restockUsed, 3_000e6, "a close on the keeper's word gives nothing back");
+
+        vm.prank(KEEPER);
+        vm.expectRevert();
+        x.creditRestock(3_000e6);
+
+        vm.expectEmit(address(sv));
+        emit StockAdmin.RestockCredited(3_000e6);
+        vm.prank(OWNER);
+        x.creditRestock(5_000e6); // never more than was counted
+        assertEq(x.state().restockUsed, 0);
+    }
+
+    function test_aRefundAfterItsWindowGivesNothingBack() public {
+        _order(true, 25 ether, 7_400e6);
+        vm.warp(block.timestamp + 1 days);
+        _price(MANTISSA);
+        stock.mint(address(sv), 25 ether);
+        x.settleRestock();
+        assertEq(x.state().restockUsed, 7_500e6, "a stale window is left as it was");
+        _order(false, 6_000e6, 19.9 ether); // the new window starts from zero
+        assertEq(x.state().restockUsed, 6_000e6);
     }
 
     function test_oneOrderAtATime() public {

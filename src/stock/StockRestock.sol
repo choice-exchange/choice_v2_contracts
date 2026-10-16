@@ -88,6 +88,7 @@ library StockRestock {
             uint256 fair = StockLib.stockToCash(ctx, amountIn, r.price, Math.Rounding.Floor);
             _band(limitOut, fair * keep / StockLib.BPS);
             StockLib.countRestock(c, s, fair);
+            s.orderCounted = fair.toUint96();
             StockLib.ensureToken(ctx, ctx.stock, amountIn);
             s.stockBooked -= amountIn;
         } else {
@@ -95,6 +96,7 @@ library StockRestock {
             uint256 inventory = StockLib.stockToCash(ctx, s.stockBooked + limitOut, r.price, Math.Rounding.Ceil);
             if (inventory > c.maxInventory) revert InventoryCapExceeded(inventory, c.maxInventory);
             StockLib.countRestock(c, s, amountIn);
+            s.orderCounted = amountIn.toUint96();
             // The reserve, an unwinding epoch's debt and the margin the new stock's short needs stay.
             uint256 keepCash = StockLib.cashKept(c, s)
                 + StockLib.stockToCash(ctx, limitOut, r.price, Math.Rounding.Ceil) * 10 / c.leverageX10;
@@ -104,6 +106,7 @@ library StockRestock {
         }
         s.orderOpen = true;
         s.orderSell = sell;
+        s.orderWindow = s.restockWindowStart;
         (s.orderCash, s.orderStock) =
             sell ? (limitOut.toUint96(), amountIn.toUint128()) : (amountIn.toUint96(), limitOut.toUint128());
         s.orderDeadline = (block.timestamp + life + c.restockDeadline).toUint64();
@@ -128,8 +131,13 @@ library StockRestock {
             s.orderOpen = false;
             uint256 tokens = IERC20(Currency.unwrap(ctx.stock)).balanceOf(address(this));
             if (tokens != 0) StockLib.lock(ctx, StockLib.OP_TO_CLAIMS, ctx.stock, tokens);
-            if (sell) emit RestockRefunded(true, s.orderStock);
-            else emit Restocked(false, s.orderCash, surplus);
+            if (sell) {
+                // The stock came back, which the vault can see: the order no longer counts.
+                StockLib.uncountRestock(s, s.orderWindow, s.orderCounted);
+                emit RestockRefunded(true, s.orderStock);
+            } else {
+                emit Restocked(false, s.orderCash, surplus);
+            }
         } else if (isKeeper || block.timestamp > s.orderDeadline) {
             s.orderOpen = false;
             if (sell) emit Restocked(true, s.orderStock, s.orderCash);

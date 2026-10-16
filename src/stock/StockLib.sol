@@ -236,6 +236,14 @@ library StockLib {
         s.restockUsed += cash.toUint96();
     }
 
+    /// @dev Give back `cash` counted in `window`, if that window is still the current one (a later
+    /// window started from zero and owes nothing).
+    function uncountRestock(StockState storage s, uint64 window, uint256 cash) internal returns (uint256 back) {
+        if (window != s.restockWindowStart || block.timestamp >= uint256(window) + RESTOCK_CAP_WINDOW) return 0;
+        back = Math.min(cash, s.restockUsed);
+        s.restockUsed -= uint96(back);
+    }
+
     /// @dev Stock held beyond the booked stock and what is held for fixing-lane requesters.
     function unbooked(StockState storage s, StockContext memory ctx) internal view returns (uint256) {
         uint256 held = ownStock(s, ctx);

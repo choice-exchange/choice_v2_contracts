@@ -51,6 +51,7 @@ contract StockAdmin is StockModule {
     event MarketMigrated(string marketId);
     event RestockMemoSet(bytes memo);
     event NavAccepted();
+    event RestockCredited(uint256 cash);
     event Swept(address indexed token, address indexed to, uint256 amount);
 
     // -------------------------------------------------------------------------------------
@@ -221,6 +222,13 @@ contract StockAdmin is StockModule {
         if (memo.length != 0) StockRestock.checkMemo(memo);
         StockStorage.layout().restockMemo = memo;
         emit RestockMemoSet(memo);
+    }
+
+    /// @notice Give `cash` back to today's restock cap, for a buy the issuer refunded in cash. The
+    /// vault cannot see a cash refund (the keeper's close is only a word), so a person confirms it.
+    function creditRestock(uint256 cash) external onlyOwner {
+        StockState storage s = StockStorage.layout().state;
+        emit RestockCredited(StockLib.uncountRestock(s, s.restockWindowStart, cash));
     }
 
     /// @notice Accept the current share price after a person has looked at a NAV jump.

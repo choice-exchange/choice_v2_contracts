@@ -84,6 +84,8 @@ struct StockConfig {
 /// @param orderDeadline when anyone may close the open order: its expiry plus `restockDeadline`
 /// @param makerHash the resting maker hedge order, empty when there is none
 /// @param makerFillable what of it may still fill, 1e18 units, as last read back
+/// @param orderWindow the restock-cap window the open order was counted in
+/// @param orderCounted the cash it counted against that window's cap
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -118,6 +120,8 @@ struct StockState {
     bool makerSell;
     uint64 makerPlacedAt;
     uint256 makerFillable;
+    uint64 orderWindow;
+    uint96 orderCounted;
 }
 
 /// @notice The fixing lane's tunables, set by the owner inside the limits in `StockFixing`. A batch
