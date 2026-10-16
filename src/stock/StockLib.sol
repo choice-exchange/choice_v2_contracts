@@ -60,7 +60,9 @@ library StockLib {
 
     /// @dev The exchange subaccount the short trades from. Not the default one, which trades off the
     /// bank balance: here its margin, PnL, fees and funding move a deposit of its own, so the bank
-    /// balance the cash ledger reads moves only on the vault's own calls (and on arrivals).
+    /// balance the cash ledger reads moves only on the vault's own calls and on arrivals. One arrival
+    /// is the vault's own: an order's relayer fee share (40% of its fee, `feeRecipient` empty = the
+    /// sender) accrues on the DEFAULT subaccount and reaches the bank in whole units (measured 10-16).
     uint96 internal constant HEDGE_NONCE = 1;
 
     /// @dev Transient: set only while the vault holds a Choice vault lock it opened itself.

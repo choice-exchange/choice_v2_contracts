@@ -147,7 +147,9 @@ interface IExchangeDerivatives {
 
     /// @dev `deposit` `0xe441dec9` and `withdraw` `0xeb28c205` move `amount` of bank `denom` (the
     /// token's own units, not the API format) into and out of one of the sender's non-default
-    /// subaccounts. Both proven from a contract on mainnet (10-12, subaccount 1, USDC).
+    /// subaccounts. Proven from a contract on mainnet on subaccount 1 with USDC (10-12; and 10-16 with
+    /// a market short, a resting post-only hold and cancel, a withdrawal while the short was open,
+    /// increase/decrease margin and the reduce-only close all on that subaccount).
     function deposit(address sender, string calldata subaccountID, string calldata denom, uint256 amount)
         external
         returns (bool success);

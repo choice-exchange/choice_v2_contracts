@@ -24,7 +24,7 @@ import {Reference, StockConfig, StockContext, StockLayout, StockState} from "./S
 ///   stays in the value at the mark and in the hedge until it is paid.
 /// - **Closing**, by anyone, on what has arrived, which both ledgers show: stock above `stockBooked` (a
 ///   buy's delivery, a sell's stock refunded) or cash above `cashBooked` (a sell's payment, a buy's
-///   refund; nothing else moves the bank balance, since the short trades from its own subaccount).
+///   refund; the short trades from its own subaccount, so only fee-share dust arrives otherwise).
 ///   Until then an arrival is out of the value, so nothing counts twice. An order that has had
 ///   nothing back by its expiry plus `restockDeadline` lapses: it leaves the value, and what arrives
 ///   later is booked as a windfall. Whatever arrived before the order is booked as one first, so

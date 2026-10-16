@@ -87,8 +87,9 @@ struct StockConfig {
 /// @param orderWindow the restock-cap window the open order was counted in
 /// @param orderCounted the cash it counted against that window's cap
 /// @param cashBooked the cash the vault accounts for (token plus claims, less `cashOwed`). The short
-/// trades from its own exchange subaccount, so nothing but the vault's own calls moves this balance:
-/// one above it is an issuer's payment or refund, or a windfall, not yet booked
+/// trades from its own exchange subaccount, so only the vault's own calls move this balance, besides
+/// arrivals: one above it is an issuer's payment or refund, a windfall, or the relayer share of the
+/// short's own fees (dust, whole units only), not yet booked
 /// @param cashDenom the cash's bank denom, which the exchange names it by; fixed at construction
 struct StockState {
     string marketId;
