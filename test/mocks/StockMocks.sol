@@ -52,6 +52,9 @@ contract MockStockExchange {
     uint256 public ordersPlaced;
     uint256 public decreases;
     bool public failDecrease;
+    /// @notice As on chain after a trade: each subaccount balance also holds a fraction of a unit over
+    /// half, which `subaccountDeposit` rounds UP, though only the whole units can be withdrawn.
+    bool public roundUp;
 
     struct Resting {
         address sender;
@@ -193,10 +196,15 @@ contract MockStockExchange {
         bytes32 sub = keccak256(bytes(subaccountID));
         total = depositTotal[sub];
         available = total - depositHeld[sub];
+        if (roundUp) (available, total) = (available + 1, total + 1);
     }
 
     function setFailDecrease(bool fail) external {
         failDecrease = fail;
+    }
+
+    function setRoundUp(bool on) external {
+        roundUp = on;
     }
 
     function pendingCount() external view returns (uint256) {

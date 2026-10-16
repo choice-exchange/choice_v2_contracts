@@ -331,6 +331,31 @@ contract StockReviewFixesTest is StockVaultHarness {
         assertEq(x.context().tokenPerShare, r);
     }
 
+    /// Mainnet 10-16: a covered short paid 10,082,710.60217 units into the hedge subaccount, which the
+    /// precompile answered as 10,082,711. Withdrawing that was refused, so the cash never came back, and
+    /// every hedge that had to bring cash back reverted.
+    function test_aSubaccountBalanceTheExchangeRoundsUpStillComesBack() public {
+        uint256 n = block.number; // via-IR reads `block.number` once per function: roll by explicit numbers
+        _hedge(PRICE); // short 30, confirmed at n + 1
+        vm.roll(n + 2);
+        _swap(true, false, 10 ether); // a taker takes 10: the short is 10 over
+        vm.prank(KEEPER);
+        assertTrue(x.syncHedge()); // cover 10, reduce-only
+        vm.roll(n + 3);
+        exchange.endBlock(PRICE); // its margin comes back to the subaccount
+        exchange.setRoundUp(true); // with a fraction of a unit over half, as on chain
+        bytes32 sub = keccak256(bytes(_sub()));
+        uint256 back = exchange.depositTotal(sub);
+        assertGt(back, 0);
+        uint256 booked = x.state().cashBooked;
+        x.confirmHedge();
+        assertEq(exchange.depositTotal(sub), 0, "every whole unit came back");
+        assertEq(x.state().cashBooked, booked + back);
+        vm.roll(n + 4);
+        vm.prank(KEEPER);
+        assertFalse(x.syncHedge(), "in the band, and nothing to bring back: no revert");
+    }
+
     /// The shares a deposit mints stay put for the lock, so nobody can deposit, push a newer price and
     /// withdraw the difference. Shares held before are free, so a stranger's dust locks only the dust.
     function test_aDepositsSharesAreLockedButOlderOnesAreNot() public {
