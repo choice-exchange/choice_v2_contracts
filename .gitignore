@@ -17,3 +17,4 @@ broadcast/**/dry-run/
 # because that only stops the WORKSPACE repo tracking them. This is the rule that stops this one.
 # Point SAFE_TX_DIR at the private workspace's own /safe/ instead.
 /safe/
+deployments/rehearsal/
