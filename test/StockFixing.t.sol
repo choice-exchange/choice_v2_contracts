@@ -193,6 +193,17 @@ contract StockFixingTest is StockVaultHarness {
         assertEq(stock.balanceOf(BUYER), 1_000 ether + out);
     }
 
+    /// And stock a batch leaves the vault, so a taker can buy it at once.
+    function test_theStockABatchLeavesTheVaultGoesIntoClaims() public {
+        uint256 id = _commit(SELLER, false, 5 ether);
+        assertEq(stock.balanceOf(address(sv)), 5 ether, "escrow is not the vault's: it stays as it came");
+        _settle(MANTISSA);
+        assertEq(stock.balanceOf(address(sv)), 0, "nothing left plain");
+        assertEq(_claims(stock), 35 ether, "the vault's stock in claims");
+        (uint256 out,) = x.claimFixing(id);
+        assertEq(out, Math.mulDiv(5 ether, _bidAt(PRICE, 10), 1e30));
+    }
+
     function test_theSellSideIsCutToTheInventoryCap() public {
         StockConfig memory c = _cfg();
         c.maxInventory = 12_000e6; // 9,000 held: room for 10 more

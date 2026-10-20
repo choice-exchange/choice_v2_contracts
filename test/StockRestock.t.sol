@@ -238,6 +238,7 @@ contract StockRestockTest is StockVaultHarness {
         vm.prank(OWNER);
         x.writeOffRestock(); // past the deadline: written off, and what came is booked
         assertEq(x.state().stockBooked, 35 ether);
+        assertEq(stock.balanceOf(address(sv)), 0, "into claims");
         _price(MANTISSA);
         assertEq(sv.totalAssets(), nav - 3_000e6 + 1_500e6, "the cash left, the stock that came is booked");
         _order(false, 1_000e6, 3.3 ether); // and restocking goes on

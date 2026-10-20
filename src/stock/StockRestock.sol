@@ -169,15 +169,17 @@ library StockRestock {
         s.orderOpen = false;
         emit RestockLapsed(s.orderSell, s.orderSell ? s.orderStock : s.orderCash);
         _bookWindfalls(s, ctx);
+        StockLib.intoClaims(ctx, ctx.stock);
         StockLib.intoClaims(ctx, ctx.cash);
     }
 
     /// @notice Book stock and cash that arrived with no order open (a late leg of a lapsed order, an
-    /// in-kind dividend, a donation), the cash into claims. Refused while an order is open, which its own
-    /// legs settle first.
+    /// in-kind dividend, a donation), into claims. Refused while an order is open, which its own legs
+    /// settle first.
     function syncWindfall(StockState storage s, StockContext memory ctx) external {
         if (s.orderOpen) revert OrderOpen();
         _bookWindfalls(s, ctx);
+        StockLib.intoClaims(ctx, ctx.stock);
         StockLib.intoClaims(ctx, ctx.cash);
     }
 

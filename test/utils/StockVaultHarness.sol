@@ -132,16 +132,14 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
         });
         manager.initialize(key, _sqrtAt(300));
 
-        // 10,000 cash deposited and 30 STOCK booked (19,000 of value), all of both as claims: a deposit
-        // lands there on its own.
+        // 10,000 cash deposited and 30 STOCK booked (19,000 of value), all of both as claims: what the
+        // vault books lands there on its own.
         cash.mint(OWNER, 10_000e6);
         cash.approve(address(sv), type(uint256).max);
         sv.deposit(10_000e6, OWNER);
         vm.stopPrank();
         stock.mint(address(sv), 30 ether);
         x.syncWindfall();
-        vm.prank(KEEPER);
-        x.toClaims(false, 30 ether);
         vm.prank(OWNER);
         x.acceptNav(); // the booked stock nearly doubled the share price
 
