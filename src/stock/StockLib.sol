@@ -534,9 +534,19 @@ library StockLib {
     }
 
     /// @dev Make sure `amount` of `currency` is held as the token, pulling the shortfall out of claims.
+    /// Every outflow of the token goes through this (or `spendOwnCash`, which calls it).
     function ensureToken(StockContext memory ctx, Currency currency, uint256 amount) internal {
         uint256 bal = IERC20(Currency.unwrap(currency)).balanceOf(address(this));
         if (bal < amount) lock(ctx, OP_FROM_CLAIMS, currency, amount - bal);
+    }
+
+    /// @dev Move all of `currency` the vault holds as the token into its Choice vault claims, which fills
+    /// pay out of (`StockPricing.guards`): called where the vault's own cash or stock arrives, so a fill can
+    /// pay it out at once. Every outflow pulls what it needs back out first (`ensureToken`), and the value
+    /// counts both forms (`holding`), so it changes nothing the vault is worth.
+    function intoClaims(StockContext memory ctx, Currency currency) internal {
+        uint256 bal = IERC20(Currency.unwrap(currency)).balanceOf(address(this));
+        if (bal != 0) lock(ctx, OP_TO_CLAIMS, currency, bal);
     }
 
     function lock(StockContext memory ctx, uint8 op, Currency currency, uint256 amount) internal {

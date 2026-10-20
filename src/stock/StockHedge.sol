@@ -47,15 +47,20 @@ library StockHedge {
     // -------------------------------------------------------------------------------------
 
     /// @notice Read the short back from the position, then bring the subaccount's free cash back to the
-    /// bank (best effort: if the exchange refuses, it stays there, still in the value). The cash comes
-    /// back even when the position cannot be read.
-    function confirmHedge(StockState storage s) external {
+    /// bank and into claims (best effort: if the exchange refuses, it stays there, still in the value).
+    /// The cash comes back even when the position cannot be read. (`ctx` is the stored copy, read only
+    /// when cash comes back.)
+    function confirmHedge(StockState storage s, StockContext storage ctx) external {
         _confirm(s, false);
         (uint256 available,) = StockLib.subaccountCash(s);
         if (available == 0) return;
         try StockLib.EXCHANGE.withdraw(address(this), StockLib.subaccount(), s.cashDenom, available) returns (bool ok) {
-            if (ok) s.cashBooked += available;
-        } catch {}
+            if (!ok) return;
+            s.cashBooked += available;
+        } catch {
+            return;
+        }
+        StockLib.intoClaims(ctx, ctx.cash);
     }
 
     /// @dev Read the short back from the position: the truth a pending order is judged against. A
@@ -294,7 +299,7 @@ library StockHedge {
     }
 
     /// @dev Leave exactly `need` (cash units) available in the hedge subaccount: deposit the shortfall
-    /// out of the vault's own cash, or bring the rest back to the bank. Booked either way.
+    /// out of the vault's own cash, or bring the rest back to the bank and into claims. Booked either way.
     function _fund(StockState storage s, StockContext memory ctx, uint256 need) private {
         (uint256 available,) = StockLib.subaccountCash(s);
         if (available == need) return;
@@ -308,6 +313,7 @@ library StockHedge {
             uint256 amount = available - need;
             if (!StockLib.EXCHANGE.withdraw(address(this), sub, s.cashDenom, amount)) revert ExchangeRefused();
             s.cashBooked += amount;
+            StockLib.intoClaims(ctx, ctx.cash);
         }
     }
 

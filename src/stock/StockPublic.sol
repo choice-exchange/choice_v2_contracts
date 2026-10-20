@@ -173,7 +173,8 @@ contract StockPublic is StockModule {
     }
 
     function confirmHedge() external delegated nonReentrant {
-        StockHedge.confirmHedge(StockStorage.layout().state);
+        StockLayout storage l = StockStorage.layout();
+        StockHedge.confirmHedge(l.state, l.ctx);
     }
 
     function syncHedge() external delegated nonReentrant returns (bool) {

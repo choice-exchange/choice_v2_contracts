@@ -102,7 +102,8 @@ contract StockAdmin is StockModule {
     }
 
     /// @notice Move the vault's own cash or stock between the token and Choice vault claims, which
-    /// is what fills pay out of. Changes nothing the vault is worth.
+    /// is what fills pay out of. Changes nothing the vault is worth. What the vault books goes into
+    /// claims on its own (`StockLib.intoClaims`): this is for anything left as the token.
     function toClaims(bool isCash, uint256 amount) external delegated nonReentrant {
         _keeperOrOwner();
         StockContext memory ctx = StockStorage.layout().ctx;

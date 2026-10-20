@@ -146,6 +146,18 @@ contract StockRestockTest is StockVaultHarness {
         cash.mint(address(sv), 3_000e6); // the issuer refunds
         x.settleRestock();
         assertEq(x.state().restockUsed, 0, "seen to come back on the cash ledger, so it no longer counts");
+        assertEq(cash.balanceOf(address(sv)), 0, "the refund went into claims");
+    }
+
+    /// A sale's payment is settled into claims, so the cash it raised pays the next sell at once.
+    function test_aSalesPaymentIsSettledIntoClaims() public {
+        uint256 held = cash.balanceOf(address(sv)) + _claims(cash);
+        _order(true, 10 ether, 2_950e6);
+        cash.mint(address(sv), 2_960e6); // the issuer pays, above the limit
+        x.settleRestock();
+        assertEq(x.state().cashBooked, held + 2_960e6);
+        assertEq(cash.balanceOf(address(sv)), 0, "nothing left plain");
+        assertEq(_claims(cash), held + 2_960e6, "all of it in claims");
     }
 
     function test_aRefundAfterItsWindowGivesNothingBack() public {

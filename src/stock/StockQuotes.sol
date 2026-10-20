@@ -24,8 +24,8 @@ import {IssuerQuote, Reference, StockConfig, StockContext, StockLayout, StockSta
 /// - Both legs move in one transaction and are pulled from the issuer's account (`issuer`), which
 ///   approves the vault on both tokens. The vault pulls the issuer's leg first and checks what arrived.
 /// - A buy counts against the daily restock cap and the inventory cap and spends only the vault's own
-///   cash. A sale sells only booked stock. The optional path: LIMIT memo orders (`StockRestock`) are
-///   the default restock, in both directions.
+///   cash. A sale sells only booked stock, and its payment goes into claims. The optional path: LIMIT
+///   memo orders (`StockRestock`) are the default restock, in both directions.
 library StockQuotes {
     using SafeERC20 for IERC20;
 
@@ -102,6 +102,7 @@ library StockQuotes {
             s.cashBooked += _pull(cashToken, issuer, q.cash);
             stockToken.safeTransfer(issuer, q.stock);
             s.stockBooked -= q.stock;
+            StockLib.intoClaims(ctx, ctx.cash);
         }
         emit QuoteFilled(q.nonce, q.vaultBuys, q.stock, q.cash, r.price);
     }

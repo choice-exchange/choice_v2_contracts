@@ -204,6 +204,9 @@ library StockFixing {
         // A live, signed fixing is a fresh anchor, as an instant fill is.
         s.anchorPrice = price.toUint128();
         s.jumpSince = 0;
+        // Cash the batch leaves the vault goes into claims, which fills pay out of (escrow moves with it;
+        // a claim pulls back what it pays).
+        if (buyFilled > cashOut) StockLib.intoClaims(ctx, ctx.cash);
         emit FixingSettled(
             boundary, price, bps, b.buy.amountIn, buyFilled, stockOut, b.sell.amountIn, sellFilled, cashOut
         );

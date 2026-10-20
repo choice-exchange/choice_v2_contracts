@@ -82,6 +82,7 @@ contract StockQuotesTest is StockVaultHarness {
         assertEq(issuerCash - cash.balanceOf(ISSUER), 1_490e6);
         assertEq(stock.balanceOf(ISSUER), 1_005 ether);
         assertEq(x.state().restockUsed, 0, "sales do not count");
+        assertEq(cash.balanceOf(address(sv)), 0, "the payment went into claims");
     }
 
     function test_aQuoteOutsideTheBandIsRefused() public {
