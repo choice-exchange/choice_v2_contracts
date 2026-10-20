@@ -54,7 +54,8 @@ contract StockMakerTest is StockVaultHarness {
         assertEq(o[0].price, 300.5e18);
         assertEq(o[0].quantity, 30 ether);
         assertEq(o[0].margin, 30 * 300.5e18 / 3, "margin at 3x");
-        assertEq(sv.totalAssets(), nav, "the held margin is still the vault's");
+        // All but the unit the subaccount keeps, which the vault never withdraws (`StockLib.subaccountCash`).
+        assertEq(sv.totalAssets(), nav - 1, "the held margin is still the vault's");
     }
 
     function test_aMakerFillIsReadBackAndTheRestStillCounts() public {
@@ -87,7 +88,7 @@ contract StockMakerTest is StockVaultHarness {
         StockState memory s = x.state();
         assertEq(s.shortConfirmed, 0, "gone is not filled");
         assertEq(bytes(s.makerHash).length, 0);
-        assertEq(sv.totalAssets(), nav);
+        assertEq(sv.totalAssets(), nav - 1, "the hold came back, all but the unit the subaccount keeps");
     }
 
     function test_replacingCancelsTheRestingOrderFirst() public {

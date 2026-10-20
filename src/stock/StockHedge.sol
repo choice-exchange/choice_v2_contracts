@@ -404,10 +404,10 @@ library StockHedge {
 
     /// @notice The booked cash, plus the booked stock (never more than is held) at the stored price,
     /// plus an open restock order's stock, plus the hedge subaccount's cash (a resting maker order's
-    /// margin hold included), plus the short at margin plus PnL. Cash that arrived unbooked, what the
-    /// vault holds for fixing-lane requesters and redeemers, and what it owes an in-kind redeem epoch,
-    /// are left out. ⚠️ Funding reaches the margin only when it settles; deposits and withdrawals settle
-    /// it first.
+    /// margin hold included, the unit the subaccount always keeps left out: `StockLib.subaccountCash`),
+    /// plus the short at margin plus PnL. Cash that arrived unbooked, what the vault holds for fixing-lane
+    /// requesters and redeemers, and what it owes an in-kind redeem epoch, are left out. ⚠️ Funding
+    /// reaches the margin only when it settles; deposits and withdrawals settle it first.
     function value(StockState storage s, StockContext memory ctx) external view returns (uint256 total) {
         uint256 price = StockLib.markPrice(ctx);
         total = StockLib.ownCash(s, ctx) + StockLib.orderValue(s, ctx, price);

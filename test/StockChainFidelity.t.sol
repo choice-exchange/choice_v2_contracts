@@ -3,12 +3,15 @@ pragma solidity 0.8.26;
 
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {IHooks} from "infinity-core/src/interfaces/IHooks.sol";
 import {ICLPoolManager} from "infinity-core/src/pool-cl/interfaces/ICLPoolManager.sol";
 
+import {IStockVaultExtension} from "../src/interfaces/IStockVaultExtension.sol";
 import {StockHedge} from "../src/stock/StockHedge.sol";
 import {StockLib} from "../src/stock/StockLib.sol";
 import {StockModule} from "../src/stock/StockModule.sol";
 import {StockOps} from "../src/stock/StockOps.sol";
+import {StockRegistry} from "../src/stock/StockRegistry.sol";
 import {StockRestock} from "../src/stock/StockRestock.sol";
 import {StockVault} from "../src/stock/StockVault.sol";
 import {PriceStore} from "../src/stock/PriceStore.sol";
@@ -310,6 +313,89 @@ contract StockChainFidelityTest is StockVaultHarness {
         c.hedgeBand = 1e6;
         c.minHedge = minHedge;
         _setCfg(c);
+    }
+
+    // ── a full exit ───────────────────────────────────────────────────────
+
+    /// Mainnet 10-20: once the short was covered to zero, `requestRedeem(every share)` and then
+    /// `settleRedeems` reverted `CashShortForQueue(28942837, 28942836)`. The subaccount keeps the unit the
+    /// vault never withdraws (`StockLib.subaccountCash`), and the value counted it, so every share's claim
+    /// was a unit more than any cash exit could pay. The value counts only what can come back now: the
+    /// whole vault leaves in cash, to the unit, and nothing is left behind.
+    function test_aFullExitSettlesInCashOnceTheShortIsCovered() public {
+        _freshVault(10_000e6);
+        StockConfig memory c = _cfg();
+        c.exitFeeBps = 0; // what the leaver gets is then the shares' value itself
+        c.targetInventory = 3_000e6; // the short runs 10 ahead of a restock
+        _setCfg(c);
+        uint256 n = block.number;
+        _hedgeAt(n, 299.5e18);
+        assertEq(x.state().shortConfirmed, 10 ether);
+        c.targetInventory = 0; // the restock never comes: the short follows the holding, none
+        _setCfg(c);
+        vm.roll(n + 2);
+        _hedgeAt(n + 2, 300.53e18); // covered at a loss, with a fee: the payout is no whole number
+        assertEq(x.state().shortConfirmed, 0);
+        (, uint256 kept) = exchange.subaccountDeposit(_sub(), CASH_DENOM);
+        assertEq(kept, 1, "the subaccount keeps the unit the vault never withdraws");
+        x.syncWindfall(); // the relayer share of the vault's own fees, booked
+
+        uint256 nav = sv.totalAssets();
+        uint256 booked = x.state().cashBooked;
+        uint256 shares = sv.balanceOf(DEPOSITOR);
+        uint256 value = sv.previewRedeem(shares);
+        uint256 instant = sv.maxWithdraw(DEPOSITOR);
+        vm.prank(DEPOSITOR);
+        x.requestRedeem(shares, DEPOSITOR, DEPOSITOR);
+        x.settleRedeems(); // reverted CashShortForQueue(booked + 1, booked)
+        vm.prank(DEPOSITOR);
+        (uint256 paid,) = x.claimRedeem(DEPOSITOR, DEPOSITOR);
+
+        assertEq(nav, booked, "the value is the cash the vault holds, not the unit it leaves");
+        assertEq(instant, value, "an instant exit could have taken all of it too");
+        assertEq(paid, value, "the leaver gets the shares' value");
+        assertEq(paid, nav, "which is the whole vault, to the unit");
+        assertEq(sv.totalSupply(), 0);
+        assertEq(sv.totalAssets(), 0, "nothing is left behind");
+        assertEq(cash.balanceOf(address(sv)) + _claims(cash), 0, "not a unit of cash");
+    }
+
+    /// A second vault on the same pool manager, its shares still at their first price as the rehearsal
+    /// vault's were: cash deposited, no stock. (The harness books 30 STOCK as a windfall, which nearly
+    /// doubles the share price, and the ERC-4626 virtual shares then own about two units of the value:
+    /// enough to hide the unit no exit could pay.) The suite's helpers act on it from here on.
+    function _freshVault(uint256 amount) internal {
+        StockRegistry reg = new StockRegistry(OWNER); // one vault per stock in a registry
+        sv = new StockVault(
+            StockVault.Init({
+                cash: IERC20(address(cash)),
+                stock: IERC20(address(stock)),
+                poolManager: ICLPoolManager(address(manager)),
+                store: store,
+                calendar: calendar,
+                modules: sv.MODULES(),
+                registry: address(reg),
+                ratios: ratios,
+                feedId: FEED,
+                cashFeedId: 0,
+                marketId: MARKET,
+                cashDenom: CASH_DENOM,
+                owner: OWNER,
+                name: "Stock vault",
+                symbol: "SV"
+            }),
+            _cfg()
+        );
+        x = IStockVaultExtension(address(sv));
+        key.hooks = IHooks(address(sv));
+        vm.startPrank(OWNER);
+        reg.setIssuerCap(ISSUER, 1_000_000e6);
+        reg.register(address(sv), address(stock), ISSUER, _cfg().maxInventory);
+        x.setRoles(KEEPER, GUARDIAN, ISSUER);
+        x.setDepositor(DEPOSITOR, true);
+        manager.initialize(key, _sqrtAt(300));
+        vm.stopPrank();
+        _deposit(amount);
     }
 }
 

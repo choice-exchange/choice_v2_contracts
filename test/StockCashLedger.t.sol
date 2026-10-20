@@ -38,7 +38,7 @@ contract StockCashLedgerTest is StockVaultHarness {
         assertEq(available, 1, "the confirmation brought the fee hold back");
         assertEq(_bank(), bank - MARGIN - 1);
         assertEq(x.state().cashBooked, _bank(), "booked as it left");
-        assertEq(sv.totalAssets(), nav);
+        assertEq(sv.totalAssets(), nav - 1, "less the unit the subaccount keeps, which never comes back");
     }
 
     function test_whatTheShortPaysBackLandsInItsSubaccountAndComesBackBooked() public {
@@ -68,7 +68,7 @@ contract StockCashLedgerTest is StockVaultHarness {
         (uint256 available, uint256 total) = _subCash();
         assertEq(total - available, 3_010e6, "the hold: 30 at 301, at 3x");
         assertEq(_bank() + total, bank, "the hold and its fee buffer sit in the subaccount");
-        assertEq(sv.totalAssets(), nav, "and in the value");
+        assertEq(sv.totalAssets(), nav - 1, "and in the value, but for the unit the subaccount keeps");
         vm.roll(block.number + 1);
         vm.prank(KEEPER);
         x.cancelMaker();

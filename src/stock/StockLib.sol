@@ -339,13 +339,18 @@ library StockLib {
     }
 
     /// @dev The hedge subaccount's cash, in cash units: what is free, and the total (which includes a
-    /// resting order's margin hold). 🔴 The exchange keeps a balance to 18 decimals, and the precompile
-    /// answers it rounded to the NEAREST unit (measured 10-16: 10,082,710.60217 answered 10,082,711), so
-    /// withdrawing what it says is free can ask for a fraction of a unit too much, and the exchange refuses.
-    /// One unit less than it answers is always there: that is what this calls free.
+    /// resting order's margin hold), each one unit less than the precompile answers. 🔴 The exchange keeps
+    /// a balance to 18 decimals, and the precompile answers it rounded to the NEAREST unit (measured 10-16:
+    /// 10,082,710.60217 answered 10,082,711), so withdrawing what it says is free can ask for a fraction of
+    /// a unit too much, and the exchange refuses. One unit less than it answers is always there: that is
+    /// what this calls free, and no withdrawal asks for more. So the subaccount always keeps a unit the
+    /// vault never takes back, and the total leaves it out too: the value counts only cash that can reach
+    /// the bank, or every share would claim a unit more than any cash exit can pay (mainnet 10-20: a full
+    /// exit reverted `CashShortForQueue(n, n - 1)`).
     function subaccountCash(StockState storage s) internal view returns (uint256 available, uint256 total) {
         (available, total) = EXCHANGE.subaccountDeposit(subaccount(), s.cashDenom);
         if (available != 0) --available;
+        if (total != 0) --total;
     }
 
     /// @notice The stock held less what is held for fixing-lane requesters.
