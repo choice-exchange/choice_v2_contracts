@@ -72,6 +72,22 @@ contract StockQuotesTest is StockVaultHarness {
         assertEq(cash.balanceOf(ISSUER) - issuerCash, 1_510e6);
         assertEq(stock.balanceOf(ISSUER), 995 ether);
         assertEq(x.state().restockUsed, 1_510e6, "counts against the daily cap");
+        assertEq(stock.balanceOf(address(sv)), 0, "the stock went into claims");
+    }
+
+    /// Stock a quote buys goes into claims, so a taker can buy it from the vault at once: the mirror of
+    /// the 10-20 refusals, where cash that arrived stayed plain and every sell was refused.
+    function test_stockAQuoteBuysCanBeSoldAtOnce() public {
+        vm.prank(KEEPER);
+        x.fromClaims(false, 30 ether); // all of the vault's stock plain
+        _expectRefusal(Refusal.Inventory);
+        _swap(true, true, 300e6);
+        IssuerQuote memory q = _quote(true, 5 ether, 1_510e6);
+        _fill(q, _sign(QUOTE_KEY, q));
+        assertEq(stock.balanceOf(address(sv)), 0, "every unit of stock went into claims");
+        assertEq(_claims(stock), 35 ether);
+        _swap(true, true, 300e6);
+        assertLt(x.state().stockBooked, 35 ether, "filled, out of claims");
     }
 
     function test_theVaultSellsAtAQuoteWithinTheBand() public {
@@ -82,6 +98,7 @@ contract StockQuotesTest is StockVaultHarness {
         assertEq(issuerCash - cash.balanceOf(ISSUER), 1_490e6);
         assertEq(stock.balanceOf(ISSUER), 1_005 ether);
         assertEq(x.state().restockUsed, 0, "sales do not count");
+        assertEq(cash.balanceOf(address(sv)), 0, "the payment went into claims");
     }
 
     function test_aQuoteOutsideTheBandIsRefused() public {

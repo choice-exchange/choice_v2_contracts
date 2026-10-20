@@ -77,7 +77,10 @@ import {
 /// as `hookData`, prices the whole swap off it, and returns a delta that leaves the pool's curve
 /// nothing to swap. Fills settle in Choice vault claims (ERC6909): the input is minted to this
 /// contract and the output burned from its claims, so a swap moves no token and never touches the
-/// Choice vault's single sync slot. A swap it will not fill reverts `NotFillable` while the curve is
+/// Choice vault's single sync slot. The vault's own cash and stock that arrive any other way (a deposit,
+/// a restock's leg, margin back from the hedge, a windfall) go into claims as they are booked
+/// (`StockLib.intoClaims`), and whatever leaves as a token is pulled back out of them first, so a fill can
+/// pay out all the vault holds. A swap it will not fill reverts `NotFillable` while the curve is
 /// closed. ⚠️ The pool's `Swap` event carries the curve's amounts, zero for a fill: read `Filled`.
 ///
 /// **Weekend mode.** Only when the `MarketCalendar` says the market is shut AND the stored price is
@@ -437,12 +440,14 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
         return Math.min(_unlocked(owner_), _convertToShares(_freeCash(), Math.Rounding.Floor));
     }
 
-    /// @dev A deposit's shares are locked to their receiver for `depositLock` (see `DepositLock`).
+    /// @dev A deposit's cash goes straight into claims, which fills pay out of, and its shares are locked
+    /// to their receiver for `depositLock` (see `DepositLock`).
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         StockLayout storage l = StockStorage.layout();
         if (l.allowlistOn && !l.isDepositor[caller] && caller != owner()) revert NotDepositor(caller);
         super._deposit(caller, receiver, assets, shares);
         l.state.cashBooked += assets;
+        StockLib.intoClaims(_ctx(), CASH);
         uint256 lock = l.config.depositLock;
         if (lock != 0) {
             DepositLock storage d = l.depositLocks[receiver];

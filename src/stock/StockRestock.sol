@@ -125,7 +125,8 @@ library StockRestock {
 
     /// @notice Close the open order on what has arrived. Anyone, any time:
     /// - stock at least the order's (a buy delivered, a sell refunded): booked, and moved into claims;
-    /// - else cash at least the order's (a sell paid at its limit or better, a buy refunded): booked.
+    /// - else cash at least the order's (a sell paid at its limit or better, a buy refunded): booked, and
+    ///   moved into claims.
     /// A refund, either way, gives back what the order counted against the daily cap.
     function settle(StockState storage s, StockContext memory ctx) external {
         if (!s.orderOpen) revert RestockUnavailable();
@@ -135,8 +136,7 @@ library StockRestock {
         if (surplus >= s.orderStock) {
             s.stockBooked += surplus;
             s.orderOpen = false;
-            uint256 tokens = IERC20(Currency.unwrap(ctx.stock)).balanceOf(address(this));
-            if (tokens != 0) StockLib.lock(ctx, StockLib.OP_TO_CLAIMS, ctx.stock, tokens);
+            StockLib.intoClaims(ctx, ctx.stock);
             if (sell) {
                 StockLib.uncountRestock(s, s.orderWindow, s.orderCounted);
                 emit RestockRefunded(true, s.orderStock);
@@ -146,6 +146,7 @@ library StockRestock {
         } else if (cashIn >= s.orderCash) {
             s.cashBooked += cashIn;
             s.orderOpen = false;
+            StockLib.intoClaims(ctx, ctx.cash);
             if (sell) {
                 emit Restocked(true, s.orderStock, cashIn);
             } else {
@@ -168,13 +169,18 @@ library StockRestock {
         s.orderOpen = false;
         emit RestockLapsed(s.orderSell, s.orderSell ? s.orderStock : s.orderCash);
         _bookWindfalls(s, ctx);
+        StockLib.intoClaims(ctx, ctx.stock);
+        StockLib.intoClaims(ctx, ctx.cash);
     }
 
     /// @notice Book stock and cash that arrived with no order open (a late leg of a lapsed order, an
-    /// in-kind dividend, a donation). Refused while an order is open, which its own legs settle first.
+    /// in-kind dividend, a donation), into claims. Refused while an order is open, which its own legs
+    /// settle first.
     function syncWindfall(StockState storage s, StockContext memory ctx) external {
         if (s.orderOpen) revert OrderOpen();
         _bookWindfalls(s, ctx);
+        StockLib.intoClaims(ctx, ctx.stock);
+        StockLib.intoClaims(ctx, ctx.cash);
     }
 
     function _bookWindfalls(StockState storage s, StockContext memory ctx) private {
