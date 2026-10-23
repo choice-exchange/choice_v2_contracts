@@ -15,6 +15,7 @@ import {Fill, StockConfig, StockContext, StockState, SwapRequest} from "./StockT
 /// by DELEGATECALL, as the vault.
 library StockOps {
     using SafeCast for uint256;
+    using SafeCast for int256;
 
     uint256 internal constant BPS = 10_000;
 
@@ -40,8 +41,8 @@ library StockOps {
     // -------------------------------------------------------------------------------------
 
     /// @notice Settle a priced fill in claims and book it: the input minted to the vault, the output
-    /// burned from its claims, both ledgers, the outflow window, and the anchor (a fill on a
-    /// live price is a fresh anchor; a frozen weekend price is not).
+    /// burned from its claims, both ledgers, the flow buckets and closed-period count, and the anchor (a
+    /// fill on a live price is a fresh anchor; a frozen weekend price is not).
     function applyFill(
         StockConfig storage c,
         StockState storage s,
@@ -58,16 +59,34 @@ library StockOps {
             ? (s.stockBooked - f.amountOut, s.cashBooked + f.amountIn)
             : (s.stockBooked + f.amountIn, s.cashBooked - f.amountOut);
         uint256 outValue = w.cashIn ? StockLib.stockToCash(ctx, f.amountOut, f.price, Math.Rounding.Ceil) : f.amountOut;
-        if (block.timestamp >= uint256(s.windowStart) + c.window) {
-            s.windowStart = uint64(block.timestamp);
-            s.windowUsed = 0;
-        }
-        s.windowUsed += outValue.toUint96();
+        _countFlow(c, s, ctx, w.cashIn, f.closed, outValue);
         if (!f.closed) {
             s.anchorPrice = f.price.toUint128();
             s.jumpSince = 0;
         }
         emit Filled(sender, w.cashIn, f.amountIn, f.amountOut, f.price, f.spreadBps, f.closed);
+    }
+
+    /// @dev Count a fill's outflow in the flow buckets (`StockPricing.guards` checked it fits) and, on a
+    /// closed market, in its period's net.
+    function _countFlow(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext memory ctx,
+        bool cashIn,
+        bool closed,
+        uint256 outValue
+    ) private {
+        (uint256 gross, int256 net) = StockLib.flowNow(c, s);
+        int256 sign = cashIn ? int256(1) : int256(-1);
+        s.flowAt = uint64(block.timestamp);
+        s.grossUsed = (gross + StockLib.share(outValue, closed ? c.windowCapClosed : c.windowCap)).toUint64();
+        s.netUsed = (net + sign * StockLib.share(outValue, c.netCap).toInt256()).toInt64();
+        if (closed) {
+            (, uint256 start) = ctx.calendar.sessionAt(block.timestamp);
+            s.closedNet = (StockLib.closedNetNow(c, s, ctx, start) + sign * outValue.toInt256()).toInt128();
+            s.closedStart = uint64(start);
+        }
     }
 
     // -------------------------------------------------------------------------------------
@@ -126,6 +145,16 @@ library StockOps {
         if (c.hedgeSlippageBps > StockLib.MAX_HEDGE_SLIPPAGE || c.restockSlippageBps > StockLib.MAX_RESTOCK_SLIPPAGE) {
             revert StockLib.BadConfig();
         }
+        if (c.scarcityBps > StockLib.MAX_SPREAD_LIMIT) revert StockLib.BadConfig();
+        // Every cap one trade is promised must be reachable: the flow caps hold at least a trade, the
+        // closed ones are no wider than the open ones, and a full trade from inside the hedge band
+        // leaves no more unhedged than allowed.
+        if (
+            c.maxTrade > c.netCap || c.netCap > c.windowCap || c.maxTradeClosed > c.maxTrade
+                || c.windowCapClosed > c.windowCap || c.maxTradeClosed > c.windowCapClosed
+                || c.maxTradeClosed > c.closedNetCap
+        ) revert StockLib.BadConfig();
+        if (uint256(c.maxTrade) + c.hedgeBand > c.maxUnhedged) revert StockLib.BadConfig();
         if (c.navJumpBps == 0 || c.navJumpBps > StockLib.MAX_NAV_JUMP) revert StockLib.BadConfig();
         if (c.leverageX10 < StockLib.MIN_LEVERAGE_X10 || c.leverageX10 > StockLib.MAX_LEVERAGE_X10) {
             revert StockLib.BadConfig();

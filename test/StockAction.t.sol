@@ -195,7 +195,7 @@ contract StockActionTest is StockVaultHarness {
         MockStockExchange.Order memory o = exchange.pending(0);
         assertEq(o.quantity, 120e18);
         assertEq(o.marketID, NEW_MARKET);
-        assertEq(o.worstPrice, 74.55e18, "the worst price is per share: 75 less 60bp");
+        assertEq(o.worstPrice, 74.92e18, "the worst price is per share: 75 less 10bp");
         vm.roll(block.number + 1);
         exchange.endBlock(75e18);
         x.confirmHedge();

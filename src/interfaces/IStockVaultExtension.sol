@@ -8,6 +8,7 @@ import {
     FixingRequest,
     IssuerQuote,
     RedeemEpoch,
+    Refusal,
     StockConfig,
     StockContext,
     StockState
@@ -31,6 +32,7 @@ interface IStockVaultExtension {
     function quoteSigner() external view returns (address);
     function registry() external view returns (address);
     function restockMemo() external view returns (bytes memory);
+    function room(bool cashIn, bytes calldata hookData) external view returns (uint256 maxCash, Refusal binding);
     function actionPending() external view returns (bool);
     function pendingRedeemRequest(uint256 requestId, address controller) external view returns (uint256);
     function claimableRedeemRequest(uint256 requestId, address controller) external view returns (uint256);

@@ -203,15 +203,17 @@ contract StockMakerTest is StockVaultHarness {
     function test_exposureCountsWhatTheRestingOrderMayStillFill() public {
         StockConfig memory c = _cfg();
         c.makerTimeout = TIMEOUT;
-        c.maxUnhedged = 200e6;
+        _unhedgedCap(c, 400e6);
         _setCfg(c);
         _place(300.5e18);
-        // If the order fills, selling one more STOCK leaves the vault short one it does not hold.
+        // If the order fills, each STOCK sold leaves the vault short one it does not hold: one (300) is
+        // within the cap, a second (600) is not.
+        _swap(true, false, 1 ether);
         _expectRefusal(Refusal.Unhedged);
         _swap(true, false, 1 ether);
         vm.prank(KEEPER);
         x.cancelMaker();
         _swap(true, false, 1 ether);
-        assertEq(x.state().stockBooked, 29 ether);
+        assertEq(x.state().stockBooked, 28 ether);
     }
 }

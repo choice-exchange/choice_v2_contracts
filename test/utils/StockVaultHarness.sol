@@ -163,7 +163,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
         return new PriceStore(OWNER, vm.addr(SIGNER_KEY), type(uint64).max);
     }
 
-    function _cfg() internal pure returns (StockConfig memory) {
+    function _cfg() internal pure virtual returns (StockConfig memory) {
         return StockConfig({
             spreadRegular: 25,
             spreadExtended: 40,
@@ -213,8 +213,20 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
             minRedeem: 10e6,
             qtyTick: 1e15,
             priceTick: 1e16,
-            depositLock: 0
+            depositLock: 0,
+            scarcityBps: 0,
+            netCap: 20_000e6,
+            closedNetCap: 3_000e6,
+            scarcityReserve: 0
         });
+    }
+
+    /// Set `maxUnhedged`, lowering the trade caps with it so a full trade from inside the band still fits
+    /// (`StockOps.checkConfig`).
+    function _unhedgedCap(StockConfig memory c, uint96 maxUnhedged) internal pure {
+        c.maxUnhedged = maxUnhedged;
+        if (c.maxTrade + c.hedgeBand > maxUnhedged) c.maxTrade = maxUnhedged - c.hedgeBand;
+        if (c.maxTradeClosed > c.maxTrade) c.maxTradeClosed = c.maxTrade;
     }
 
     function _setCfg(StockConfig memory c) internal {

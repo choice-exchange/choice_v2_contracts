@@ -25,6 +25,8 @@ library StockLib {
 
     IExchangeDerivatives internal constant EXCHANGE = IExchangeDerivatives(0x0000000000000000000000000000000000000065);
     uint256 internal constant BPS = 10_000;
+    /// @dev A full flow bucket (`flowNow`).
+    uint256 internal constant FULL = 1e18;
 
     // Pause flags.
     uint8 internal constant PAUSE_FILLS = 1;
@@ -113,8 +115,7 @@ library StockLib {
         returns (Reference memory r)
     {
         (r.session, r.sessionStart) = ctx.calendar.sessionAt(block.timestamp);
-        r.closed = r.session == MarketCalendar.Session.Closed
-            || (r.session == MarketCalendar.Session.Overnight && !c.overnightLive);
+        r.closed = closedFor(c, r.session);
         r.sharePrice = inCash(ctx, toWad(p.price, p.exponent), MAX_CASH_AGE_MS);
         r.price = perToken(ctx, r.sharePrice);
         if (r.price == 0) {
@@ -230,8 +231,51 @@ library StockLib {
     // Helpers
     // -------------------------------------------------------------------------------------
 
-    function windowUsedNow(StockConfig storage c, StockState storage s) internal view returns (uint256) {
-        return block.timestamp >= uint256(s.windowStart) + c.window ? 0 : s.windowUsed;
+    /// @dev The flow buckets as they stand now. Each drains its whole cap over `window`, continuously: no
+    /// moment resets one, so there is no edge to time a burst against, and keeping one full costs its
+    /// spread for as long as it is kept full.
+    /// @return gross the share of the gross cap in force that is used (`FULL` = full)
+    /// @return net the share of `netCap` used, buys (stock out) up and sells down, draining toward zero
+    function flowNow(StockConfig storage c, StockState storage s) internal view returns (uint256 gross, int256 net) {
+        uint256 drained = (block.timestamp - s.flowAt) * FULL / c.window;
+        gross = s.grossUsed > drained ? s.grossUsed - drained : 0;
+        net = s.netUsed;
+        if (abs(net) <= drained) net = 0;
+        else net = net > 0 ? net - drained.toInt256() : net + drained.toInt256();
+    }
+
+    /// @dev `value` as a share of `cap`: what a fill adds to a bucket. Rounded down, by under a wei of a full
+    /// bucket, so a cap taken in even steps fills exactly.
+    function share(uint256 value, uint256 cap) internal pure returns (uint256) {
+        return Math.mulDiv(value, FULL, cap);
+    }
+
+    /// @dev Whether adding `added` takes a signed count further from zero and past `cap`. A fill that brings
+    /// it back toward zero always passes, however full it is.
+    function overCap(int256 used, int256 added, uint256 cap) internal pure returns (bool) {
+        uint256 next = abs(used + added);
+        return next > abs(used) && next > cap;
+    }
+
+    /// @dev The net stock value out counted for the closed period that began at `start`: zero for a period
+    /// not counted yet, unless it follows the counted one with no open session between (a weekend into an
+    /// overnight priced as closed), which makes them one period.
+    function closedNetNow(StockConfig storage c, StockState storage s, StockContext memory ctx, uint256 start)
+        internal
+        view
+        returns (int256)
+    {
+        if (s.closedStart == start) return s.closedNet;
+        if (s.closedStart == 0 || start == 0) return 0;
+        (MarketCalendar.Session before, uint256 beforeStart) = ctx.calendar.sessionAt(start - 1);
+        return closedFor(c, before) && beforeStart == s.closedStart ? s.closedNet : int256(0);
+    }
+
+    /// @dev Whether `session` is closed for this vault: the market shut, or an overnight it prices as closed.
+    function closedFor(StockConfig storage c, MarketCalendar.Session session) internal view returns (bool) {
+        return
+            session == MarketCalendar.Session.Closed
+                || (session == MarketCalendar.Session.Overnight && !c.overnightLive);
     }
 
     /// @dev The stored price per token for valuation: any age, but it must exist.

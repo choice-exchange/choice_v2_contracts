@@ -12,8 +12,8 @@ import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 /// claims, which fills pay out of.
 contract StockCashLedgerTest is StockVaultHarness {
     /// The margin the harness's first hedge posts: 30 STOCK short at 3x (3,000), plus the loss a sell
-    /// at its worst price (60 bps under the mark) would open at (54).
-    uint256 internal constant MARGIN = 3_054e6;
+    /// at its worst price (10 bps under the mark: a market hedge crosses at most `minSpread`) would open at (9).
+    uint256 internal constant MARGIN = 3_009e6;
 
     function _bank() internal view returns (uint256) {
         return cash.balanceOf(address(sv)) + _claims(cash);

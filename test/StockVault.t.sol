@@ -340,6 +340,7 @@ contract StockVaultTest is StockVaultHarness {
     function test_windowCap() public {
         StockConfig memory c = _cfg();
         c.windowCap = 6_000e6;
+        c.netCap = 6_000e6;
         _setCfg(c);
         _swap(true, true, 4_000e6);
         _expectRefusal(Refusal.Window);
@@ -375,7 +376,7 @@ contract StockVaultTest is StockVaultHarness {
 
     function test_unhedgedCapRefusesWideningOnly() public {
         StockConfig memory c = _cfg();
-        c.maxUnhedged = 9_100e6; // holding 30 (9,000) against no short
+        _unhedgedCap(c, 9_100e6); // holding 30 (9,000) against no short
         _setCfg(c);
         _expectRefusal(Refusal.Unhedged);
         _swap(false, true, 1 ether);
@@ -385,7 +386,7 @@ contract StockVaultTest is StockVaultHarness {
     function test_aPendingHedgeCountsBothWays() public {
         _hedge(PRICE); // short 30, flat
         StockConfig memory c = _cfg();
-        c.maxUnhedged = 700e6;
+        _unhedgedCap(c, 700e6);
         _setCfg(c);
         vm.roll(block.number + 1);
         _swap(false, true, 1 ether); // long 1 (300): within the cap
@@ -546,7 +547,7 @@ contract StockVaultTest is StockVaultHarness {
     function test_theTargetShortIsCappedByTheUnhedgedLimit() public {
         StockConfig memory c = _cfg();
         c.targetInventory = 30_000e6; // 100 at 300, holding 30
-        c.maxUnhedged = 1_500e6;
+        _unhedgedCap(c, 1_500e6);
         _setCfg(c);
         // The restock would close 21,000 of gap; the short runs at most 1,500 (5) ahead of the holding.
         assertEq(sv.hedgeGap(), 35 ether);
@@ -565,7 +566,7 @@ contract StockVaultTest is StockVaultHarness {
         assertEq(sv.hedgeGap(), 0);
         _weekendPrice(); // the issuer does not fill at the weekend
         assertEq(sv.hedgeGap(), 0, "the pre-short stays");
-        c.maxUnhedged = 1_500e6; // 5 at 300: now it may run only 5 ahead of the 20 held
+        _unhedgedCap(c, 1_500e6); // 5 at 300: now it may run only 5 ahead of the 20 held
         _setCfg(c);
         assertEq(sv.hedgeGap(), -5 ether);
         vm.prank(GUARDIAN);
@@ -584,7 +585,7 @@ contract StockVaultTest is StockVaultHarness {
         c.restockDailyCap = 1_500e6; // now only 5 can come today
         _setCfg(c);
         assertEq(sv.hedgeGap(), 0, "the 10 already on is kept");
-        c.maxUnhedged = 1_500e6;
+        _unhedgedCap(c, 1_500e6);
         _setCfg(c);
         assertEq(sv.hedgeGap(), -5 ether, "past the most it may run ahead");
     }
@@ -631,9 +632,9 @@ contract StockVaultTest is StockVaultHarness {
         MockStockExchange.Order memory o = exchange.pending(0);
         assertFalse(o.isBuy);
         assertEq(o.quantity, 30 ether);
-        assertEq(o.worstPrice, 298.2e18); // 300 less 60 bp, on the 0.01 tick
-        // Initial margin at the mark (the higher price), plus the 1.80 a share the order opens under it.
-        assertEq(o.margin, Math.mulDiv(30 ether, PRICE, 1e18) * 10 / 30 + Math.mulDiv(30 ether, 1.8e18, 1e18));
+        assertEq(o.worstPrice, 299.7e18); // 300 less 10 bp, on the 0.01 tick
+        // Initial margin at the mark (the higher price), plus the 0.30 a share the order opens under it.
+        assertEq(o.margin, Math.mulDiv(30 ether, PRICE, 1e18) * 10 / 30 + Math.mulDiv(30 ether, 0.3e18, 1e18));
     }
 
     function test_aDroppedHedgeIsReadBackAsNothing() public {

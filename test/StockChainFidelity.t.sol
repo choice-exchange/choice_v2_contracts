@@ -32,6 +32,12 @@ contract StockChainFidelityTest is StockVaultHarness {
         exchange.setBook(299.5e18, 300.5e18);
     }
 
+    /// A market hedge crosses at most `minSpread`, so it has to cover the book's 17 bp half-spread.
+    function _cfg() internal pure override returns (StockConfig memory c) {
+        c = super._cfg();
+        c.minSpread = 20;
+    }
+
     function _hedgeAt(uint256 n, uint256 fillPrice) internal {
         vm.prank(KEEPER);
         assertTrue(x.syncHedge());
@@ -279,15 +285,24 @@ contract StockChainFidelityTest is StockVaultHarness {
 
     /// The exchange refuses a market order that does not cross the book at placement. Anyone's hedge may
     /// cross only the vault's narrowest spread, so inside a wider book it cannot go out: the keeper's can.
-    function test_aStrangersHedgeInsideAWideBookIsRefused() public {
+    /// A market hedge crosses at most `minSpread`, the keeper's as much as anyone's: in a book wider than
+    /// that nobody's goes through, until the spread the vault charges covers crossing it.
+    function test_aHedgeInsideABookWiderThanTheSpreadIsRefused() public {
         uint256 n = block.number;
         _hedgeAt(n, 299.5e18);
         vm.warp(block.timestamp + 301);
         _price(MANTISSA);
         vm.roll(n + 2);
         _swap(false, true, 3 ether);
+        exchange.setBook(299.3e18, 300.7e18); // 23 bp a side
         vm.expectRevert(bytes("slippage exceeds worst price"));
         x.syncHedge();
+        vm.prank(KEEPER);
+        vm.expectRevert(bytes("slippage exceeds worst price"));
+        x.syncHedge();
+        StockConfig memory c = _cfg();
+        c.minSpread = 25;
+        _setCfg(c);
         vm.prank(KEEPER);
         assertTrue(x.syncHedge());
     }
@@ -298,7 +313,7 @@ contract StockChainFidelityTest is StockVaultHarness {
         uint256 n = block.number;
         _hedgeAt(n, 299.5e18);
         vm.roll(n + 2);
-        _minHedge(1_195_000); // 0.004 a share is 1.20 at the reference, 1.1928 at the worst
+        _minHedge(1_199_000); // 0.004 a share is 1.20 at the reference, 1.1976 at the worst
         _swap(false, true, 0.004 ether);
         vm.prank(KEEPER);
         assertFalse(x.syncHedge(), "under the minimum at the worst price");
@@ -413,11 +428,11 @@ contract StockCashFeedTest is StockVaultHarness {
         s.update(LazerBuilder.one(SIGNER_KEY, ts, LazerBuilder.Feed(CASH_FEED, 99_000_000, -8, 0, ts, 0, 0, -1)));
     }
 
-    /// 300 USD at 0.99 USD a cash unit is 303.03 in cash; the keeper's sell may go 60 bps under that.
+    /// 300 USD at 0.99 USD a cash unit is 303.03 in cash; the keeper's sell may go 10 bps under that.
     function test_theStockIsPricedInTheCashNotInUsd() public {
         vm.prank(KEEPER);
         assertTrue(x.syncHedge());
-        assertEq(exchange.pending(0).worstPrice, 301.21e18);
+        assertEq(exchange.pending(0).worstPrice, 302.72e18);
     }
 
     /// The fixing lane prices its tick in the cash too, with the cash's price from the same update, so the

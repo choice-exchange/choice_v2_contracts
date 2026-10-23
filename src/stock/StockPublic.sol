@@ -18,6 +18,7 @@ import {
     FixingRequest,
     IssuerQuote,
     RedeemEpoch,
+    Refusal,
     StockConfig,
     StockContext,
     StockLayout,
@@ -109,6 +110,20 @@ contract StockPublic is StockModule {
 
     function restockMemo() external view delegated returns (bytes memory) {
         return StockStorage.layout().restockMemo;
+    }
+
+    /// @notice The largest fill on one side that passes every guard now, as its cash leg (cash in for a
+    /// buy, `cashIn`; cash out for a sell), and the refusal one unit more meets; zero and the reason when
+    /// nothing fills. `hookData` is what the swap would carry: a signed update, or empty for the stored
+    /// price. See `StockPricing.room`.
+    function room(bool cashIn, bytes calldata hookData)
+        external
+        view
+        delegated
+        returns (uint256 maxCash, Refusal binding)
+    {
+        StockLayout storage l = StockStorage.layout();
+        return StockPricing.room(l.config, l.state, l.ctx, cashIn, hookData);
     }
 
     /// @notice Whether a corporate action is pending: halted, or a ratio announced but not accepted.
