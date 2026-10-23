@@ -228,7 +228,7 @@ contract StockReviewFixesTest is StockVaultHarness {
     /// short last confirmed.
     function test_aLiquidationCountsBeforeAnyoneConfirmsIt() public {
         StockConfig memory c = _cfg();
-        c.maxUnhedged = 5_000e6;
+        _unhedgedCap(c, 5_000e6);
         _setCfg(c);
         _hedge(PRICE); // short 30: the holding is hedged
         assertEq(uint256(sv.quoteFill(false, 1 ether, true, "").reason), uint256(Refusal.None));

@@ -160,7 +160,7 @@ contract DeployStockVaultRehearsal is BaseScript {
             windowCapClosed: 10e6,
             maxInventory: 50e6,
             targetInventory: 0,
-            maxUnhedged: 10e6,
+            maxUnhedged: 25e6,
             hedgeBand: 2e6,
             minHedge: 1e6,
             cashReserve: 0,
@@ -169,7 +169,11 @@ contract DeployStockVaultRehearsal is BaseScript {
             minRedeem: 1e6,
             qtyTick: 1e15,
             priceTick: 1e16,
-            depositLock: 5 minutes
+            depositLock: 5 minutes,
+            scarcityBps: 0,
+            netCap: 40e6,
+            closedNetCap: 10e6,
+            scarcityReserve: 0
         });
     }
 

@@ -397,9 +397,9 @@ contract StockFixingTest is StockVaultHarness {
         vm.prank(OWNER);
         sv.withdraw(9_000e6, OWNER, OWNER);
         // 1,000 of its own cash left against 30 STOCK to hedge at 1x: 9,000 of margin at the mark
-        // plus 54 for the order opening 1.80 under it, plus 1% for the fee.
+        // plus 9 for the order opening 0.30 under it, plus 1% for the fee.
         vm.prank(KEEPER);
-        vm.expectRevert(abi.encodeWithSelector(StockLib.CashShort.selector, 9_144_540_001, 1_000e6));
+        vm.expectRevert(abi.encodeWithSelector(StockLib.CashShort.selector, 9_099_090_001, 1_000e6));
         x.syncHedge();
         assertEq(x.state().cashOwed, 50_000e6);
     }

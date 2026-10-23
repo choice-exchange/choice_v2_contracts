@@ -43,46 +43,108 @@ library StockPricing {
         StockContext memory ctx,
         SwapRequest memory w,
         bytes calldata hookData
-    ) external view returns (Fill memory f) {
-        if (s.paused & StockLib.PAUSE_FILLS != 0) return _refuse(f, Refusal.Paused);
-        if (!s.poolRegistered) return _refuse(f, Refusal.Disabled);
-        Reference memory r = StockLib.referencePrice(c, ctx, pickPrice(ctx, hookData));
+    ) external view returns (Fill memory) {
+        return _fill(c, s, ctx, w, _reference(c, s, ctx, hookData));
+    }
+
+    /// @notice The largest fill on one side that passes every guard now, as its cash leg (the cash paid
+    /// in for a buy, `cashIn`, or paid out for a sell), and the refusal a fill one unit larger meets: what
+    /// a router sizes to, since a refusal reverts the whole swap. Zero, and the reason, when nothing
+    /// fills. The swap's own price limit is not applied.
+    function room(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext memory ctx,
+        bool cashIn,
+        bytes calldata hookData
+    ) external view returns (uint256 maxCash, Refusal binding) {
+        Reference memory r = _reference(c, s, ctx, hookData);
+        // The cash leg is the amount named: exact input on a buy, exact output on a sell.
+        SwapRequest memory w =
+            SwapRequest({cashIn: cashIn, exactInput: cashIn, zeroForOne: false, sqrtPriceLimitX96: 0, amount: 1});
+        binding = _fill(c, s, ctx, w, r).reason;
+        if (binding != Refusal.None) return (0, binding);
+        // Every guard refuses from some size up and passes below it, so the largest size that passes is a
+        // bisection between one unit and the trade cap.
+        uint256 lo = 1;
+        uint256 hi = r.closed ? c.maxTradeClosed : c.maxTrade;
+        w.amount = hi;
+        binding = _fill(c, s, ctx, w, r).reason;
+        if (binding == Refusal.None) return (hi, Refusal.Size);
+        while (hi - lo > 1) {
+            w.amount = (lo + hi) / 2;
+            Refusal reason = _fill(c, s, ctx, w, r).reason;
+            if (reason == Refusal.None) lo = w.amount;
+            else (hi, binding) = (w.amount, reason);
+        }
+        return (lo, binding);
+    }
+
+    /// @dev The reference a fill prices off, and the reason no fill of any size may, when there is one:
+    /// paused, no pool, the price unusable, a closed market without weekend fills, a jump from the anchor,
+    /// or stock gone missing.
+    function _reference(StockConfig storage c, StockState storage s, StockContext memory ctx, bytes calldata hookData)
+        private
+        view
+        returns (Reference memory r)
+    {
+        if (s.paused & StockLib.PAUSE_FILLS != 0) {
+            r.reason = Refusal.Paused;
+        } else if (!s.poolRegistered) {
+            r.reason = Refusal.Disabled;
+        } else {
+            r = StockLib.referencePrice(c, ctx, pickPrice(ctx, hookData));
+            if (r.reason != Refusal.None) return r;
+            if (r.closed && !c.weekendFills) {
+                r.reason = Refusal.Closed;
+            } else if (s.anchorPrice != 0 && StockLib.deviationBps(r.price, s.anchorPrice) > c.maxJumpBps) {
+                r.reason = Refusal.Jump;
+            } else if (StockLib.ownStock(s, ctx) < s.stockBooked) {
+                r.reason = Refusal.Deficit;
+            }
+        }
+    }
+
+    /// @dev The fill for one swap at `r`, or the reason there is none.
+    function _fill(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext memory ctx,
+        SwapRequest memory w,
+        Reference memory r
+    ) private view returns (Fill memory f) {
         f.price = r.price;
         f.closed = r.closed;
         if (r.reason != Refusal.None) return _refuse(f, r.reason);
-        if (r.closed && !c.weekendFills) return _refuse(f, Refusal.Closed);
-        if (s.anchorPrice != 0 && StockLib.deviationBps(r.price, s.anchorPrice) > c.maxJumpBps) {
-            return _refuse(f, Refusal.Jump);
-        }
-        if (StockLib.ownStock(s, ctx) < s.stockBooked) return _refuse(f, Refusal.Deficit);
 
         uint256 scale = 10 ** (uint256(ctx.stockDecimals) + 18 - ctx.cashDecimals);
         (uint256 maxTrade, uint256 windowCap) =
             r.closed ? (uint256(c.maxTradeClosed), uint256(c.windowCapClosed)) : (c.maxTrade, c.windowCap);
-        uint256 used = StockLib.windowUsedNow(c, s);
-        {
-            // The size terms read the trade at the reference price, before the spread is known.
-            uint256 cashEstimate = w.cashIn == w.exactInput ? w.amount : Math.mulDiv(w.amount, r.price, scale);
-            f.spreadBps = spread(c, s, r, cashEstimate, used, maxTrade, windowCap);
-        }
+        (uint256 gross, int256 net) = StockLib.flowNow(c, s);
+        // The size terms read the trade at the reference price, before the spread is known.
+        uint256 cashEstimate = w.cashIn == w.exactInput ? w.amount : Math.mulDiv(w.amount, r.price, scale);
+        f.spreadBps = spread(c, s, r, cashEstimate, gross, maxTrade, windowCap);
         if (f.spreadBps > c.maxSpread) return _refuse(f, Refusal.Spread);
 
+        // The lean and the scarcity premium sit outside the spread, so neither ever refuses a fill.
         int256 lean = skew(c, s, ctx, r.price);
+        uint256 scarce = scarcity(c, s, ctx, w.cashIn, r.price, cashEstimate);
         if (w.cashIn) {
             // forge-lint: disable-next-line(unsafe-typecast) - |lean| < minSpread <= spread.
-            uint256 up = uint256(int256(StockLib.BPS + f.spreadBps) + lean);
+            uint256 up = uint256(int256(StockLib.BPS + f.spreadBps + scarce) + lean);
             uint256 ask = Math.mulDiv(r.price, up, StockLib.BPS, Math.Rounding.Ceil);
             (f.amountIn, f.amountOut) = w.exactInput
                 ? (w.amount, Math.mulDiv(w.amount, scale, ask))
                 : (Math.mulDiv(w.amount, ask, scale, Math.Rounding.Ceil), w.amount);
         } else {
-            // forge-lint: disable-next-line(unsafe-typecast) - |lean| < minSpread <= spread < StockLib.BPS.
-            uint256 bid = r.price * uint256(int256(StockLib.BPS - f.spreadBps) + lean) / StockLib.BPS;
+            // forge-lint: disable-next-line(unsafe-typecast) - |lean| < minSpread <= spread, and spread +
+            // scarce <= 2 * MAX_SPREAD_LIMIT < StockLib.BPS.
+            uint256 bid = r.price * uint256(int256(StockLib.BPS - f.spreadBps - scarce) + lean) / StockLib.BPS;
             (f.amountIn, f.amountOut) = w.exactInput
                 ? (w.amount, Math.mulDiv(w.amount, bid, scale))
                 : (Math.mulDiv(w.amount, scale, bid, Math.Rounding.Ceil), w.amount);
         }
-        Refusal g = guards(c, s, ctx, w, f, maxTrade, windowCap, used);
+        Refusal g = guards(c, s, ctx, w, f, r.sessionStart, maxTrade, windowCap, gross, net);
         if (g != Refusal.None) return _refuse(f, g);
     }
 
@@ -109,7 +171,7 @@ library StockPricing {
         StockState storage s,
         Reference memory r,
         uint256 cashEstimate,
-        uint256 used,
+        uint256 gross,
         uint256 maxTrade,
         uint256 windowCap
     ) internal view returns (uint256 bps) {
@@ -130,28 +192,43 @@ library StockPricing {
             bps += Math.mulDiv(c.sizeBps, Math.min(cashEstimate, maxTrade), maxTrade, Math.Rounding.Ceil);
         }
         if (windowCap != 0) {
-            bps += Math.mulDiv(c.windowBps, Math.min(used + cashEstimate, windowCap), windowCap, Math.Rounding.Ceil);
+            uint256 fullAfter = Math.min(gross + StockLib.share(cashEstimate, windowCap), StockLib.FULL);
+            bps += Math.mulDiv(c.windowBps, fullAfter, StockLib.FULL, Math.Rounding.Ceil);
         }
         if (block.timestamp < s.widenUntil) bps += s.widenBps;
         if (block.timestamp < s.wideUntil) bps += c.reanchorBps;
         if (bps < c.minSpread) bps = c.minSpread;
     }
 
-    /// @dev Every guard a priced fill must pass. A failure is a refusal, never a revert.
+    /// @dev Every guard a priced fill must pass. A failure is a refusal, never a revert. The flow caps
+    /// count the value out, stock at the fill price or cash: the gross one every fill, the net one buys
+    /// against sells, and on a closed market the period's net, which no window resets.
     function guards(
         StockConfig storage c,
         StockState storage s,
         StockContext memory ctx,
         SwapRequest memory w,
         Fill memory f,
+        uint256 sessionStart,
         uint256 maxTrade,
         uint256 windowCap,
-        uint256 used
+        uint256 gross,
+        int256 net
     ) internal view returns (Refusal) {
         uint256 cashLeg = w.cashIn ? f.amountIn : f.amountOut;
         if (f.amountIn == 0 || f.amountOut == 0 || cashLeg > maxTrade) return Refusal.Size;
         uint256 outValue = w.cashIn ? StockLib.stockToCash(ctx, f.amountOut, f.price, Math.Rounding.Ceil) : f.amountOut;
-        if (used + outValue > windowCap) return Refusal.Window;
+        if (gross + StockLib.share(outValue, windowCap) > StockLib.FULL) return Refusal.Window;
+        int256 sign = w.cashIn ? int256(1) : int256(-1);
+        if (StockLib.overCap(net, sign * StockLib.share(outValue, c.netCap).toInt256(), StockLib.FULL)) {
+            return Refusal.Net;
+        }
+        if (
+            f.closed
+                && StockLib.overCap(
+                    StockLib.closedNetNow(c, s, ctx, sessionStart), sign * outValue.toInt256(), c.closedNetCap
+                )
+        ) return Refusal.ClosedNet;
         // Fills pay out of claims only.
         if (ctx.vault.balanceOf(address(this), w.cashIn ? ctx.stock : ctx.cash) < f.amountOut) {
             return Refusal.Inventory;
@@ -217,6 +294,33 @@ library StockPricing {
         int256 deviation = (target - held.toInt256()) * bps / target;
         if (deviation < -bps) deviation = -bps;
         return deviation * uint256(c.skewBps).toInt256() / bps;
+    }
+
+    /// @dev The scarcity premium in bps: zero while what a fill leaves of the side it takes (the stock, at the
+    /// reference, for a buy; the cash free to spend, for a sell) is at least `scarcityReserve`, then rising
+    /// linearly to `scarcityBps` at none left. The last of either side stays fillable, but dear, so
+    /// emptying the vault costs more the emptier it gets.
+    function scarcity(
+        StockConfig storage c,
+        StockState storage s,
+        StockContext memory ctx,
+        bool cashIn,
+        uint256 price,
+        uint256 cashEstimate
+    ) internal view returns (uint256) {
+        uint256 reserve = c.scarcityReserve;
+        if (reserve == 0 || c.scarcityBps == 0) return 0;
+        uint256 held;
+        if (cashIn) {
+            held = StockLib.stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor);
+        } else {
+            uint256 own = StockLib.ownCash(s, ctx);
+            uint256 kept = StockLib.cashKept(c, s);
+            held = own > kept ? own - kept : 0;
+        }
+        uint256 left = held > cashEstimate ? held - cashEstimate : 0;
+        if (left >= reserve) return 0;
+        return Math.mulDiv(c.scarcityBps, reserve - left, reserve, Math.Rounding.Ceil);
     }
 
     /// @dev The swapper's price limit, applied to the fill's own rate. A limit at either end of

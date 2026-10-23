@@ -67,6 +67,11 @@ struct StockConfig {
     uint64 priceTick;
     // -- exits
     uint32 depositLock; // how long the shares a deposit mints stay with their receiver; zero = off
+    // -- flow and scarcity (last, so every field above keeps its ABI word)
+    uint16 scarcityBps; // added to the ask as the stock left falls under `scarcityReserve`, and taken off the bid as free cash does; in full at none left
+    uint96 netCap; // the net bucket: stock value out less cash out, draining over `window`; between `maxTrade` and `windowCap`
+    uint96 closedNetCap; // net stock value out, either way, over one closed period
+    uint96 scarcityReserve; // zero = no scarcity premium
 }
 
 /// @notice What a stock vault keeps between calls.
@@ -98,6 +103,12 @@ struct StockConfig {
 /// @param positionLost the short was found gone with no order of the vault's to explain it (a
 /// liquidation, a forced settlement, or a market paused, whose positions the exchange does not list):
 /// no share is priced, and no market migration, until the owner has looked and accepted the NAV
+/// @param flowAt when the flow buckets were last brought up to date. Each drains its whole cap over
+/// `window`, continuously, so no moment resets one (see `StockLib.flowNow`).
+/// @param grossUsed the gross bucket's fill, as a share of the gross cap in force (`StockLib.FULL` = full)
+/// @param netUsed the net bucket's fill, as a share of `netCap`: buys (stock out) up, sells down
+/// @param closedStart the closed period `closedNet` counts in, by its start
+/// @param closedNet net stock value out over that period, cash units: buys up, sells down
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -110,8 +121,9 @@ struct StockState {
     uint64 wideUntil;
     uint64 widenUntil;
     uint16 widenBps;
-    uint64 windowStart;
-    uint96 windowUsed;
+    uint64 flowAt;
+    uint64 grossUsed;
+    int64 netUsed;
     uint256 stockBooked;
     int256 shortConfirmed;
     int256 pendingQty;
@@ -138,6 +150,8 @@ struct StockState {
     string cashDenom;
     uint128 jumpPrice;
     bool positionLost;
+    uint64 closedStart;
+    int128 closedNet;
 }
 
 /// @notice The shares deposits minted to one holder that may not leave it before `until`. A deposit
@@ -325,7 +339,9 @@ enum Refusal {
     Unhedged,
     Deficit,
     PriceLimit,
-    Action
+    Action,
+    Net,
+    ClosedNet
 }
 
 /// @notice Everything a stock vault stores besides its share token and owner, at one fixed slot,

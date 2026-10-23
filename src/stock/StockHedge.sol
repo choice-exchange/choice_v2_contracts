@@ -121,9 +121,10 @@ library StockHedge {
             revert HedgeTooSoon(uint256(s.lastHedgeTime) + c.publicHedgeDelay);
         }
 
-        // Anyone's hedge may cross at most the narrowest spread the vault charges, so moving the book
-        // against it costs more than it can take; the keeper's may use the full slippage.
-        uint256 slip = isKeeper ? c.hedgeSlippageBps : Math.min(c.hedgeSlippageBps, c.minSpread);
+        // Any market hedge, the keeper's too, may cross at most the narrowest spread the vault charges, so
+        // moving the book against it costs more than it can take. `hedgeSlippageBps` above that is headroom
+        // for maker orders and the emergency cover only.
+        uint256 slip = Math.min(c.hedgeSlippageBps, c.minSpread);
         uint256 worst = sell
             ? r.sharePrice * (StockLib.BPS - slip) / StockLib.BPS / c.priceTick * c.priceTick
             : Math.ceilDiv(
