@@ -119,15 +119,25 @@ contract DeployStockVaultRehearsal is BaseScript {
     }
 
     /// @notice Test caps: $100 of deposits, $50 of stock, $20 a trade, a 2x hedge.
+    /// - `minSpread` 35: every market hedge crosses at most `min(hedgeSlippageBps, minSpread)`, and the AAPL perp's
+    ///   book sat ~20-27 bp off the oracle (10-23), so at 10 no hedge could cross; 35 ran the v5 rehearsal. A
+    ///   post-market cover needed 50 (10-28). It also covers a stale price many times over: the p99 move over the
+    ///   3 s `maxAgeMs` was ~4 bp in regular hours (AAPL, keeper ticks 10-21..10-28, scaled from 30 s).
+    /// - `agePerSecondBps` 2: AAPL's p99 one-second move in regular hours, so a price's age is priced wherever a
+    ///   session spread plus it clears `minSpread`.
+    /// - Flow caps: round trips net to zero, so `netCap` bounds direction only, and `windowCap` is what a block
+    ///   fills. Each round trip counts both legs and pays the spread on both, so refusing every fill for a
+    ///   `window` costs about `minSpread` x `windowCap` (here 0.35% of $100). Size `windowCap` so that is more than
+    ///   blocking is worth, never just to the expected flow.
     function config() public pure returns (StockConfig memory) {
         return StockConfig({
             spreadRegular: 25,
             spreadExtended: 40,
             spreadOvernight: 50,
             spreadClosed: 80,
-            minSpread: 10,
+            minSpread: 35,
             maxSpread: 200,
-            agePerSecondBps: 0,
+            agePerSecondBps: 2,
             quoteMissingBps: 0,
             confidenceMissingBps: 0,
             sizeBps: 0,
