@@ -103,6 +103,8 @@ contract MockStockExchange {
     bool public enforceCross;
     uint256 public reduceMarginRatio; // 1e18 = 100%
     bool public failDecrease;
+    /// @notice Every `subaccountDeposit` reverts, as the precompile does on a negative balance.
+    bool public failSubaccountRead;
     /// @notice The most a market order fills at `endBlock` (0: all), as a thin book would leave it.
     uint256 public fillCap;
 
@@ -143,6 +145,10 @@ contract MockStockExchange {
 
     function setFailDecrease(bool fail) external {
         failDecrease = fail;
+    }
+
+    function setFailSubaccountRead(bool fail) external {
+        failSubaccountRead = fail;
     }
 
     function setMarketActive(string calldata market, bool active) external {
@@ -210,6 +216,7 @@ contract MockStockExchange {
         view
         returns (uint256 available, uint256 total)
     {
+        require(!failSubaccountRead, "negatively-signed value cannot be packed");
         if (!_isCash(denom)) return (0, 0);
         if (_isDefault(subaccountID)) {
             uint256 d = _round(int256(defaultDust[_owner(subaccountID)]));

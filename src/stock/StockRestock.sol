@@ -27,11 +27,14 @@ import {Reference, StockConfig, StockContext, StockLayout, StockState} from "./S
 ///   buy's delivery, a sell's stock refunded) or cash above `cashBooked` (a sell's payment, a buy's
 ///   refund; the short trades from its own subaccount, so only fee-share dust arrives otherwise).
 ///   Until then an arrival is out of the value, so nothing counts twice, and no share is priced before
-///   an arrived leg closes its order (`settleArrived`). An order stays open, and in the value, until one
-///   of its legs arrives: past its expiry plus `restockDeadline` the owner may write it off
-///   (`writeOff`), and what arrives later is booked as a windfall. Whatever arrived before
-///   the order is booked as one first, so only this order's own legs settle it. Faking a close takes a
-///   gift of the whole leg.
+///   an arrived leg closes its order (`settleArrived`). A close books the leg, at most
+///   `restockSlippageBps` over what the order asked for; more than that is a gift, which waits for the
+///   keeper like any windfall (`syncWindfall`), since a booked gift moves the share price and past
+///   `navJumpBps` stops every deposit and exit until the owner accepts it. An order stays open, and in
+///   the value, until one of its legs arrives: past its expiry plus `restockDeadline` the owner may write
+///   it off (`writeOff`), and what arrives later is booked as a windfall. Whatever arrived before the
+///   order is booked as one first, so only this order's own legs settle it. Faking a close takes a gift
+///   of the whole leg.
 library StockRestock {
     using SafeCast for uint256;
 
@@ -133,24 +136,28 @@ library StockRestock {
     /// - stock at least the order's (a buy delivered, a sell refunded): booked, and moved into claims;
     /// - else cash at least the order's (a sell paid at its limit or better, a buy refunded): booked, and
     ///   moved into claims.
-    /// A refund, either way, gives back what the order counted against the daily cap.
-    function settle(StockState storage s, StockContext memory ctx) external {
+    /// Either leg is booked up to `restockSlippageBps` over the order's own amount; the rest is left to
+    /// the keeper as a windfall. A refund, either way, gives back what the order counted against the
+    /// daily cap.
+    function settle(StockConfig storage c, StockState storage s, StockContext memory ctx) external {
         if (!s.orderOpen) revert RestockUnavailable();
-        if (!_close(s, ctx)) revert NotDelivered(StockLib.unbooked(s, ctx), s.orderStock);
+        if (!_close(c, s, ctx)) revert NotDelivered(StockLib.unbooked(s, ctx), s.orderStock);
     }
 
     /// @notice Close the open order as `settle` does if one of its legs has arrived, and do nothing
     /// otherwise: run before any share is priced (`StockOps.beforeNav`), so an exit is never priced off an
     /// order the issuer has already filled or refunded.
-    function settleArrived(StockState storage s, StockContext memory ctx) external {
-        if (s.orderOpen) _close(s, ctx);
+    function settleArrived(StockConfig storage c, StockState storage s, StockContext memory ctx) external {
+        if (s.orderOpen) _close(c, s, ctx);
     }
 
-    function _close(StockState storage s, StockContext memory ctx) private returns (bool) {
+    function _close(StockConfig storage c, StockState storage s, StockContext memory ctx) private returns (bool) {
         uint256 surplus = StockLib.unbooked(s, ctx);
         uint256 cashIn = StockLib.unbookedCash(s, ctx);
         bool sell = s.orderSell;
+        uint256 most = StockLib.BPS + c.restockSlippageBps;
         if (surplus >= s.orderStock) {
+            surplus = Math.min(surplus, s.orderStock * most / StockLib.BPS);
             s.stockBooked += surplus;
             s.orderOpen = false;
             StockLib.intoClaims(ctx, ctx.stock);
@@ -161,6 +168,7 @@ library StockRestock {
                 emit Restocked(false, s.orderCash, surplus);
             }
         } else if (cashIn >= s.orderCash) {
+            cashIn = Math.min(cashIn, s.orderCash * most / StockLib.BPS);
             s.cashBooked += cashIn;
             s.orderOpen = false;
             StockLib.intoClaims(ctx, ctx.cash);
@@ -192,8 +200,9 @@ library StockRestock {
     }
 
     /// @notice Book stock and cash that arrived with no order open (a late leg of a lapsed order, an
-    /// in-kind dividend, a donation), into claims. Refused while an order is open, which its own legs
-    /// settle first.
+    /// in-kind dividend, a donation, what a close left over), into claims. Refused while an order is
+    /// open, which its own legs settle first. The keeper's call (`StockPublic.syncWindfall`): a booked gift
+    /// moves the share price, and past `navJumpBps` stops every deposit and exit until the owner accepts it.
     function syncWindfall(StockState storage s, StockContext memory ctx) external {
         if (s.orderOpen) revert OrderOpen();
         _bookWindfalls(s, ctx);

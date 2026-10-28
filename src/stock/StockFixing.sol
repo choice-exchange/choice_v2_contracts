@@ -21,7 +21,8 @@ import {
     StockConfig,
     StockContext,
     StockLayout,
-    StockState
+    StockState,
+    StockStorage
 } from "./StockTypes.sol";
 
 /// @title StockFixing
@@ -173,9 +174,12 @@ library StockFixing {
         if (p.timestampUs != uint256(b.tickMs) * 1000) revert WrongTick(p.timestampUs, uint256(b.tickMs) * 1000);
         uint256 usd = StockLib.toWad(p.price, p.exponent);
         if (ctx.cashFeedId != 0) {
-            // The cash's price from the same update, so at the same tick: the settler picks no moment.
+            // The cash's price from the same update, so at the same tick: the settler picks no moment. Older
+            // than `MAX_CASH_AGE_MS` there, as on every other path, it prices nothing, and the fixing is stale.
             IPriceStore.Price memory q = ctx.store.verify(update, ctx.cashFeedId);
-            uint256 cashUsd = StockLib.toWad(q.price, q.exponent);
+            uint256 cashUsd = uint256(q.feedTimestampUs) + StockLib.MAX_CASH_AGE_MS * 1000 < q.timestampUs
+                ? 0
+                : StockLib.toWad(q.price, q.exponent);
             usd = cashUsd == 0 ? 0 : Math.mulDiv(usd, 1e18, cashUsd);
         }
         uint256 price = StockLib.perToken(ctx, usd);
@@ -299,9 +303,9 @@ library StockFixing {
         } else {
             // The vault takes stock net and pays cash. The cash out is below the net's value, and
             // hedging that value needs value * 10 / leverageX10 of margin; both must fit above the
-            // reserve.
+            // reserve and what the redeem queue waits for.
             uint256 own = StockLib.ownCash(s, ctx);
-            uint256 kept = StockLib.cashKept(c, s);
+            uint256 kept = StockLib.cashKeptQueued(StockStorage.layout());
             uint256 room = own > kept ? own - kept : 0;
             uint256 capValue = Math.min(fc.maxNet, room * c.leverageX10 / (uint256(c.leverageX10) + 10));
             uint256 heldValue = StockLib.stockToCash(ctx, StockLib.stockInventory(s), price, Math.Rounding.Ceil);

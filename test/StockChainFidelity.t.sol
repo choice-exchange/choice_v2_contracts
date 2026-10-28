@@ -268,6 +268,7 @@ contract StockChainFidelityTest is StockVaultHarness {
         // 40% of the fee, 299.5 * 30 * 0.0001%: 3,594 units to the vault's default subaccount, then its bank.
         vm.expectEmit(address(sv));
         emit StockRestock.CashWindfall(3594);
+        vm.prank(KEEPER);
         x.syncWindfall();
 
         vm.roll(n + 2);
@@ -353,6 +354,7 @@ contract StockChainFidelityTest is StockVaultHarness {
         assertEq(x.state().shortConfirmed, 0);
         (, uint256 kept) = exchange.subaccountDeposit(_sub(), CASH_DENOM);
         assertEq(kept, 1, "the subaccount keeps the unit the vault never withdraws");
+        vm.prank(KEEPER);
         x.syncWindfall(); // the relayer share of the vault's own fees, booked
 
         uint256 nav = sv.totalAssets();

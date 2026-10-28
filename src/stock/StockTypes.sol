@@ -109,6 +109,8 @@ struct StockConfig {
 /// @param netUsed the net bucket's fill, as a share of `netCap`: buys (stock out) up, sells down
 /// @param closedStart the closed period `closedNet` counts in, by its start
 /// @param closedNet net stock value out over that period, cash units: buys up, sells down
+/// @param fundingUnsettledSince when the short's funding was first refused a settlement, since the last
+/// one that went through; zero while it settles (see `StockOps.beforeNav`)
 struct StockState {
     string marketId;
     PoolId poolId;
@@ -152,6 +154,7 @@ struct StockState {
     bool positionLost;
     uint64 closedStart;
     int128 closedNet;
+    uint64 fundingUnsettledSince;
 }
 
 /// @notice The shares deposits minted to one holder that may not leave it before `until`. A deposit

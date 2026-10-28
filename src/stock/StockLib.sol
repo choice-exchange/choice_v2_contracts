@@ -92,6 +92,7 @@ library StockLib {
     error BadConfig();
     error BadMarket();
     error PositionUnreadable();
+    error SubaccountUnreadable();
     error PriceNotUsable(Refusal reason);
     error OracleMissing();
     error CashShort(uint256 needed, uint256 own);
@@ -400,9 +401,14 @@ library StockLib {
     /// what this calls free, and no withdrawal asks for more. So the subaccount always keeps a unit the
     /// vault never takes back, and the total leaves it out too: the value counts only cash that can reach
     /// the bank, or every share would claim a unit more than any cash exit can pay (mainnet 10-20: a full
-    /// exit reverted `CashShortForQueue(n, n - 1)`).
+    /// exit reverted `CashShortForQueue(n, n - 1)`). The precompile reverts on a negative balance: that is
+    /// `SubaccountUnreadable`, so nothing priced off this fails without saying why.
     function subaccountCash(StockState storage s) internal view returns (uint256 available, uint256 total) {
-        (available, total) = EXCHANGE.subaccountDeposit(subaccount(), s.cashDenom);
+        try EXCHANGE.subaccountDeposit(subaccount(), s.cashDenom) returns (uint256 a, uint256 t) {
+            (available, total) = (a, t);
+        } catch {
+            revert SubaccountUnreadable();
+        }
         if (available != 0) --available;
         if (total != 0) --total;
     }
@@ -423,8 +429,10 @@ library StockLib {
         return uint256(c.cashReserve) + s.debtOwed;
     }
 
-    /// @dev Cash a restock buy may not spend: `cashKept`, plus the open redeem epoch's value, the cash the
-    /// queue is waiting for (an instant withdrawal cannot take it either).
+    /// @dev Cash no fill, fixing, quote or restock buy may spend: `cashKept`, plus the open redeem epoch's
+    /// value, the cash the queue is waiting for (an instant withdrawal cannot take it either). Spent, it
+    /// could push the redeemers into payment in stock. Hedge margin may still draw on it: it hedges stock
+    /// already held, stays in the value, and comes back as the short is covered.
     function cashKeptQueued(StockLayout storage l) internal view returns (uint256) {
         uint256 shares = l.epochs[l.redeemEpoch].shares;
         uint256 queued = shares == 0 ? 0 : IERC4626(address(this)).convertToAssets(shares);
@@ -462,12 +470,18 @@ library StockLib {
         if (!readable) revert PositionUnreadable();
     }
 
-    /// @dev Whether the short can be valued now: the exchange reads it back, and it is not missing (gone
-    /// with no buy of the vault's to explain it, whether or not a confirmation has seen that yet).
+    /// @dev Whether the short can be valued now: the exchange reads it and its subaccount's cash back, and
+    /// it is not missing (gone with no buy of the vault's to explain it, whether or not a confirmation has
+    /// seen that yet).
     function shortValued(StockState storage s) internal view returns (bool) {
         if (s.positionLost) return false;
         (bool readable, bool found,) = readPosition(s);
-        return readable && (found || covered(s));
+        if (!readable || !(found || covered(s))) return false;
+        try EXCHANGE.subaccountDeposit(subaccount(), s.cashDenom) returns (uint256, uint256) {
+            return true;
+        } catch {
+            return false;
+        }
     }
 
     /// @dev Whether the vault's own buys could have covered the whole confirmed short: a cover from an

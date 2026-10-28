@@ -277,6 +277,7 @@ contract StockRestockTest is StockVaultHarness {
         assertEq(sv.totalAssets(), nav - 3_000e6, "written off: out of the value");
         cash.mint(address(sv), 3_000e6); // refunded late
         assertEq(sv.totalAssets(), nav - 3_000e6, "not counted until booked");
+        vm.prank(KEEPER);
         x.syncWindfall();
         assertEq(sv.totalAssets(), nav);
     }
@@ -341,6 +342,7 @@ contract StockRestockTest is StockVaultHarness {
         x.writeOffRestock(); // nothing came
         assertEq(sv.totalAssets(), nav - 3_000e6);
         stock.mint(address(sv), 10 ether); // it was refunded after all
+        vm.prank(KEEPER);
         x.syncWindfall();
         assertEq(sv.totalAssets(), nav);
     }
@@ -366,6 +368,7 @@ contract StockRestockTest is StockVaultHarness {
     function test_windfallWaitsForAnOpenOrder() public {
         _order(false, 1_000e6, 3.3 ether);
         vm.expectRevert(StockRestock.OrderOpen.selector);
+        vm.prank(KEEPER);
         x.syncWindfall();
     }
 

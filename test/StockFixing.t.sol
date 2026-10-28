@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 
+import {PriceStore} from "../src/stock/PriceStore.sol";
 import {StockFixing} from "../src/stock/StockFixing.sol";
 import {StockModule} from "../src/stock/StockModule.sol";
 import {StockLib} from "../src/stock/StockLib.sol";
@@ -179,6 +180,18 @@ contract StockFixingTest is StockVaultHarness {
         assertEq(out, Math.mulDiv(25 ether, _bidAt(PRICE, 10), 1e30));
         assertEq(x.state().stockBooked, 55 ether);
         assertGe(cash.balanceOf(address(sv)) + _claims(cash), 2_500e6);
+    }
+
+    /// A queued redeem epoch's cash is kept like the reserve (10-28 review): of 10,000, the 9,500 queued
+    /// stays, so 500 is the room, and 375 of stock comes in with 125 to margin its short.
+    function test_theSellSideIsCutToCashAboveTheQueue() public {
+        uint256 half = sv.balanceOf(OWNER) / 2;
+        vm.prank(OWNER);
+        x.requestRedeem(half, OWNER, OWNER);
+        uint256 id = _commit(SELLER, false, 40 ether);
+        _settle(MANTISSA);
+        (, uint256 refund) = x.claimFixing(id);
+        assertApproxEqAbs(refund, 38.75 ether, 1e13);
     }
 
     /// The cash a batch leaves the vault goes into claims at settlement, so fills can pay it out at once.
@@ -375,6 +388,7 @@ contract StockFixingTest is StockVaultHarness {
         _commit(SELLER, false, 5 ether);
         assertEq(sv.totalAssets(), navBefore, "escrow adds no value");
         assertEq(sv.maxWithdraw(OWNER), freeBefore, "nor free cash");
+        vm.prank(KEEPER);
         x.syncWindfall();
         assertEq(x.state().stockBooked, 30 ether, "nor stock");
     }
@@ -547,5 +561,65 @@ contract StockFixingTest is StockVaultHarness {
         assertEq(stock.balanceOf(address(sv)) + _claims(stock), stockHeld - stockPaid);
         assertEq(x.state().stockBooked, stock.balanceOf(address(sv)) + _claims(stock), "booked is what is held");
         assertGe(sv.totalAssets(), navBefore);
+    }
+}
+
+/// The fixing lane on a vault whose cash has its own feed. The cash's price comes from the tick's own
+/// update, and (10-28 review) is refused when that feed is older than `MAX_CASH_AGE_MS`, as on every
+/// other path: the stock's age was checked, the cash's was not.
+contract StockFixingCashFeedTest is StockVaultHarness {
+    uint32 internal constant CASH_FEED = 8;
+    address internal constant BUYER = address(0xB111);
+    // forge-lint: disable-next-line(unsafe-typecast) - a 2026 timestamp.
+    uint64 internal constant BOUNDARY = uint64(TUE + 16 hours);
+    uint64 internal constant TICK_US = (BOUNDARY * 1000 + 5000) * 1000;
+
+    function _cashFeed() internal pure override returns (uint32) {
+        return CASH_FEED;
+    }
+
+    function _newStore() internal override returns (PriceStore s) {
+        s = super._newStore();
+        uint64 ts = uint64(block.timestamp) * 1e6;
+        s.update(LazerBuilder.one(SIGNER_KEY, ts, LazerBuilder.Feed(CASH_FEED, 100_000_000, -8, 0, ts, 0, 0, -1)));
+    }
+
+    function setUp() public override {
+        super.setUp();
+        vm.prank(OWNER);
+        x.setFixingConfig(
+            FixingConfig({
+                interval: 3600,
+                delayMs: 5000,
+                settleWindow: 30,
+                spreadBps: 10,
+                sizeBps: 0,
+                maxSpreadBps: 100,
+                minRequest: 10e6,
+                maxSide: 100_000e6,
+                maxNet: 50_000e6
+            })
+        );
+        cash.mint(BUYER, 3_000e6);
+        vm.startPrank(BUYER);
+        cash.approve(address(sv), type(uint256).max);
+        x.commitFixing(BOUNDARY, true, 3_000e6, BUYER);
+        vm.stopPrank();
+    }
+
+    /// The tick's update, the stock current at the tick and the cash's feed stamped at `cashFeedUs`.
+    function _tick(uint64 cashFeedUs) internal pure returns (bytes memory) {
+        LazerBuilder.Feed[] memory f = new LazerBuilder.Feed[](2);
+        f[0] = LazerBuilder.Feed(FEED, MANTISSA, -5, 0, TICK_US, 0, 0, -1);
+        f[1] = LazerBuilder.Feed(CASH_FEED, 100_000_000, -8, 0, cashFeedUs, 0, 0, -1);
+        return LazerBuilder.sign(SIGNER_KEY, LazerBuilder.payload(TICK_US, f));
+    }
+
+    function test_aStaleCashFeedAtTheTickIsRefused() public {
+        vm.warp(BOUNDARY + 6);
+        vm.expectRevert(abi.encodeWithSelector(StockFixing.FixingRefused.selector, Refusal.Stale));
+        x.settleFixing(BOUNDARY, _tick(TICK_US - 60_001_000)); // a minute and a millisecond old
+        x.settleFixing(BOUNDARY, _tick(TICK_US - 60_000_000)); // a minute: accepted
+        assertTrue(x.fixingBatch(BOUNDARY).settled);
     }
 }

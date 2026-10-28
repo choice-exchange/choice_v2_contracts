@@ -19,8 +19,11 @@ library StockOps {
     using SafeCast for int256;
 
     uint256 internal constant BPS = 10_000;
+    /// @notice How long shares may be priced with the short's funding unsettled (see `beforeNav`).
+    uint256 internal constant MAX_FUNDING_UNSETTLED = 1 days;
 
     error NavNotReady();
+    error FundingStale(uint256 since);
     error IsPaused(uint8 flag);
     error NavJump(uint256 sharePrice, uint256 last);
 
@@ -104,21 +107,33 @@ library StockOps {
         }
         requireNavPrice(c, ctx);
         // A restock order whose leg has arrived closes first: open, it would still be priced as in transit.
-        if (s.orderOpen) StockRestock.settleArrived(s, ctx);
+        if (s.orderOpen) StockRestock.settleArrived(c, s, ctx);
         (bool readable, bool found,) = StockLib.readPosition(s);
         if (found || !readable) {
             // A one-unit margin decrease applies accrued funding in the same transaction and moves
             // nothing that matters. It also stamps the market's funding index on the position, and a
             // negative index makes the position unreadable (`StockLib.readPosition`): so it runs as a
             // call to the vault itself (`StockHedge.settleFunding`) that reverts, undoing it, unless the
-            // position still reads after. A refusal either way leaves funding unsettled rather than
-            // freezing every exit; and on an unreadable position this is the one move that can heal it.
+            // position still reads after. A refusal leaves funding unsettled rather than freezing every
+            // exit at once, and on an unreadable position this is the one move that can heal it. But the
+            // value then leaves out the funding accrued since (on a market whose index stays negative,
+            // every attempt is undone), so that is tolerated for `MAX_FUNDING_UNSETTLED` from the first
+            // refusal only.
             (bool ok,) = address(this).call(abi.encodeWithSignature("settleFunding()"));
-            if (!ok) emit FundingUnsettled();
-        } else if (!StockLib.covered(s)) {
+            uint256 since = s.fundingUnsettledSince;
+            if (ok) {
+                if (since != 0) s.fundingUnsettledSince = 0;
+            } else {
+                if (since == 0) s.fundingUnsettledSince = uint64(block.timestamp);
+                else if (block.timestamp > since + MAX_FUNDING_UNSETTLED) revert FundingStale(since);
+                emit FundingUnsettled();
+            }
+        } else {
             // The short is gone and nothing of the vault's covered it: a liquidation, a settlement or a
             // paused market. No share is priced before a confirmation marks it and the owner has looked.
-            revert NavNotReady();
+            if (!StockLib.covered(s)) revert NavNotReady();
+            // No short, so no funding accrues: a clock left from an earlier one stops.
+            if (s.fundingUnsettledSince != 0) s.fundingUnsettledSince = 0;
         }
     }
 

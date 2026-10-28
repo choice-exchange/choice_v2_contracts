@@ -212,11 +212,12 @@ contract StockPublic is StockModule {
     /// @notice Close the open restock order on what has arrived. Anyone. See `StockRestock.settle`.
     function settleRestock() external delegated nonReentrant {
         StockLayout storage l = StockStorage.layout();
-        StockRestock.settle(l.state, l.ctx);
+        StockRestock.settle(l.config, l.state, l.ctx);
     }
 
-    /// @notice Book stock and cash that arrived with no order open.
-    function syncWindfall() external delegated nonReentrant {
+    /// @notice Book stock and cash that arrived with no order open. The keeper only: see
+    /// `StockRestock.syncWindfall`.
+    function syncWindfall() external onlyKeeper nonReentrant {
         StockLayout storage l = StockStorage.layout();
         StockRestock.syncWindfall(l.state, l.ctx);
     }
