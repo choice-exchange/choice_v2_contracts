@@ -86,6 +86,7 @@ contract StockCashLedgerTest is StockVaultHarness {
         cash.mint(address(sv), 1_000e6);
         assertEq(sv.totalAssets(), nav);
         assertEq(sv.maxWithdraw(OWNER), free, "nor spendable");
+        vm.prank(KEEPER);
         x.syncWindfall();
         assertEq(sv.totalAssets(), nav + 1_000e6);
         assertEq(cash.balanceOf(address(sv)), 0, "booked, and into claims");

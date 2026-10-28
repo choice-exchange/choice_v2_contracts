@@ -11,7 +11,16 @@ import {IExchangeDerivatives} from "../interfaces/IExchangeDerivatives.sol";
 import {IPriceStore} from "../interfaces/IPriceStore.sol";
 import {MarketCalendar} from "./MarketCalendar.sol";
 import {StockLib} from "./StockLib.sol";
-import {Fill, Reference, Refusal, StockConfig, StockContext, StockState, SwapRequest} from "./StockTypes.sol";
+import {
+    Fill,
+    Reference,
+    Refusal,
+    StockConfig,
+    StockContext,
+    StockState,
+    StockStorage,
+    SwapRequest
+} from "./StockTypes.sol";
 
 /// @title StockPricing
 /// @notice A `StockVault`'s instant-lane pricing: the fill for a swap or the reason there is none, the
@@ -240,9 +249,11 @@ library StockPricing {
             if (StockLib.stockToCash(ctx, inventoryAfter, f.price, Math.Rounding.Ceil) > c.maxInventory) {
                 return Refusal.InventoryCap;
             }
-            // The cash left must cover the reserve plus the margin to hedge what comes in.
+            // The cash left must cover the reserve and what the redeem queue waits for, plus the margin to
+            // hedge what comes in.
             uint256 margin = StockLib.stockToCash(ctx, f.amountIn, f.price, Math.Rounding.Ceil) * 10 / c.leverageX10;
-            if (StockLib.ownCash(s, ctx) < f.amountOut + StockLib.cashKept(c, s) + margin) return Refusal.Reserve;
+            uint256 kept = StockLib.cashKeptQueued(StockStorage.layout());
+            if (StockLib.ownCash(s, ctx) < f.amountOut + kept + margin) return Refusal.Reserve;
         }
         if (_widensExposure(c, s, ctx, bookedAfter, f.price)) return Refusal.Unhedged;
         if (!withinLimit(w.zeroForOne, f.amountIn, f.amountOut, w.sqrtPriceLimitX96)) return Refusal.PriceLimit;
@@ -315,7 +326,7 @@ library StockPricing {
             held = StockLib.stockToCash(ctx, s.stockBooked, price, Math.Rounding.Floor);
         } else {
             uint256 own = StockLib.ownCash(s, ctx);
-            uint256 kept = StockLib.cashKept(c, s);
+            uint256 kept = StockLib.cashKeptQueued(StockStorage.layout());
             held = own > kept ? own - kept : 0;
         }
         uint256 left = held > cashEstimate ? held - cashEstimate : 0;

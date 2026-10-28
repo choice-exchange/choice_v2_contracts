@@ -2,14 +2,18 @@
 pragma solidity 0.8.26;
 
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
+import {StockLib} from "../src/stock/StockLib.sol";
+import {StockModule} from "../src/stock/StockModule.sol";
+import {StockOps} from "../src/stock/StockOps.sol";
 import {StockRestock} from "../src/stock/StockRestock.sol";
 import {StockVault} from "../src/stock/StockVault.sol";
-import {StockConfig} from "../src/stock/StockTypes.sol";
+import {Refusal, StockConfig} from "../src/stock/StockTypes.sol";
 import {StockVaultHarness} from "./utils/StockVaultHarness.sol";
 
-/// The 10-28 review's Medium findings, each first proven against the unfixed code (the share price
-/// moved, or the lock was rolled) and kept here as the regression test that it no longer does.
-/// OWNER holds every share: 10,000 cash and 30 STOCK at 300, so 19,000 of value.
+/// The 10-28 review's findings, each first proven against the unfixed code (the share price moved, the
+/// lock was rolled, the queue's cash was spent) and kept here as the regression test that it no longer
+/// is. The fixing lane's two are in `StockFixing.t.sol`. OWNER holds every share: 10,000 cash and 30
+/// STOCK at 300, so 19,000 of value.
 contract StockReviewFixes1028Test is StockVaultHarness {
     address internal constant ATTACKER = address(0xA77A);
 
@@ -109,5 +113,87 @@ contract StockReviewFixes1028Test is StockVaultHarness {
         x.setOperator(ATTACKER, true);
         vm.prank(ATTACKER);
         sv.deposit(1e6, DEPOSITOR); // an operator it approved may
+    }
+
+    // ── the queue's cash is kept from fills ───────────────────────────────
+
+    /// A queued epoch's cash is kept like the reserve. Only instant withdrawals respected it, so a fill
+    /// paying cash out could spend what the redeemers wait for and push them into stock.
+    function test_aFillCannotSpendCashTheQueueIsWaitingFor() public {
+        uint256 half = sv.balanceOf(OWNER) / 2; // 9,500 of value
+        vm.prank(OWNER);
+        x.requestRedeem(half, OWNER, OWNER);
+        _expectRefusal(Refusal.Reserve);
+        _swap(false, true, 6.6 ether); // ~1,975 out, plus its short's margin: over the 500 left above the queue
+        _swap(false, true, 1 ether); // ~300 and its margin fit
+    }
+
+    // ── funding may stay unsettled for a day at most ──────────────────────
+
+    /// A refused settlement leaves the value without the funding accrued since. It is tolerated, so a short
+    /// under its margin ratio does not freeze exits at once, but for a day from the first refusal only.
+    function test_fundingMayStayUnsettledForADayAtMost() public {
+        _hedge(PRICE);
+        exchange.setFailDecrease(true);
+        cash.mint(OWNER, 2e6);
+        vm.prank(OWNER);
+        sv.deposit(1e6, OWNER); // the first refusal starts the clock
+        uint256 since = vm.getBlockTimestamp(); // not block.timestamp, which via-ir reads after the warps
+        vm.warp(since + 1 days);
+        _price(MANTISSA);
+        vm.prank(OWNER);
+        sv.deposit(1e6, OWNER); // a day on: still tolerated
+        vm.warp(since + 1 days + 1);
+        _price(MANTISSA);
+        vm.prank(OWNER);
+        vm.expectRevert(abi.encodeWithSelector(StockOps.FundingStale.selector, since));
+        sv.withdraw(1e6, OWNER, OWNER);
+
+        exchange.setFailDecrease(false);
+        vm.prank(OWNER);
+        sv.withdraw(1e6, OWNER, OWNER); // settled, so the clock is cleared
+        exchange.setFailDecrease(true);
+        vm.prank(OWNER);
+        sv.withdraw(1e6, OWNER, OWNER); // and the next refusal starts a new one
+    }
+
+    // ── an unreadable subaccount is a named refusal ───────────────────────
+
+    /// The hedge subaccount's cash is in the value, and the precompile reverts on a negative balance. The
+    /// value is then refused by name, and the ERC-4626 limits read zero, as they must, rather than revert.
+    function test_anUnreadableSubaccountIsRefusedByName() public {
+        exchange.setFailSubaccountRead(true);
+        vm.expectRevert(StockLib.SubaccountUnreadable.selector);
+        sv.totalAssets();
+        assertEq(sv.maxDeposit(OWNER), 0);
+        assertEq(sv.maxWithdraw(OWNER), 0);
+        assertEq(sv.maxRedeem(OWNER), 0);
+        assertFalse(sv.navReady());
+    }
+
+    // ── nobody books a gift but the keeper ────────────────────────────────
+
+    /// A booked gift moves the share price, past `navJumpBps` stopping every deposit and exit until the
+    /// owner accepts it: anyone could freeze the vault for the price of the gift.
+    function test_onlyTheKeeperBooksAWindfall() public {
+        stock.mint(address(sv), 30 ether); // a gift of 9,000
+        vm.prank(ATTACKER);
+        vm.expectRevert(StockModule.NotKeeper.selector);
+        x.syncWindfall();
+        vm.prank(KEEPER);
+        x.syncWindfall();
+        assertEq(x.state().stockBooked, 60 ether);
+    }
+
+    /// Settling an order books its own leg, at most `restockSlippageBps` over what it asked for, so a gift
+    /// sent with the leg waits for the keeper too.
+    function test_settlingAnOrderBooksItsLegButNotAGiftWithIt() public {
+        _order(false, 3_000e6, 9.8 ether);
+        stock.mint(address(sv), 40 ether); // 10 delivered, better than the limit, and 30 given
+        x.settleRestock();
+        assertEq(x.state().stockBooked, 30 ether + 10.094 ether, "the leg, up to 3% over its 9.8");
+        vm.prank(KEEPER);
+        x.syncWindfall();
+        assertEq(x.state().stockBooked, 70 ether);
     }
 }

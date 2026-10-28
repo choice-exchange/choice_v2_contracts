@@ -139,6 +139,7 @@ abstract contract StockVaultHarness is Test, DeployPermit2 {
         sv.deposit(10_000e6, OWNER);
         vm.stopPrank();
         stock.mint(address(sv), 30 ether);
+        vm.prank(KEEPER);
         x.syncWindfall();
         vm.prank(OWNER);
         x.acceptNav(); // the booked stock nearly doubled the share price
