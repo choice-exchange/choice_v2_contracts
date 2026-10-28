@@ -7,6 +7,7 @@ import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {Currency} from "infinity-core/src/types/Currency.sol";
 
 import {StockLib} from "./StockLib.sol";
+import {StockRestock} from "./StockRestock.sol";
 import {Fill, StockConfig, StockContext, StockState, SwapRequest} from "./StockTypes.sol";
 
 /// @title StockOps
@@ -102,6 +103,8 @@ library StockOps {
             revert NavNotReady();
         }
         requireNavPrice(c, ctx);
+        // A restock order whose leg has arrived closes first: open, it would still be priced as in transit.
+        if (s.orderOpen) StockRestock.settleArrived(s, ctx);
         (bool readable, bool found,) = StockLib.readPosition(s);
         if (found || !readable) {
             // A one-unit margin decrease applies accrued funding in the same transaction and moves

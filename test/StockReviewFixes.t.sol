@@ -358,12 +358,13 @@ contract StockReviewFixesTest is StockVaultHarness {
     }
 
     /// The shares a deposit mints stay put for the lock, so nobody can deposit, push a newer price and
-    /// withdraw the difference. Shares held before are free, so a stranger's dust locks only the dust.
+    /// withdraw the difference. Shares held before are free, so a later dust deposit locks only the dust.
     function test_aDepositsSharesAreLockedButOlderOnesAreNot() public {
         StockConfig memory c = _cfg();
         c.depositLock = 300;
         _setCfg(c);
-        cash.mint(DEPOSITOR, 101e6);
+        cash.mint(DEPOSITOR, 100e6);
+        cash.mint(OWNER, 1e6);
         vm.startPrank(DEPOSITOR);
         cash.approve(address(sv), type(uint256).max);
         uint256 shares = sv.deposit(100e6, DEPOSITOR);
@@ -378,8 +379,9 @@ contract StockReviewFixesTest is StockVaultHarness {
         sv.transfer(OWNER, 1);
         vm.expectRevert(locked);
         x.requestRedeem(shares, DEPOSITOR, DEPOSITOR);
-        uint256 dust = sv.deposit(1e6, OWNER);
         vm.stopPrank();
+        vm.prank(OWNER);
+        uint256 dust = sv.deposit(1e6, OWNER);
         (uint256 ownerLocked,) = x.lockedShares(OWNER);
         assertEq(ownerLocked, dust);
         vm.prank(OWNER);
