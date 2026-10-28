@@ -134,6 +134,7 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     error CurveClosed();
     error NotFillable(Refusal reason);
     error NotDepositor(address caller);
+    error NotOperator(address receiver, address caller);
     error UnexpectedLock();
     error NotSelf();
     error SharesLocked(uint256 locked, uint256 until);
@@ -441,10 +442,13 @@ contract StockVault is ERC4626, Ownable2Step, ReentrancyGuardTransient, Multical
     }
 
     /// @dev A deposit's cash goes straight into claims, which fills pay out of, and its shares are locked
-    /// to their receiver for `depositLock` (see `DepositLock`).
+    /// to their receiver for `depositLock` (see `DepositLock`). That restarts the receiver's lock, so only
+    /// the receiver or an operator it approved (`setOperator`) deposits for it: a stranger's dust would
+    /// otherwise keep its newest shares locked for as long as the stranger kept paying it in.
     function _deposit(address caller, address receiver, uint256 assets, uint256 shares) internal override {
         StockLayout storage l = StockStorage.layout();
         if (l.allowlistOn && !l.isDepositor[caller] && caller != owner()) revert NotDepositor(caller);
+        if (receiver != caller && !l.operators[receiver][caller]) revert NotOperator(receiver, caller);
         super._deposit(caller, receiver, assets, shares);
         l.state.cashBooked += assets;
         StockLib.intoClaims(_ctx(), CASH);

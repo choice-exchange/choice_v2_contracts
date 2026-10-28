@@ -26,9 +26,10 @@ import {Reference, StockConfig, StockContext, StockLayout, StockState} from "./S
 /// - **Closing**, by anyone, on what has arrived, which both ledgers show: stock above `stockBooked` (a
 ///   buy's delivery, a sell's stock refunded) or cash above `cashBooked` (a sell's payment, a buy's
 ///   refund; the short trades from its own subaccount, so only fee-share dust arrives otherwise).
-///   Until then an arrival is out of the value, so nothing counts twice. An order stays open, and in
-///   the value, until one of its legs arrives: past its expiry plus `restockDeadline` the owner may
-///   write it off (`writeOff`), and what arrives later is booked as a windfall. Whatever arrived before
+///   Until then an arrival is out of the value, so nothing counts twice, and no share is priced before
+///   an arrived leg closes its order (`settleArrived`). An order stays open, and in the value, until one
+///   of its legs arrives: past its expiry plus `restockDeadline` the owner may write it off
+///   (`writeOff`), and what arrives later is booked as a windfall. Whatever arrived before
 ///   the order is booked as one first, so only this order's own legs settle it. Faking a close takes a
 ///   gift of the whole leg.
 library StockRestock {
@@ -38,7 +39,7 @@ library StockRestock {
 
     error RestockUnavailable();
     error OrderTooLong(uint256 life);
-    error LimitOutOfBand(uint256 value, uint256 floor);
+    error LimitOutOfBand(uint256 value, uint256 bound);
     error InventoryCapExceeded(uint256 value, uint256 cap);
     error NotEnoughStock(uint256 wanted, uint256 booked);
     error StockDeficit();
@@ -56,8 +57,9 @@ library StockRestock {
 
     /// @notice Send a LIMIT order to the issuer: `amountIn` of cash for at least `limitOut` stock, or
     /// (`sell`) `amountIn` of stock for at least `limitOut` cash, open for `expiryUnits` of the issuer's
-    /// expiry unit. The limit is within `restockSlippageBps` of a fresh reference (a buy pays no more, a
-    /// sale takes no less), the reference within `maxJumpBps` of the anchor, a buy within the inventory
+    /// expiry unit. The limit is within `restockSlippageBps` of a fresh reference (a sale takes no less;
+    /// a buy's stock is worth within it of its cash either way, so no buy asks for more than its cash buys,
+    /// which never fills), the reference within `maxJumpBps` of the anchor, a buy within the inventory
     /// cap, and both sides' cash value within the daily restock cap.
     function order(
         StockLayout storage l,
@@ -88,13 +90,17 @@ library StockRestock {
         if (sell) {
             if (amountIn > s.stockBooked) revert NotEnoughStock(amountIn, s.stockBooked);
             uint256 fair = StockLib.stockToCash(ctx, amountIn, r.price, Math.Rounding.Floor);
-            _band(limitOut, fair * keep / StockLib.BPS);
+            _band(limitOut, fair * keep / StockLib.BPS, type(uint256).max);
             StockLib.countRestock(c, s, fair);
             s.orderCounted = fair.toUint96();
             StockLib.ensureToken(ctx, ctx.stock, amountIn);
             s.stockBooked -= amountIn;
         } else {
-            _band(StockLib.stockToCash(ctx, limitOut, r.price, Math.Rounding.Floor), amountIn * keep / StockLib.BPS);
+            _band(
+                StockLib.stockToCash(ctx, limitOut, r.price, Math.Rounding.Floor),
+                amountIn * keep / StockLib.BPS,
+                amountIn * (StockLib.BPS + c.restockSlippageBps) / StockLib.BPS
+            );
             uint256 inventory = StockLib.stockToCash(ctx, s.stockBooked + limitOut, r.price, Math.Rounding.Ceil);
             if (inventory > c.maxInventory) revert InventoryCapExceeded(inventory, c.maxInventory);
             StockLib.countRestock(c, s, amountIn);
@@ -130,6 +136,17 @@ library StockRestock {
     /// A refund, either way, gives back what the order counted against the daily cap.
     function settle(StockState storage s, StockContext memory ctx) external {
         if (!s.orderOpen) revert RestockUnavailable();
+        if (!_close(s, ctx)) revert NotDelivered(StockLib.unbooked(s, ctx), s.orderStock);
+    }
+
+    /// @notice Close the open order as `settle` does if one of its legs has arrived, and do nothing
+    /// otherwise: run before any share is priced (`StockOps.beforeNav`), so an exit is never priced off an
+    /// order the issuer has already filled or refunded.
+    function settleArrived(StockState storage s, StockContext memory ctx) external {
+        if (s.orderOpen) _close(s, ctx);
+    }
+
+    function _close(StockState storage s, StockContext memory ctx) private returns (bool) {
         uint256 surplus = StockLib.unbooked(s, ctx);
         uint256 cashIn = StockLib.unbookedCash(s, ctx);
         bool sell = s.orderSell;
@@ -154,8 +171,9 @@ library StockRestock {
                 emit RestockRefunded(false, s.orderCash);
             }
         } else {
-            revert NotDelivered(surplus, s.orderStock);
+            return false;
         }
+        return true;
     }
 
     /// @notice Close an order the issuer has neither filled nor refunded by its deadline, as never to be
@@ -257,8 +275,9 @@ library StockRestock {
         out = bytes.concat(out, _slice(t, start, t.length));
     }
 
-    function _band(uint256 value, uint256 floor) private pure {
+    function _band(uint256 value, uint256 floor, uint256 ceiling) private pure {
         if (value < floor) revert LimitOutOfBand(value, floor);
+        if (value > ceiling) revert LimitOutOfBand(value, ceiling);
     }
 
     function _slice(bytes memory b, uint256 from, uint256 to) private pure returns (bytes memory r) {

@@ -322,6 +322,16 @@ library StockLib {
         return stockToCash(ctx, s.orderStock, price, Math.Rounding.Floor);
     }
 
+    /// @dev What the open order is worth to a share price: what it closes at if `price` holds. A sale is
+    /// `orderValue`. A buy fills exactly at its limit or is refunded, so it is its stock only while that is
+    /// worth no more than the cash it sent: past the limit the refund is what comes, and counting the
+    /// stock would let a holder exit on a gain the vault never gets (the short's loss then shows with
+    /// nothing against it, because that is the loss the vault has).
+    function orderWorth(StockState storage s, StockContext memory ctx, uint256 price) internal view returns (uint256) {
+        uint256 v = orderValue(s, ctx, price);
+        return s.orderOpen && !s.orderSell ? Math.min(v, s.orderCash) : v;
+    }
+
     /// @dev Count `cash` against the daily restock cap, shared by memo orders and quotes.
     function countRestock(StockConfig storage c, StockState storage s, uint256 cash) internal {
         if (block.timestamp >= uint256(s.restockWindowStart) + RESTOCK_CAP_WINDOW) {
